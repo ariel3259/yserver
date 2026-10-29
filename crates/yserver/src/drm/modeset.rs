@@ -2020,9 +2020,10 @@ pub(crate) struct ComposedScanoutPlaneState<'a> {
     pub(crate) in_fence_fd: Option<i32>,
 }
 
-/// Successfully imported framebuffer retained after an accepted M1 probe.
-/// It is never installed on hardware. Owning the DRM device makes teardown
-/// reliable during backend shutdown regardless of struct-field drop order.
+/// Successfully imported framebuffer retained after an accepted M1 probe and
+/// available to a later accepted direct-scanout commit. Owning the DRM device
+/// makes teardown reliable during backend shutdown regardless of struct-field
+/// drop order.
 pub(crate) struct DirectScanoutProbeFramebuffer {
     fb: framebuffer::Handle,
     backing: Option<DirectScanoutProbeBacking>,

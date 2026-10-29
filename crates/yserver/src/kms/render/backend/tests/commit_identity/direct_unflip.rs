@@ -1232,6 +1232,477 @@ fn p1_degraded_shared_unflip_waits_for_accepted_replacements() {
     fixture.finish_after_normal_drain();
 }
 
+struct ResizePendingUnflip {
+    fixture: super::recording_scene::RecordingSceneFixtureGuard,
+    direct_source_id: crate::kms::render::store::DrawableId,
+    device_fd: RawFd,
+    replacement: AtomicCommitRecord,
+    replacement_id: u64,
+    old_topology: u64,
+    new_source_id: crate::kms::render::store::DrawableId,
+}
+
+fn resize_root_direct_present_before_unflip() -> Option<ResizePendingUnflip> {
+    use crate::kms::render::store::DrawableKind;
+    use yserver_core::{
+        backend::{Backend, PixmapHandle, WindowHandle},
+        resources::{ROOT_VISUAL, ROOT_WINDOW},
+        server::{BackendCapabilities, ServerState},
+    };
+    use yserver_protocol::x11::{
+        ClientId, CreatePixmapRequest, CreateWindowRequest, RequestHeader, ResourceId,
+        SequenceNumber,
+    };
+
+    const CLIENT: u32 = 1;
+    const INITIAL_PRESENT_ID: u64 = 0x711;
+    const WINDOW_XID: u32 = 0x0071_1001;
+    const PIXMAP_XID: u32 = 0x0071_1002;
+
+    let (fixture, direct) = direct_fixture(1, P1SceneRoute::Shared, INITIAL_PRESENT_ID, 0)?;
+    let mut fixture = fixture.cleanup_guard();
+    let device_fd = fd(&fixture);
+    let initial_size = (
+        fixture.events.backend.platform.fb_w,
+        fixture.events.backend.platform.fb_h,
+    );
+    // Let the normal observation path seed the cache signature for the old
+    // root extent, then restore the fixture's synthetic accepted M1 owner.
+    Backend::note_present_scanout_candidate(&mut fixture.events.backend, direct.candidate);
+    fixture.events.backend.pstate.scanout_m1.entries.insert(
+        direct.source_id,
+        crate::kms::render::backend::ScanoutM1ProbeEntry::accepted(
+            crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(
+                ::drm::control::from_u32(0x8711).expect("nonzero synthetic framebuffer"),
+            ),
+        ),
+    );
+    let old_topology = fixture.events.backend.pstate.scanout_m1.topology_signature;
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m1
+            .entries
+            .contains_key(&direct.source_id)
+    );
+
+    let attempts = submit_direct(&mut fixture, &direct, device_fd);
+    let initial = accepted_records(&attempts)
+        .into_iter()
+        .next()
+        .expect("initial root direct commit accepted");
+    let initial_id = accepted_event_id(&initial).expect("initial direct commit has an event ID");
+    complete_direct_initial(&mut fixture, &initial, initial_id, device_fd);
+    drain_present_notifications(&mut fixture, &[INITIAL_PRESENT_ID], &[]);
+    assert_eq!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .current
+            .as_ref()
+            .map(|frame| frame.source_id),
+        Some(direct.source_id),
+        "the source whose M1 entry owns the FB is live on the root"
+    );
+
+    let new_size = (initial_size.0 + 128, initial_size.1);
+    Backend::set_logical_screen_size(&mut fixture.events.backend, new_size.0, new_size.1)
+        .expect("resize through the Backend entry point used by RRSetScreenSize");
+    assert_eq!(
+        fixture.events.backend.pstate.scanout_m1.topology_signature, old_topology,
+        "resize requests unflip but does not synchronously clear the M1 cache"
+    );
+    assert!(fixture.events.backend.pstate.direct.root().unflip_requested);
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m1
+            .entries
+            .contains_key(&direct.source_id)
+    );
+
+    let replacement_offset = record_count(&fixture, device_fd);
+    let replacement = grouped_unflip_record(&mut fixture, device_fd, replacement_offset, 1);
+    let replacement_id =
+        accepted_event_id(&replacement).expect("composed unflip replacement accepted");
+    assert_eq!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .unflip_awaiting_outputs,
+        HashMap::from([(0, replacement_id)]),
+        "the replacement is accepted but has not retired"
+    );
+    assert_eq!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .current
+            .as_ref()
+            .map(|frame| frame.source_id),
+        Some(direct.source_id),
+        "the direct source remains current until the replacement flip event"
+    );
+
+    // Build the core resource view after the resize, then resize the existing
+    // direct target through ConfigureWindow so the following wire Present has
+    // both a new-root-sized source and a matching target rectangle.
+    let (outputs, modes) = Backend::randr_outputs_and_modes(&mut fixture.events.backend);
+    let capabilities = BackendCapabilities::from_backend(&fixture.events.backend);
+    fixture.events.state = ServerState::with_randr_outputs_and_modes(
+        new_size.0,
+        new_size.1,
+        outputs,
+        modes,
+        capabilities,
+    );
+    super::super::install_client_for_render(&mut fixture.events.state, CLIENT);
+    fixture
+        .events
+        .state
+        .resources
+        .window_mut(ROOT_WINDOW)
+        .expect("root resource")
+        .host_xid = WindowHandle::from_raw(fixture.events.backend.core.window_id);
+    let window = ResourceId(WINDOW_XID);
+    fixture.events.state.resources.create_window(
+        ClientId(CLIENT),
+        CreateWindowRequest {
+            depth: 24,
+            window,
+            parent: ROOT_WINDOW,
+            x: 0,
+            y: 0,
+            width: initial_size.0,
+            height: initial_size.1,
+            border_width: 0,
+            class: 1,
+            visual: ROOT_VISUAL,
+            ..Default::default()
+        },
+    );
+    fixture
+        .events
+        .state
+        .resources
+        .window_mut(window)
+        .expect("Present target resource")
+        .host_xid = WindowHandle::from_raw(direct.target_xid);
+    let _ = fixture.events.state.resources.map_window(window);
+
+    let mut configure_body = Vec::with_capacity(12);
+    configure_body.extend_from_slice(&WINDOW_XID.to_le_bytes());
+    configure_body.extend_from_slice(&0x000c_u16.to_le_bytes()); // CWWidth | CWHeight
+    configure_body.extend_from_slice(&0_u16.to_le_bytes());
+    configure_body.extend_from_slice(&u32::from(new_size.0).to_le_bytes());
+    configure_body.extend_from_slice(&u32::from(new_size.1).to_le_bytes());
+    let events = fixture.events_mut();
+    yserver_core::core_loop::process_request::process_request(
+        &mut events.state,
+        &mut events.backend,
+        ClientId(CLIENT),
+        SequenceNumber(1),
+        RequestHeader {
+            opcode: 12, // ConfigureWindow
+            data: 0,
+            length_units: 5,
+        },
+        &configure_body,
+        None,
+    )
+    .expect("configure the target through the core request dispatcher");
+
+    let source_host_xid = direct.target_xid + 2;
+    let source_storage = fixture
+        .events
+        .backend
+        .platform
+        .gpu
+        .allocate_drawable_storage(new_size.0, new_size.1, 24)
+        .expect("allocate new-root-sized Present source");
+    let new_source_id = fixture
+        .events
+        .backend
+        .store
+        .allocate(
+            source_host_xid,
+            DrawableKind::Pixmap,
+            24,
+            false,
+            source_storage,
+        )
+        .expect("register Present source in backend store");
+    Backend::put_image(
+        &mut fixture.events.backend,
+        None,
+        source_host_xid,
+        24,
+        1,
+        1,
+        0,
+        0,
+        &[0, 0, 0, 0],
+    )
+    .expect("initialize Present source through Backend");
+    fixture.adopt_drawables([source_host_xid]);
+
+    let pixmap = ResourceId(PIXMAP_XID);
+    fixture.events.state.resources.create_pixmap(
+        ClientId(CLIENT),
+        CreatePixmapRequest {
+            depth: 24,
+            pixmap,
+            drawable: window,
+            width: new_size.0,
+            height: new_size.1,
+        },
+    );
+    let _ = fixture.events.state.resources.set_pixmap_host_xid(
+        pixmap,
+        PixmapHandle::from_raw(source_host_xid).expect("nonzero source host XID"),
+    );
+
+    // PresentPixmap with no valid/update region and zero offsets. The core
+    // request path calls observe_scanout_m0 before try_present_direct; the
+    // latter declines because the resize's composed replacement is pending.
+    dispatch_resized_root_present(&mut fixture, 2, 2);
+
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .unflip_awaiting_outputs
+            .contains_key(&0)
+    );
+    assert_eq!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .current
+            .as_ref()
+            .map(|frame| frame.source_id),
+        Some(direct.source_id),
+        "the unflip replacement is still unretired while the Present is processed"
+    );
+    let copied_present = Backend::drain_completed_present_events(&mut fixture.events.backend);
+    assert_eq!(
+        copied_present.len(),
+        1,
+        "the resized root Present completed through its Copy fallback"
+    );
+    assert_eq!(copied_present[0].host_xid, PIXMAP_XID);
+    assert!(Backend::drain_retired_present_idle_events(&mut fixture.events.backend).is_empty());
+
+    Some(ResizePendingUnflip {
+        fixture,
+        direct_source_id: direct.source_id,
+        device_fd,
+        replacement,
+        replacement_id,
+        old_topology,
+        new_source_id,
+    })
+}
+
+fn dispatch_resized_root_present(
+    fixture: &mut super::recording_scene::RecordingSceneFixtureGuard,
+    sequence: u16,
+    serial: u32,
+) {
+    use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber, present};
+
+    let mut present_body = vec![0_u8; 68];
+    present_body[0..4].copy_from_slice(&0x0071_1001_u32.to_le_bytes());
+    present_body[4..8].copy_from_slice(&0x0071_1002_u32.to_le_bytes());
+    present_body[8..12].copy_from_slice(&serial.to_le_bytes());
+    present_body[36..40]
+        .copy_from_slice(&yserver_core::present_scheduler::PRESENT_OPTION_ASYNC.to_le_bytes());
+    let events = fixture.events_mut();
+    yserver_core::core_loop::process_request::process_request(
+        &mut events.state,
+        &mut events.backend,
+        ClientId(1),
+        SequenceNumber(sequence),
+        RequestHeader {
+            opcode: 145,
+            data: present::PIXMAP,
+            length_units: 18,
+        },
+        &present_body,
+        None,
+    )
+    .expect("PresentPixmap through the core request dispatcher");
+}
+
+fn assert_live_resize_m1_owner_is_held(scenario: &ResizePendingUnflip) {
+    let backend = &scenario.fixture.events.backend;
+    let entry = backend
+        .pstate
+        .scanout_m1
+        .entries
+        .get(&scenario.direct_source_id)
+        .expect("live direct source retains its M1 cache entry");
+    assert!(
+        entry.framebuffer().is_some(),
+        "the live source retains its M1 framebuffer owner"
+    );
+    assert_eq!(
+        backend.pstate.scanout_m1.topology_signature, scenario.old_topology,
+        "the live direct owner keeps the old M1 topology signature"
+    );
+    assert!(
+        !backend
+            .pstate
+            .scanout_m1
+            .entries
+            .contains_key(&scenario.new_source_id),
+        "the changed-topology candidate is deferred while an owner is active"
+    );
+    assert!(backend.pstate.direct.root().active());
+    assert!(
+        backend
+            .pstate
+            .direct
+            .root()
+            .unflip_awaiting_outputs
+            .contains_key(&0)
+    );
+    assert_eq!(
+        backend
+            .pstate
+            .direct
+            .root()
+            .current
+            .as_ref()
+            .map(|frame| frame.source_id),
+        Some(scenario.direct_source_id),
+        "the old source remains current until replacement retirement"
+    );
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+fn resize_keeps_live_direct_framebuffer_until_unflip_retires() {
+    // Mutation: remove the active-owner check before clearing the cache on a signature change.
+    let Some(mut scenario) = resize_root_direct_present_before_unflip() else {
+        eprintln!(
+            "SKIP resize_keeps_live_direct_framebuffer_until_unflip_retires: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    assert_live_resize_m1_owner_is_held(&scenario);
+
+    complete_recorded_attempt(
+        &mut scenario.fixture,
+        scenario.device_fd,
+        &scenario.replacement,
+        scenario.replacement_id,
+        90,
+    );
+    let direct = scenario.fixture.events.backend.pstate.direct.root();
+    assert!(direct.unflip_awaiting_outputs.is_empty());
+    assert!(!direct.active());
+    assert!(direct.current.is_none());
+    assert!(
+        scenario
+            .fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m1
+            .entries
+            .contains_key(&scenario.direct_source_id)
+    );
+    drain_present_notifications(&mut scenario.fixture, &[], &[0x711]);
+    scenario.fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+fn stale_m1_cache_clears_after_owners_retire() {
+    // Mutation: never clear stale M1 entries when the topology signature changes.
+    let Some(mut scenario) = resize_root_direct_present_before_unflip() else {
+        eprintln!("SKIP stale_m1_cache_clears_after_owners_retire: Vulkan fixture unavailable");
+        return;
+    };
+    assert_live_resize_m1_owner_is_held(&scenario);
+
+    complete_recorded_attempt(
+        &mut scenario.fixture,
+        scenario.device_fd,
+        &scenario.replacement,
+        scenario.replacement_id,
+        90,
+    );
+    assert!(
+        !scenario
+            .fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .active()
+    );
+    assert!(
+        scenario
+            .fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .current
+            .is_none()
+    );
+    drain_present_notifications(&mut scenario.fixture, &[], &[0x711]);
+
+    dispatch_resized_root_present(&mut scenario.fixture, 3, 3);
+    let backend = &mut scenario.fixture.events.backend;
+    assert_ne!(
+        backend.pstate.scanout_m1.topology_signature, scenario.old_topology,
+        "the next eligible Present records the resized topology signature"
+    );
+    assert!(
+        !backend
+            .pstate
+            .scanout_m1
+            .entries
+            .contains_key(&scenario.direct_source_id)
+    );
+    let new_entry = backend
+        .pstate
+        .scanout_m1
+        .entries
+        .get(&scenario.new_source_id)
+        .expect("the next eligible Present is probed under the new signature");
+    assert!(new_entry.framebuffer().is_none());
+    let copied_present = Backend::drain_completed_present_events(backend);
+    assert_eq!(copied_present.len(), 1);
+    assert_eq!(copied_present[0].host_xid, 0x0071_1002);
+    assert!(Backend::drain_retired_present_idle_events(backend).is_empty());
+    scenario.fixture.finish_after_normal_drain();
+}
+
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: omit post-tick registration of an already-signalled copied replacement accepted inside scene.tick.
