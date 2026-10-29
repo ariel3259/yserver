@@ -753,7 +753,7 @@ impl KmsBackend {
             return;
         }
         let output_indices = self.direct_scope_outputs(scope);
-        let tearing = scope == DirectScope::Root && self.pstate.tearing.is_on();
+        let tearing = self.tearing_scope() == Some(scope);
         if tearing || self.effective_cursor_hidden() {
             // Tearing keeps every cursor plane detached. A hidden effective
             // cursor also must not leave a stale sprite bound over direct scanout.
@@ -909,7 +909,7 @@ impl KmsBackend {
         let mut refreshed_outputs = Vec::new();
         for scope in self.pstate.direct.active_scopes() {
             let scope_outputs = self.direct_scope_outputs(scope);
-            if scope == DirectScope::Root && self.pstate.tearing.is_on() {
+            if self.tearing_scope() == Some(scope) {
                 if let Some(owner) = self.pstate.direct.get_mut(scope) {
                     owner.cursor_bound_all = false;
                 }
@@ -1084,8 +1084,8 @@ impl KmsBackend {
         {
             return;
         }
-        if scope == DirectScope::Root && self.pstate.tearing.is_on() {
-            for output_idx in 0..self.platform.outputs.len() {
+        if self.tearing_scope() == Some(scope) {
+            for output_idx in self.direct_scope_outputs(scope) {
                 self.platform.clear_direct_cursor_retry(output_idx);
             }
             if let Some(owner) = self.pstate.direct.get_mut(scope) {
@@ -1746,7 +1746,8 @@ impl KmsBackend {
                 window,
                 crtc_epoch,
                 ..
-            } if window == frame.candidate.dst_window_xid
+            } if self.tearing_scope() == Some(scope)
+                && window == frame.candidate.dst_window_xid
                 && crtc_epoch == frame.candidate.crtc_epoch
         );
         let async_shape = self
@@ -4004,10 +4005,13 @@ impl KmsBackend {
     }
 
     fn prepare_tearing_scene_pass(&mut self) {
+        let tearing_outputs = self.tearing_scope_outputs();
         if std::mem::take(&mut self.platform.scene_cursor_hide_failed)
             && self.pstate.tearing.is_on()
             && !self.pstate.tearing.hide_failed_logged
-            && self.platform.any_cursor_plane_visible()
+            && tearing_outputs
+                .iter()
+                .any(|&idx| self.platform.cursor_plane_visible_for_output(idx))
         {
             log::warn!("kms: tearing cursor-plane hide failed; keeping composed flips on vsync");
             self.pstate.tearing.hide_failed_logged = true;
@@ -4021,10 +4025,13 @@ impl KmsBackend {
             return;
         }
         self.request_tearing_cursor_handoff();
-        if self.platform.any_cursor_plane_visible() {
+        if tearing_outputs
+            .iter()
+            .any(|&idx| self.platform.cursor_plane_visible_for_output(idx))
+        {
             return;
         }
-        for output_idx in 0..self.platform.outputs.len() {
+        for output_idx in tearing_outputs {
             let Some(shape) = self.platform.scene_async_shape(output_idx) else {
                 continue;
             };

@@ -629,6 +629,18 @@ impl<P: Platform> XBackend<P> {
                 })
                 .unwrap_or((0, 0, 0, 0));
             let tearing_active = P::tearing_active(self);
+            #[allow(clippy::cast_possible_truncation)]
+            let (cursor_x, cursor_y) = (new_x as i64, new_y as i64);
+            let tearing_intersects_owner = tearing_active
+                && P::tearing_cursor_intersects_owner(
+                    self,
+                    cursor_x,
+                    cursor_y,
+                    i64::from(hot_x),
+                    i64::from(hot_y),
+                    i64::from(cw),
+                    i64::from(ch),
+                );
             if self.effective_cursor_hidden() {
                 // The effective cursor has no visible pixels, so pointer
                 // motion has no cursor sprite to move.
@@ -639,10 +651,10 @@ impl<P: Platform> XBackend<P> {
                         | crate::kms::render::scene::CursorPlaneMode::Mixed
                 )
             {
-                if tearing_active {
-                    // Keep Root tearing motion on the capped scene-wake path.
-                    // The KMS hook also moves an independent Output owner's
-                    // visible hardware cursor.
+                if tearing_intersects_owner {
+                    // Keep motion on the tearing owner's capped scene-wake
+                    // path; foreign outputs continue through their own cursor
+                    // policy below.
                     P::cursor_motion_during_tearing(self, true);
                 }
                 let mixed = matches!(

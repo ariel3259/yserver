@@ -54,9 +54,26 @@ pub trait Platform: OutputSink + Sized + 'static {
     fn tearing_active(_b: &XBackend<Self>) -> bool {
         false
     }
+    /// Per-output hardware-cursor suppression for a direct tearing owner.
+    fn tearing_cursor_suppression_mask(_b: &XBackend<Self>, output_count: usize) -> Vec<bool> {
+        vec![false; output_count]
+    }
+    /// Whether the tearing owner overlaps this cursor footprint.
+    fn tearing_cursor_intersects_owner(
+        _b: &XBackend<Self>,
+        _cursor_x: i64,
+        _cursor_y: i64,
+        _hot_x: i64,
+        _hot_y: i64,
+        _width: i64,
+        _height: i64,
+    ) -> bool {
+        false
+    }
     /// Whether the effective cursor sprite overlaps any live output.
     fn cursor_intersects_outputs(
         _b: &XBackend<Self>,
+        _output_indices: &[usize],
         _cursor_x: i64,
         _cursor_y: i64,
         _hot_x: i64,

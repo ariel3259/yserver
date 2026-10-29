@@ -31,6 +31,130 @@ fn recording_sink(
     recorder
 }
 
+fn enter_output_owner_through_backend(
+    fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixture,
+    direct: &super::commit_identity::recording_scene::DirectPresentSetup,
+    output_idx: usize,
+) -> crate::drm::atomic::tests_support::AtomicCommitRecord {
+    use yserver_core::backend::Backend;
+
+    fixture
+        .events
+        .backend
+        .for_tests_set_scanout_m1_prober(super::present_scanout::record_scanout_m1_probe);
+    Backend::note_present_scanout_candidate(&mut fixture.events.backend, direct.candidate);
+    let device_fd = fixture.kms_fd(output_idx);
+    let before = fixture.events.recorders[&device_fd].records().len();
+    let probation = usize::from(crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION);
+    for attempt in 0..probation {
+        assert_eq!(
+            Backend::try_present_direct(
+                &mut fixture.events.backend,
+                direct.candidate,
+                direct.event.clone(),
+            )
+            .expect("output owner Present through Backend"),
+            attempt + 1 == probation,
+            "Output({output_idx}) enters on its final probationary Present"
+        );
+    }
+    let crtc = fixture.events.backend.platform.outputs[output_idx]
+        .output
+        .crtc;
+    let direct_record = fixture.events.recorders[&device_fd]
+        .records()
+        .into_iter()
+        .skip(before)
+        .find(|record| {
+            record.kind != AtomicCommitKind::CursorOnly
+                && record.events.len() == 1
+                && record.events[0].crtc == crtc
+                && super::commit_identity::support::accepted_event_id(record).is_some()
+        })
+        .expect("Output Present produced one accepted direct commit");
+    let tearing_outputs = fixture.events.backend.tearing_scope_outputs();
+    if tearing_outputs.contains(&output_idx) && direct_record.kind != AtomicCommitKind::Async {
+        let mut delivered = std::collections::HashSet::new();
+        super::cursor_sprites::support::retire_pending_output(
+            &mut fixture.events,
+            &mut delivered,
+            output_idx,
+            30,
+        );
+        let mut async_candidate = direct.candidate;
+        async_candidate.present_id += 10_000;
+        let mut async_event = direct.event.clone();
+        async_event.present_id = async_candidate.present_id;
+        async_event.serial =
+            u32::try_from(async_candidate.present_id).expect("follow-up Present serial fits");
+        let async_before = fixture.events.recorders[&device_fd].records().len();
+        assert!(
+            Backend::try_present_direct(&mut fixture.events.backend, async_candidate, async_event,)
+                .expect("tearing owner accepts its follow-up direct Present")
+        );
+        let async_record = fixture.events.recorders[&device_fd]
+            .records()
+            .into_iter()
+            .skip(async_before)
+            .find(|record| {
+                record.events.len() == 1
+                    && record.events[0].crtc == crtc
+                    && super::commit_identity::support::accepted_event_id(record).is_some()
+            })
+            .expect("tearing owner follow-up Present is recorded");
+        assert_eq!(async_record.kind, AtomicCommitKind::Async);
+        super::cursor_sprites::support::retire_pending_output(
+            &mut fixture.events,
+            &mut delivered,
+            output_idx,
+            31,
+        );
+        return async_record;
+    }
+    direct_record
+}
+
+fn output_probation_present(
+    fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixture,
+    delivered: &mut std::collections::HashSet<super::cursor_sprites::support::CompletionKey>,
+    direct: &super::commit_identity::recording_scene::DirectPresentSetup,
+    output_idx: usize,
+    present_id: u64,
+    options: u32,
+    frame: u32,
+) -> bool {
+    use yserver_core::backend::Backend;
+
+    let mut candidate = direct.candidate;
+    candidate.present_id = present_id;
+    candidate.options = options;
+    let mut event = direct.event.clone();
+    event.present_id = present_id;
+    event.serial = u32::try_from(present_id).expect("Present serial fits");
+    event.options = options;
+    Backend::note_present_scanout_candidate(&mut fixture.events.backend, candidate);
+    let accepted = Backend::try_present_direct(&mut fixture.events.backend, candidate, event)
+        .expect("probation Present through Backend");
+    if accepted {
+        super::cursor_sprites::support::retire_pending_output(
+            &mut fixture.events,
+            delivered,
+            output_idx,
+            frame,
+        );
+        let completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
+        assert_eq!(
+            completed
+                .iter()
+                .filter(|event| event.present_id == present_id)
+                .count(),
+            1,
+            "accepted probation Present completes exactly once"
+        );
+    }
+    accepted
+}
+
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: run tearing observation for non-Root candidates.
@@ -77,7 +201,14 @@ fn output_candidates_leave_root_tearing_probation_unchanged() {
             "Root remains below direct admission and tearing entry thresholds"
         );
         assert_eq!(
-            fixture.events.backend.pstate.tearing.probation,
+            fixture
+                .events
+                .backend
+                .pstate
+                .direct
+                .root()
+                .tearing_probation
+                .count,
             u8::try_from(index + 1).expect("probation count fits"),
             "Root builds its partial tearing streak"
         );
@@ -97,12 +228,26 @@ fn output_candidates_leave_root_tearing_probation_unchanged() {
             "Output(1) Present falls back to Copy"
         );
         assert_eq!(
-            fixture.events.backend.pstate.tearing.probation,
+            fixture
+                .events
+                .backend
+                .pstate
+                .direct
+                .root()
+                .tearing_probation
+                .count,
             u8::try_from(index + 1).expect("probation count fits"),
             "Output(1) does not change Root's probation count"
         );
         assert_eq!(
-            fixture.events.backend.pstate.tearing.probation_owner,
+            fixture
+                .events
+                .backend
+                .pstate
+                .direct
+                .root()
+                .tearing_probation
+                .window,
             Some(root_window),
             "Output(1) does not replace Root's probation window"
         );
@@ -130,7 +275,14 @@ fn output_candidates_leave_root_tearing_probation_unchanged() {
             if window == root_window
     ));
     assert_eq!(
-        fixture.events.backend.pstate.tearing.probation,
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .tearing_probation
+            .count,
         u8::try_from(probation).expect("threshold fits"),
         "Root enters exactly at the configured threshold"
     );
@@ -774,8 +926,8 @@ fn qualify_direct_async(
             submitted,
             "qualifying root Present {present_id} must submit ({diagnostic}; tearing={:?}, probation={}, owner={:?}, m2_streak={}, scene_cursor={:?}, scene_pending={})",
             backend.pstate.tearing.state,
-            backend.pstate.tearing.probation,
-            backend.pstate.tearing.probation_owner,
+            backend.pstate.direct.root().tearing_probation.count,
+            backend.pstate.direct.root().tearing_probation.window,
             backend.pstate.direct.root().eligible_streak,
             backend.scene.cursor_mode(),
             backend.scene.has_pending_page_flips(),
@@ -903,8 +1055,8 @@ pub(super) fn finish_entering_tearing(
                 if owner == protocol_window_xid
         ),
         "probation={} owner={:?} cursor={:?} root_order={:?}",
-        backend.pstate.tearing.probation,
-        backend.pstate.tearing.probation_owner,
+        backend.pstate.direct.root().tearing_probation.count,
+        backend.pstate.direct.root().tearing_probation.window,
         backend.scene.cursor_mode(),
         backend.core.top_level_order
     );
@@ -1038,8 +1190,8 @@ fn assert_tearing_off(backend: &KmsBackend) {
         backend.pstate.tearing.state,
         crate::kms::render::backend::TearingState::Off
     ));
-    assert_eq!(backend.pstate.tearing.probation, 0);
-    assert_eq!(backend.pstate.tearing.probation_owner, None);
+    assert_eq!(backend.pstate.direct.root().tearing_probation.count, 0);
+    assert_eq!(backend.pstate.direct.root().tearing_probation.window, None);
     assert_eq!(backend.pstate.tearing.last_cursor_compose, None);
     assert_eq!(backend.pstate.tearing.deferred_cursor_wake, None);
     assert!(backend.platform.async_ledger.for_tests_is_empty());
@@ -1527,8 +1679,11 @@ fn probation_resets_on_non_async_root_present() {
         backend.pstate.tearing.state,
         crate::kms::render::backend::TearingState::Off
     ));
-    assert_eq!(backend.pstate.tearing.probation, 7);
-    assert_eq!(backend.pstate.tearing.probation_owner, Some(WINDOW));
+    assert_eq!(backend.pstate.direct.root().tearing_probation.count, 7);
+    assert_eq!(
+        backend.pstate.direct.root().tearing_probation.window,
+        Some(WINDOW)
+    );
     assert_commit_sequence(&recorder, &[AtomicCommitKind::Scene; 15]);
     assert_direct_queue_drained(&backend);
 }
@@ -1731,7 +1886,7 @@ fn non_async_authoritative_present_resets_probation_during_reentry_barrier() {
         damage_root_and_composite(&mut backend);
         retire_composed_frame(&mut backend, &mut state, index as u32 + 1);
     }
-    assert_eq!(backend.pstate.tearing.probation, 7);
+    assert_eq!(backend.pstate.direct.root().tearing_probation.count, 7);
     assert_eq!(backend.pstate.direct.root().eligible_streak, 7);
     assert!(
         try_direct_present_with_live_storage(
@@ -1787,8 +1942,8 @@ fn non_async_authoritative_present_resets_probation_during_reentry_barrier() {
     assert!(backend.scene.root_overlay.is_empty());
 
     assert!(try_direct_present_for_window(&mut backend, 848, WINDOW, width, height, 0).is_none());
-    assert_eq!(backend.pstate.tearing.probation, 0);
-    assert_eq!(backend.pstate.tearing.probation_owner, None);
+    assert_eq!(backend.pstate.direct.root().tearing_probation.count, 0);
+    assert_eq!(backend.pstate.direct.root().tearing_probation.window, None);
     assert!(backend.pstate.direct.root().reentry_blocked_until_composed);
     assert_tearing_off(&backend);
     damage_root_and_composite(&mut backend);
@@ -1842,8 +1997,11 @@ fn probation_restarts_when_another_window_takes_the_root() {
         backend.pstate.tearing.state,
         crate::kms::render::backend::TearingState::Off
     ));
-    assert_eq!(backend.pstate.tearing.probation, 4);
-    assert_eq!(backend.pstate.tearing.probation_owner, Some(WINDOW_B));
+    assert_eq!(backend.pstate.direct.root().tearing_probation.count, 4);
+    assert_eq!(
+        backend.pstate.direct.root().tearing_probation.window,
+        Some(WINDOW_B)
+    );
     qualify_direct_async(&mut backend, &recorder, &mut state, WINDOW_B, 1008, 4);
     assert!(matches!(
         backend.pstate.tearing.state,
@@ -2061,7 +2219,10 @@ fn vt_release_exits_tearing_and_resume_needs_probation() {
         } else {
             assert!(index < 7);
             assert_eq!(recorder.records().len(), before_present);
-            assert_eq!(backend.pstate.tearing.probation, index as u8 + 1);
+            assert_eq!(
+                backend.pstate.direct.root().tearing_probation.count,
+                index as u8 + 1
+            );
             assert_eq!(
                 backend.pstate.direct.root().eligible_streak,
                 index as u8 + 1
@@ -4890,6 +5051,357 @@ fn task5_client_frame_is_never_deferred_by_cursor_cap() {
     assert_eq!(backend.pstate.tearing.deferred_cursor_wake, None);
     assert!(!backend.scene.has_pending_page_flips());
     assert!(backend.pending_present_batches.is_empty());
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutations: global tearing scope; Root-only tearing.
+fn output_owner_tears_while_other_output_composes() {
+    use yserver_core::backend::Backend;
+
+    let Some(mut fixture) = super::commit_identity::recording_scene::RecordingSceneFixture::
+        with_output_admission_topology()
+        .expect("dual-output admission fixture")
+    else {
+        eprintln!(
+            "SKIP output_owner_tears_while_other_output_composes: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    for device in &mut fixture.events.backend.platform.devices {
+        device.async_page_flip = true;
+    }
+    Backend::set_cursor_hidden(&mut fixture.events.backend, true);
+
+    let owner = fixture.install_direct_output_present(
+        1,
+        15_201,
+        yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+    );
+    let owner_record = enter_output_owner_through_backend(&mut fixture, &owner, 1);
+    let crtc1 = fixture.events.backend.platform.outputs[1].output.crtc;
+    let crtc0 = fixture.events.backend.platform.outputs[0].output.crtc;
+    assert_eq!(owner_record.kind, AtomicCommitKind::Async);
+    assert_eq!(owner_record.events.len(), 1);
+    assert_eq!(owner_record.events[0].crtc, crtc1);
+    assert!(matches!(
+        fixture.events.backend.pstate.tearing.state,
+        crate::kms::render::backend::TearingState::On { window, .. }
+            if window == owner.candidate.dst_window_xid
+    ));
+    assert_eq!(
+        fixture.events.backend.tearing_scope_outputs(),
+        [1],
+        "only Output(1) is owned by the tearing stream"
+    );
+
+    damage_root(&mut fixture.events.backend);
+    let device_fd = fixture.kms_fd(1);
+    let before_compose = fixture.events.recorders[&device_fd].records().len();
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("compose Output(0) while Output(1) tears");
+    let scene0 = fixture.events.recorders[&device_fd]
+        .records()
+        .into_iter()
+        .skip(before_compose)
+        .find(|record| {
+            matches!(
+                record.kind,
+                AtomicCommitKind::Scene | AtomicCommitKind::SceneWithCursor
+            ) && record.events.iter().any(|event| event.crtc == crtc0)
+        })
+        .expect("Output(0) composes while Output(1) stays direct");
+    assert!(
+        !scene0
+            .flags
+            .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_ASYNC),
+        "the unrelated composed output uses synchronized timing"
+    );
+    assert!(scene0.events.iter().all(|event| event.crtc == crtc0));
+    let mut delivered = std::collections::HashSet::new();
+    super::cursor_sprites::support::retire_pending_output(
+        &mut fixture.events,
+        &mut delivered,
+        0,
+        42,
+    );
+
+    let mut other = fixture.install_direct_output_present(
+        0,
+        15_202,
+        yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+    );
+    other.candidate.client_id = 2;
+    other.event.client_id = yserver_protocol::x11::ClientId(2);
+    let other_record = enter_output_owner_through_backend(&mut fixture, &other, 0);
+    assert_eq!(other_record.kind, AtomicCommitKind::Scene);
+    assert!(
+        !other_record
+            .flags
+            .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_ASYNC),
+        "a second async client receives synchronized direct flips"
+    );
+    assert_eq!(other_record.events.len(), 1);
+    assert_eq!(other_record.events[0].crtc, crtc0);
+    assert!(matches!(
+        fixture.events.backend.pstate.tearing.state,
+        crate::kms::render::backend::TearingState::On { window, .. }
+            if window == owner.candidate.dst_window_xid
+    ));
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_some()
+    );
+    assert!(fixture.events.backend.pstate.direct.outputs[0].active());
+    fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutations: clear every record on exit; use one global tearing-probation record.
+fn successor_takes_tearing_with_its_own_streak() {
+    use yserver_core::backend::Backend;
+
+    let Some(mut fixture) = super::commit_identity::recording_scene::RecordingSceneFixture::
+        with_output_admission_topology()
+        .expect("dual-output admission fixture")
+    else {
+        eprintln!("SKIP successor_takes_tearing_with_its_own_streak: Vulkan fixture unavailable");
+        return;
+    };
+    for device in &mut fixture.events.backend.platform.devices {
+        device.async_page_flip = true;
+    }
+    Backend::set_cursor_hidden(&mut fixture.events.backend, true);
+    let first = fixture.install_direct_output_present(
+        1,
+        15_301,
+        yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+    );
+    let _first_record = enter_output_owner_through_backend(&mut fixture, &first, 1);
+    let successor = fixture.install_direct_output_present(
+        0,
+        15_302,
+        yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+    );
+    let probation = usize::from(crate::kms::render::backend::TEARING_ENTRY_PROBATION);
+    let mut delivered = std::collections::HashSet::new();
+    for attempt in 0..probation {
+        let accepted = output_probation_present(
+            &mut fixture,
+            &mut delivered,
+            &successor,
+            0,
+            15_400 + u64::try_from(attempt).expect("Present id fits"),
+            yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+            50 + u32::try_from(attempt).expect("frame fits"),
+        );
+        assert_eq!(
+            accepted,
+            attempt + 1 == probation,
+            "the successor enters direct on its M2 threshold while the other output tears"
+        );
+        assert!(matches!(
+            fixture.events.backend.pstate.tearing.state,
+            crate::kms::render::backend::TearingState::On { window, .. }
+                if window == first.candidate.dst_window_xid
+        ));
+    }
+    assert_eq!(
+        fixture.events.backend.pstate.direct.outputs[0]
+            .tearing_probation
+            .count,
+        crate::kms::render::backend::TEARING_ENTRY_PROBATION
+    );
+
+    Backend::destroy_subwindow(&mut fixture.events.backend, None, first.target_xid)
+        .expect("destroy the tearing owner's window through Backend");
+    assert_eq!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .tearing_probation
+            .count,
+        0,
+        "owner exit clears its own record immediately"
+    );
+    assert_eq!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .tearing_probation
+            .window,
+        None
+    );
+    assert_eq!(
+        fixture.events.backend.pstate.direct.outputs[0]
+            .tearing_probation
+            .count,
+        crate::kms::render::backend::TEARING_ENTRY_PROBATION,
+        "the successor keeps its full streak across owner exit"
+    );
+
+    assert!(output_probation_present(
+        &mut fixture,
+        &mut delivered,
+        &successor,
+        0,
+        15_500,
+        yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+        70,
+    ));
+    assert!(matches!(
+        fixture.events.backend.pstate.tearing.state,
+        crate::kms::render::backend::TearingState::On { window, .. }
+            if window == successor.candidate.dst_window_xid
+    ));
+    fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutations: use one global tearing-probation record; let foreign Presents reset the record.
+fn foreign_presents_leave_partial_output_streak_unchanged() {
+    let Some(mut fixture) = super::commit_identity::recording_scene::RecordingSceneFixture::
+        with_output_admission_topology()
+        .expect("dual-output admission fixture")
+    else {
+        eprintln!(
+            "SKIP foreign_presents_leave_partial_output_streak_unchanged: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    for device in &mut fixture.events.backend.platform.devices {
+        device.async_page_flip = true;
+    }
+    let output0 = fixture.install_direct_output_present(
+        0,
+        15_601,
+        yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+    );
+    let output1 = fixture.install_direct_output_present(
+        1,
+        15_602,
+        yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+    );
+    fixture
+        .events
+        .backend
+        .for_tests_set_scanout_m1_prober(super::present_scanout::record_scanout_m1_probe);
+    let probation = usize::from(crate::kms::render::backend::TEARING_ENTRY_PROBATION);
+    let mut delivered = std::collections::HashSet::new();
+    for attempt in 0..3 {
+        assert!(!output_probation_present(
+            &mut fixture,
+            &mut delivered,
+            &output0,
+            0,
+            15_700 + u64::try_from(attempt).expect("Present id fits"),
+            yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+            10 + u32::try_from(attempt).expect("frame fits"),
+        ));
+    }
+    assert_eq!(
+        fixture.events.backend.pstate.direct.outputs[0]
+            .tearing_probation
+            .count,
+        3
+    );
+
+    assert!(!output_probation_present(
+        &mut fixture,
+        &mut delivered,
+        &output1,
+        1,
+        15_710,
+        yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+        20,
+    ));
+    assert!(!output_probation_present(
+        &mut fixture,
+        &mut delivered,
+        &output1,
+        1,
+        15_711,
+        0,
+        21,
+    ));
+    assert_eq!(
+        fixture.events.backend.pstate.direct.outputs[0]
+            .tearing_probation
+            .count,
+        3,
+        "Output(1)'s async and synchronized Presents leave Output(0)'s streak unchanged"
+    );
+    assert_eq!(
+        fixture.events.backend.pstate.direct.outputs[0]
+            .tearing_probation
+            .window,
+        Some(output0.candidate.dst_window_xid)
+    );
+
+    for attempt in 3..probation {
+        let accepted = output_probation_present(
+            &mut fixture,
+            &mut delivered,
+            &output0,
+            0,
+            15_700 + u64::try_from(attempt).expect("Present id fits"),
+            yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+            30 + u32::try_from(attempt).expect("frame fits"),
+        );
+        assert_eq!(
+            accepted,
+            attempt + 1 == probation,
+            "Output(0) reaches tearing after exactly its remaining qualifying Presents"
+        );
+    }
+    assert!(matches!(
+        fixture.events.backend.pstate.tearing.state,
+        crate::kms::render::backend::TearingState::On { window, .. }
+            if window == output0.candidate.dst_window_xid
+    ));
+    fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: release tearing when the owner has no recent Present.
+fn paused_tearing_owner_keeps_tearing() {
+    use yserver_core::backend::Backend;
+
+    let Some(mut fixture) = super::commit_identity::recording_scene::RecordingSceneFixture::
+        with_output_admission_topology()
+        .expect("dual-output admission fixture")
+    else {
+        eprintln!("SKIP paused_tearing_owner_keeps_tearing: Vulkan fixture unavailable");
+        return;
+    };
+    for device in &mut fixture.events.backend.platform.devices {
+        device.async_page_flip = true;
+    }
+    Backend::set_cursor_hidden(&mut fixture.events.backend, true);
+    let owner = fixture.install_direct_output_present(
+        1,
+        15_801,
+        yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+    );
+    let _owner_record = enter_output_owner_through_backend(&mut fixture, &owner, 1);
+    let state = fixture.events.backend.pstate.tearing.state;
+    assert!(fixture.events.backend.pstate.tearing.is_on());
+
+    for _ in 0..4 {
+        let _ = Backend::next_wakeup(&fixture.events.backend);
+        Backend::maybe_composite(&mut fixture.events.backend)
+            .expect("run an idle scheduling pass while the owner is paused");
+        assert_eq!(
+            fixture.events.backend.pstate.tearing.state, state,
+            "idle scheduling leaves the tearing owner unchanged"
+        );
+        assert!(
+            fixture.events.backend.pstate.direct.outputs[1]
+                .current
+                .is_some()
+        );
+    }
+    fixture.finish();
 }
 
 mod round2;

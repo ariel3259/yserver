@@ -642,6 +642,29 @@ pub(in crate::kms::render::backend) type ScanoutM1Prober = fn(
 /// causes direct/composed atomic thrash.
 pub(in crate::kms::render::backend) const SCANOUT_M2_ELIGIBLE_ROOT_PROBATION: u8 = 8;
 
+/// Per-direct-slot Presents that qualify for the single tearing owner.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::kms::render::backend) struct TearingProbation {
+    pub(in crate::kms::render::backend) window: Option<u32>,
+    pub(in crate::kms::render::backend) count: u8,
+}
+
+impl TearingProbation {
+    pub(in crate::kms::render::backend) fn note_qualifying_present(&mut self, window: u32) -> u8 {
+        if self.window != Some(window) {
+            self.window = Some(window);
+            self.count = 1;
+        } else {
+            self.count = self.count.saturating_add(1).min(TEARING_ENTRY_PROBATION);
+        }
+        self.count
+    }
+
+    pub(in crate::kms::render::backend) fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 pub(in crate::kms::render::backend) struct ScanoutM2State {
     pub(in crate::kms::render::backend) pending: Option<DirectPresentFrame>,
     /// One eligible direct successor, retained while `pending` owns the
@@ -680,6 +703,7 @@ pub(in crate::kms::render::backend) struct ScanoutM2State {
     pub(in crate::kms::render::backend) unflip_awaiting_outputs: HashMap<usize, u64>,
     pub(in crate::kms::render::backend) reentry_blocked_until_composed: bool,
     pub(in crate::kms::render::backend) eligible_streak: u8,
+    pub(in crate::kms::render::backend) tearing_probation: TearingProbation,
     pub(in crate::kms::render::backend) unflip_fallback_source: Option<DrawableId>,
     pub(in crate::kms::render::backend) unflip_shadow_ready: bool,
     /// The synchronized composed unflip failed and was degraded to the
@@ -711,6 +735,7 @@ impl ScanoutM2State {
             unflip_awaiting_outputs: HashMap::new(),
             reentry_blocked_until_composed: false,
             eligible_streak: 0,
+            tearing_probation: TearingProbation::default(),
             unflip_fallback_source: None,
             unflip_shadow_ready: false,
             degraded_composed_unflip: false,
@@ -759,6 +784,10 @@ impl ScanoutM2State {
 
     pub(in crate::kms::render::backend) fn reset_eligible_direct_probation(&mut self) {
         self.eligible_streak = 0;
+    }
+
+    pub(in crate::kms::render::backend) fn reset_tearing_probation(&mut self) {
+        self.tearing_probation.reset();
     }
 }
 
@@ -891,6 +920,7 @@ pub(in crate::kms::render::backend) enum TearingState {
 /// this candidate and target to revalidate ownership against the live tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::kms::render::backend) struct TearingAdmissionContext {
+    pub(in crate::kms::render::backend) scope: DirectScope,
     pub(in crate::kms::render::backend) candidate: PresentScanoutCandidate,
     pub(in crate::kms::render::backend) target: ScanoutM0Target,
     pub(in crate::kms::render::backend) root_host_xid: u32,
@@ -898,8 +928,6 @@ pub(in crate::kms::render::backend) struct TearingAdmissionContext {
 
 pub(in crate::kms::render::backend) struct Tearing {
     pub(in crate::kms::render::backend) state: TearingState,
-    pub(in crate::kms::render::backend) probation: u8,
-    pub(in crate::kms::render::backend) probation_owner: Option<u32>,
     pub(in crate::kms::render::backend) hide_failed_logged: bool,
     pub(in crate::kms::render::backend) last_cursor_compose: Option<std::time::Instant>,
     pub(in crate::kms::render::backend) deferred_cursor_wake: Option<std::time::Instant>,
@@ -909,8 +937,6 @@ impl Tearing {
     pub(in crate::kms::render::backend) fn new() -> Self {
         Self {
             state: TearingState::Off,
-            probation: 0,
-            probation_owner: None,
             hide_failed_logged: false,
             last_cursor_compose: None,
             deferred_cursor_wake: None,
@@ -919,11 +945,6 @@ impl Tearing {
 
     pub(in crate::kms::render::backend) fn is_on(&self) -> bool {
         matches!(self.state, TearingState::On { .. })
-    }
-
-    pub(in crate::kms::render::backend) fn reset_probation(&mut self) {
-        self.probation = 0;
-        self.probation_owner = None;
     }
 
     pub(in crate::kms::render::backend) fn note_composed_submit(

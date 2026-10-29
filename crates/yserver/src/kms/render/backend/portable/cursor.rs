@@ -484,8 +484,11 @@ impl<P: Platform> XBackend<P> {
 
     /// Whether the currently-effective sprite should be visible in the live
     /// output layout, regardless of the scene's retired HW/SW classification.
-    pub(in crate::kms::render::backend) fn tearing_cursor_wants_visible(&self) -> bool {
-        if self.effective_cursor_hidden() {
+    pub(in crate::kms::render::backend) fn tearing_cursor_wants_visible_for_outputs(
+        &self,
+        output_indices: &[usize],
+    ) -> bool {
+        if output_indices.is_empty() || self.effective_cursor_hidden() {
             return false;
         }
         let Some(record) = self
@@ -502,7 +505,16 @@ impl<P: Platform> XBackend<P> {
         let height = i64::from(record.height);
         let hot_x = i64::from(record.hot_x);
         let hot_y = i64::from(record.hot_y);
-        P::cursor_intersects_outputs(self, cursor_x, cursor_y, hot_x, hot_y, width, height)
+        P::cursor_intersects_outputs(
+            self,
+            output_indices,
+            cursor_x,
+            cursor_y,
+            hot_x,
+            hot_y,
+            width,
+            height,
+        )
     }
 
     /// XFIXES `HideCursor` / `ShowCursor` edge. Hiding drops the scene's
@@ -702,13 +714,10 @@ impl<P: Platform> XBackend<P> {
         } else {
             Vec::new()
         };
-        // Root tearing suppresses the scene-wide cursor upload, but an
-        // independent Output owner still refreshes its own hardware cursor
-        // through the owner-aware path above.
-        if P::tearing_active(self) {
-            return;
-        }
+        let output_count = self.platform.output_layouts().len();
+        let tearing_suppressed = P::tearing_cursor_suppression_mask(self, output_count);
         let refreshes_visible_cursor = direct_owns_frame
+            || tearing_suppressed.iter().any(|suppressed| *suppressed)
             || match self.scene.cursor_mode() {
                 crate::kms::render::scene::CursorPlaneMode::Hw
                 | crate::kms::render::scene::CursorPlaneMode::Mixed => true,
@@ -716,9 +725,14 @@ impl<P: Platform> XBackend<P> {
                 | crate::kms::render::scene::CursorPlaneMode::Sw => false,
             };
         if refreshes_visible_cursor {
-            let output_count = self.platform.output_layouts().len();
             let queued_outputs: Vec<_> = (0..output_count)
-                .filter(|output_idx| !refreshed_direct_outputs.contains(output_idx))
+                .filter(|output_idx| {
+                    !refreshed_direct_outputs.contains(output_idx)
+                        && !tearing_suppressed
+                            .get(*output_idx)
+                            .copied()
+                            .unwrap_or(false)
+                })
                 .collect();
             self.scene
                 .queue_steady_state_cursor_upload(record.version, &queued_outputs);
