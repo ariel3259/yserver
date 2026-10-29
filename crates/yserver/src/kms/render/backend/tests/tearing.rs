@@ -2106,6 +2106,91 @@ fn dpms_off_exits_tearing_and_on_requires_fresh_probation() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: skip clearing partial Root tearing probation when exit_tearing runs while Off.
+fn dpms_off_resets_partial_root_tearing_probation() {
+    use yserver_core::backend::Backend;
+
+    const WINDOW: u32 = 0x7d01;
+    let Some(mut backend) = live_scene_backend() else {
+        eprintln!(
+            "SKIP dpms_off_resets_partial_root_tearing_probation: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    for device in &mut backend.platform.devices {
+        device.async_page_flip = true;
+    }
+    backend.platform.for_tests_accept_output_power_commits();
+    let recorder = recording_sink(&mut backend, 0);
+    let mut state = yserver_core::server::ServerState::new();
+    let (width, height) = backend.platform.fb_dimensions();
+
+    for index in 0..7_u64 {
+        assert!(
+            try_direct_present_with_live_storage(
+                &mut backend,
+                1320 + index,
+                WINDOW,
+                width,
+                height,
+                yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+            )
+            .is_none()
+        );
+        damage_root_and_composite(&mut backend);
+        retire_composed_frame(&mut backend, &mut state, index as u32 + 1);
+    }
+    assert!(matches!(
+        backend.pstate.tearing.state,
+        crate::kms::render::backend::TearingState::Off
+    ));
+    assert_eq!(backend.pstate.direct.root().tearing_probation.count, 7);
+    assert_eq!(
+        backend.pstate.direct.root().tearing_probation.window,
+        Some(WINDOW)
+    );
+
+    Backend::set_dpms_power(&mut backend, 3).expect("DPMS off fixture");
+    assert_eq!(backend.pstate.direct.root().tearing_probation.count, 0);
+    assert_eq!(backend.pstate.direct.root().tearing_probation.window, None);
+    assert_tearing_off(&backend);
+
+    Backend::set_dpms_power(&mut backend, 0).expect("DPMS on fixture");
+    Backend::set_cursor_hidden(&mut backend, true);
+    damage_root_and_composite(&mut backend);
+    retire_composed_frame(&mut backend, &mut state, 8);
+    recorder.clear_records();
+
+    assert!(
+        try_direct_present_with_live_storage(
+            &mut backend,
+            1327,
+            WINDOW,
+            width,
+            height,
+            yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+        )
+        .is_some()
+    );
+    assert!(matches!(
+        backend.pstate.tearing.state,
+        crate::kms::render::backend::TearingState::Off
+    ));
+    assert!(backend.platform.async_ledger.for_tests_is_empty());
+    assert_eq!(backend.pstate.direct.root().tearing_probation.count, 1);
+    assert_eq!(
+        backend.pstate.direct.root().tearing_probation.window,
+        Some(WINDOW)
+    );
+    assert_eq!(recorder.records().len(), 1);
+    assert_eq!(recorder.records()[0].kind, AtomicCommitKind::Scene);
+    retire_direct_present(&mut backend, &mut state, 9);
+    assert_commit_sequence(&recorder, &[AtomicCommitKind::Scene]);
+    assert_direct_queue_drained(&backend);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: retain tearing on VT release or skip the fresh eight-Present Vsync probation after acquire.
 fn vt_release_exits_tearing_and_resume_needs_probation() {
     use yserver_core::{backend::Backend, core_loop::input_inventory::InputInventory};

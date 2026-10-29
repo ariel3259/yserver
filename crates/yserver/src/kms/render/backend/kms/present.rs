@@ -435,9 +435,8 @@ impl KmsBackend {
 
     pub(super) fn exit_tearing(&mut self, reason: &'static str) {
         let was_on = self.pstate.tearing.is_on();
-        if let Some(scope) = self.tearing_scope()
-            && let Some(owner) = self.pstate.direct.get_mut(scope)
-        {
+        let probation_scope = self.tearing_scope().unwrap_or(DirectScope::Root);
+        if let Some(owner) = self.pstate.direct.get_mut(probation_scope) {
             owner.reset_tearing_probation();
         }
         self.pstate.tearing.state = TearingState::Off;
