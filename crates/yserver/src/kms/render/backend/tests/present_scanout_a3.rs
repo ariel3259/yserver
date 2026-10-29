@@ -936,48 +936,53 @@ fn output_restack_revalidation() {
         };
         let mut fixture = fixture.cleanup_guard();
         let mut state = ServerState::new();
-        let lower = a3_seed_ordered_window(
-            &mut fixture,
-            &mut state,
-            ResourceId(0x3100),
-            100,
-            100,
-            500,
-            500,
-            true,
-        );
-        let upper = a3_seed_ordered_window(
-            &mut fixture,
-            &mut state,
-            ResourceId(0x3101),
-            100,
-            100,
-            500,
-            500,
-            true,
-        );
-        Backend::fill_rectangle(
-            &mut fixture.events.backend,
-            None,
-            lower,
-            0x00ff_0000,
-            0,
-            0,
-            500,
-            500,
-        )
-        .expect("paint the lower output 0 window red");
-        Backend::fill_rectangle(
-            &mut fixture.events.backend,
-            None,
-            upper,
-            0x0000_00ff,
-            0,
-            0,
-            500,
-            500,
-        )
-        .expect("paint the upper output 0 window blue");
+        let restack_windows = if row == "restack-elsewhere" {
+            let lower = a3_seed_ordered_window(
+                &mut fixture,
+                &mut state,
+                ResourceId(0x3100),
+                100,
+                100,
+                500,
+                500,
+                true,
+            );
+            let upper = a3_seed_ordered_window(
+                &mut fixture,
+                &mut state,
+                ResourceId(0x3101),
+                100,
+                100,
+                500,
+                500,
+                true,
+            );
+            Backend::fill_rectangle(
+                &mut fixture.events.backend,
+                None,
+                lower,
+                0x00ff_0000,
+                0,
+                0,
+                500,
+                500,
+            )
+            .expect("paint the lower output 0 window red");
+            Backend::fill_rectangle(
+                &mut fixture.events.backend,
+                None,
+                upper,
+                0x0000_00ff,
+                0,
+                0,
+                500,
+                500,
+            )
+            .expect("paint the upper output 0 window blue");
+            Some((lower, upper))
+        } else {
+            None
+        };
 
         let game_rid = ResourceId(0x3111);
         let game_xid = direct.target_xid;
@@ -1019,6 +1024,7 @@ fn output_restack_revalidation() {
 
         match row {
             "restack-elsewhere" => {
+                let (lower, upper) = restack_windows.expect("restack row has output 0 windows");
                 a3_restack_top_level(
                     &mut fixture,
                     &mut state,
@@ -2015,19 +2021,16 @@ fn other_output_progresses() {
                     output0_id, pending_id,
                     "{row}: independent CRTC acknowledgements use distinct event IDs"
                 );
-                let mut accepted_crtcs = vec![pending_record.events[0].crtc];
-                accepted_crtcs.extend(records.iter().filter_map(|record| {
-                    super::commit_identity::accepted_event_id(record).and_then(|_| {
-                        record
-                            .events
-                            .iter()
-                            .find(|event| event.crtc == output0_crtc)
-                            .map(|event| event.crtc)
-                    })
-                }));
+                let mut accepted_crtcs: Vec<_> = std::iter::once(&pending_record)
+                    .chain(records.iter())
+                    .filter(|record| super::commit_identity::accepted_event_id(record).is_some())
+                    .flat_map(|record| record.events.iter().map(|event| event.crtc))
+                    .collect();
+                accepted_crtcs.sort_by_key(|crtc| u32::from(*crtc));
+                let mut expected_crtcs = vec![output0_crtc, output1_crtc];
+                expected_crtcs.sort_by_key(|crtc| u32::from(*crtc));
                 assert_eq!(
-                    accepted_crtcs,
-                    [output1_crtc, output0_crtc],
+                    accepted_crtcs, expected_crtcs,
                     "{row}: exact accepted commits cover the pending owner and damaged output"
                 );
                 assert_eq!(
@@ -2112,10 +2115,15 @@ fn other_output_progresses() {
                 retire_held_output_owner(&mut fixture, &direct, row);
             }
             // D02/A16: fresh replacement and unrelated scene damage are both accepted in one pass.
-            "fresh-unflip" => {
+            "fresh-unflip" | "degraded-unflip" => {
                 Backend::unmap_subwindow(&mut fixture.events.backend, None, direct.target_xid)
                     .expect("request fresh unflip through Backend");
                 super::commit_identity::direct_unflip::damage_scene_root(&mut fixture);
+                if row == "degraded-unflip" {
+                    let recorder = fixture.events.recorders[&fd].clone();
+                    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+                    recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+                }
                 let records = a3_tick(&mut fixture);
                 let mut accepted_crtcs: Vec<_> = records
                     .iter()
@@ -2135,35 +2143,48 @@ fn other_output_progresses() {
                         super::commit_identity::accepted_event_id(record).is_some()
                             && a3_has_scene_commit_for(std::slice::from_ref(*record), output0_crtc)
                     })
-                    .expect("output 0 scene frame accepted in fresh-unflip pass");
+                    .expect("output 0 scene frame accepted while output 1 is unflipping");
                 let replacement = records
                     .iter()
                     .find(|record| {
                         super::commit_identity::accepted_event_id(record).is_some()
                             && a3_has_scene_commit_for(std::slice::from_ref(*record), output1_crtc)
                     })
-                    .expect("output 1 fresh replacement accepted in same pass");
+                    .expect("output 1 replacement accepted in the same pass");
                 let output0_id = super::commit_identity::accepted_event_id(output0_record).unwrap();
                 let replacement_id =
                     super::commit_identity::accepted_event_id(replacement).unwrap();
-                assert_ne!(
-                    output0_id, replacement_id,
-                    "{row}: each output has an independent accepted acknowledgement ID"
-                );
-                assert_eq!(
-                    fixture.events.backend.scene.pending_page_flip_event_id(0),
-                    Some(output0_id),
-                    "{row}: output 0 tracks its own scene acknowledgement"
-                );
-                assert_eq!(
-                    fixture.events.backend.scene.pending_page_flip_event_id(1),
-                    Some(replacement_id),
-                    "{row}: output 1 tracks its replacement acknowledgement"
-                );
-                assert!(
-                    fixture.events.backend.pstate.direct.outputs[1].fresh_composed_unflip,
-                    "{row}: accepted replacement is classified as a fresh unflip"
-                );
+                if row == "fresh-unflip" {
+                    assert_ne!(
+                        output0_id, replacement_id,
+                        "{row}: each output has an independent accepted acknowledgement ID"
+                    );
+                    assert_eq!(
+                        fixture.events.backend.scene.pending_page_flip_event_id(0),
+                        Some(output0_id),
+                        "{row}: output 0 tracks its own scene acknowledgement"
+                    );
+                    assert_eq!(
+                        fixture.events.backend.scene.pending_page_flip_event_id(1),
+                        Some(replacement_id),
+                        "{row}: output 1 tracks its replacement acknowledgement"
+                    );
+                    assert!(
+                        fixture.events.backend.pstate.direct.outputs[1].fresh_composed_unflip,
+                        "{row}: accepted replacement is classified as a fresh unflip"
+                    );
+                } else {
+                    assert!(
+                        fixture.events.backend.pstate.direct.outputs[1].degraded_composed_unflip,
+                        "{row}: EIO enters degraded replacement"
+                    );
+                    assert!(
+                        fixture.events.backend.pstate.direct.outputs[1]
+                            .unflip_outputs_to_replace
+                            .contains(&1),
+                        "{row}: degraded replacement obligation remains until retirement"
+                    );
+                }
                 assert_eq!(
                     fixture.events.backend.pstate.direct.outputs[1]
                         .unflip_awaiting_outputs
@@ -2192,79 +2213,6 @@ fn other_output_progresses() {
                 assert!(
                     fixture.events.backend.present_source_pins.is_empty(),
                     "{row}: replacement retirement releases source pins"
-                );
-            }
-            // D02/A16/T07: degraded replacement still composes unrelated ready output 0.
-            "degraded-unflip" => {
-                Backend::unmap_subwindow(&mut fixture.events.backend, None, direct.target_xid)
-                    .expect("request degraded unflip through Backend");
-                super::commit_identity::direct_unflip::damage_scene_root(&mut fixture);
-                let recorder = fixture.events.recorders[&fd].clone();
-                recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
-                recorder.script_result(Err(std::io::Error::from_raw_os_error(libc::EIO)));
-                let records = a3_tick(&mut fixture);
-                let mut accepted_crtcs: Vec<_> = records
-                    .iter()
-                    .filter(|record| super::commit_identity::accepted_event_id(record).is_some())
-                    .flat_map(|record| record.events.iter().map(|event| event.crtc))
-                    .collect();
-                accepted_crtcs.sort_by_key(|crtc| u32::from(*crtc));
-                let mut expected_crtcs = vec![output0_crtc, output1_crtc];
-                expected_crtcs.sort_by_key(|crtc| u32::from(*crtc));
-                assert_eq!(
-                    accepted_crtcs, expected_crtcs,
-                    "{row}: degraded pass accepts both unrelated scene and replacement CRTCs"
-                );
-                assert!(
-                    fixture.events.backend.pstate.direct.outputs[1].degraded_composed_unflip,
-                    "{row}: EIO enters degraded replacement"
-                );
-                let output0_record = records
-                    .iter()
-                    .find(|record| {
-                        super::commit_identity::accepted_event_id(record).is_some()
-                            && a3_has_scene_commit_for(std::slice::from_ref(*record), output0_crtc)
-                    })
-                    .expect("unrelated output 0 composition is accepted in degraded pass");
-                let replacement = records
-                    .iter()
-                    .find(|record| {
-                        super::commit_identity::accepted_event_id(record).is_some()
-                            && a3_has_scene_commit_for(std::slice::from_ref(*record), output1_crtc)
-                    })
-                    .expect("degraded output 1 replacement is accepted");
-                let replacement_id =
-                    super::commit_identity::accepted_event_id(replacement).unwrap();
-                assert_eq!(
-                    fixture.events.backend.pstate.direct.outputs[1]
-                        .unflip_awaiting_outputs
-                        .get(&1),
-                    Some(&replacement_id),
-                    "{row}: accepted degraded replacement identity is tracked"
-                );
-                assert!(
-                    fixture.events.backend.pstate.direct.outputs[1]
-                        .unflip_outputs_to_replace
-                        .contains(&1),
-                    "{row}: degraded replacement obligation remains until retirement"
-                );
-                a3_retire_records(&mut fixture, std::slice::from_ref(output0_record));
-                assert!(
-                    fixture.events.backend.pstate.direct.outputs[1]
-                        .current
-                        .is_some(),
-                    "{row}: unrelated output retirement leaves degraded owner active"
-                );
-                a3_retire_records(&mut fixture, std::slice::from_ref(replacement));
-                assert!(
-                    fixture.events.backend.pstate.direct.outputs[1]
-                        .current
-                        .is_none(),
-                    "{row}: replacement retirement releases degraded owner"
-                );
-                assert!(
-                    fixture.events.backend.present_source_pins.is_empty(),
-                    "{row}: degraded retirement releases source pins"
                 );
             }
             _ => unreachable!("known Q06 row"),
