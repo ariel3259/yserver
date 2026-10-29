@@ -276,7 +276,16 @@ pub(crate) fn establish_hardware_cursor(
     cursor: CursorHandle,
     pointer: (i32, i32),
 ) -> HardwareCursor {
-    let output_idx = 0;
+    establish_hardware_cursor_on_output(fixture, delivered, cursor, 0, pointer)
+}
+
+pub(crate) fn establish_hardware_cursor_on_output(
+    fixture: &mut AtomicPathFixture,
+    delivered: &mut HashSet<CompletionKey>,
+    cursor: CursorHandle,
+    output_idx: usize,
+    pointer: (i32, i32),
+) -> HardwareCursor {
     {
         let backend = &mut fixture.scene.events.backend;
         define_root_cursor(backend, cursor);
@@ -551,14 +560,22 @@ pub(crate) fn drain_unretired_output_events(
     delivered: &mut HashSet<CompletionKey>,
     output_idx: usize,
 ) {
+    drain_output_events(&mut fixture.scene.events, delivered, output_idx);
+}
+
+pub(crate) fn drain_output_events(
+    events: &mut AtomicEventFixture,
+    delivered: &mut HashSet<CompletionKey>,
+    output_idx: usize,
+) {
     for frame in 20..28 {
-        if !has_unretired_accepted_event(&fixture.scene.events, delivered, output_idx) {
+        if !has_unretired_accepted_event(events, delivered, output_idx) {
             return;
         }
-        retire_pending_output(&mut fixture.scene.events, delivered, output_idx, frame);
+        retire_pending_output(events, delivered, output_idx, frame);
     }
     assert!(
-        !has_unretired_accepted_event(&fixture.scene.events, delivered, output_idx),
+        !has_unretired_accepted_event(events, delivered, output_idx),
         "accepted output events did not drain"
     );
 }
@@ -747,7 +764,7 @@ pub(crate) fn enter_held_direct(
                     .pstate
                     .direct
                     .root()
-                    .eligible_root_streak,
+                    .eligible_streak,
                 fixture.scene.events.backend.effective_cursor_hidden(),
                 fixture
                     .scene
@@ -755,7 +772,9 @@ pub(crate) fn enter_held_direct(
                     .backend
                     .platform
                     .any_cursor_plane_visible(),
-                fixture.scene.events.backend.direct_cursor_eligible(),
+                fixture.scene.events.backend.direct_cursor_eligible_for(
+                    &(0..fixture.scene.events.backend.platform.outputs.len()).collect::<Vec<_>>(),
+                ),
                 fixture
                     .scene
                     .events

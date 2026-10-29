@@ -219,6 +219,7 @@ impl KmsBackend {
             direct,
             tearing: Tearing::new(),
             direct_frame_submitter: KmsBackend::submit_direct_frame_live,
+            scanout_m1_prober: KmsBackend::probe_direct_scanout_m1_live,
             vt_resume_executor: std::rc::Rc::new(DrmVtResumeExecutor),
             monotonic_clock: std::rc::Rc::new(std::time::Instant::now),
             armed_vblank_targets: std::collections::HashMap::new(),
@@ -418,12 +419,16 @@ impl KmsBackend {
             self.platform.fb_dimensions(),
             self.pstate.tearing.is_on(),
         );
+        let skip_outputs: Vec<_> = (0..self.platform.outputs.len())
+            .map(|output_idx| self.output_is_direct(output_idx))
+            .collect();
         let vrr_before = self.vrr_committed_snapshot();
         let result = self.scene.tick(
             &input,
             &mut self.store,
             &mut self.platform,
             &mut self.telemetry,
+            &skip_outputs,
             cow_host_xid,
         );
         self.log_vrr_committed_changes(&vrr_before, None, "inherited");
@@ -493,9 +498,15 @@ impl KmsBackend {
         self.telemetry.flush_submit_trace();
         let result = self.platform.disable_output();
         if result.is_ok() {
-            self.stop_direct_after_scanout_replaced("shutdown");
+            for scope in self.pstate.direct.active_scopes() {
+                self.stop_direct_after_scanout_replaced(scope, "shutdown");
+            }
             self.pending_completed_events_on_shutdown
                 .append(&mut self.pstate.direct.root_mut().completed);
+            for owner in &mut self.pstate.direct.outputs {
+                self.pending_completed_events_on_shutdown
+                    .append(&mut owner.completed);
+            }
             self.pstate.scanout_m1.clear("shutdown");
         }
         result
@@ -538,11 +549,14 @@ impl KmsBackend {
         state.dpms.power_level = 0;
         state.dpms.last_activity = std::time::Instant::now();
 
-        let direct_shadow_error = if self.pstate.direct.root().active() {
-            self.materialize_direct_shadow_for_unflip().err()
-        } else {
-            None
-        };
+        let mut direct_shadow_error = None;
+        for scope in self.pstate.direct.active_scopes() {
+            if let Err(error) = self.materialize_direct_shadow_for_unflip(scope)
+                && direct_shadow_error.is_none()
+            {
+                direct_shadow_error = Some(error);
+            }
+        }
 
         let old_pending_pageflips = self.pending_pageflip_crtcs();
 
@@ -588,8 +602,8 @@ impl KmsBackend {
         }
         self.platform
             .clear_atomic_cursor_state_after_old_events_discard();
-        if self.pstate.direct.root().active() {
-            self.stop_direct_after_scanout_replaced("VT suspend");
+        for scope in self.pstate.direct.active_scopes() {
+            self.stop_direct_after_scanout_replaced(scope, "VT suspend");
         }
 
         // The old framebuffer references and events are gone. It is now safe
@@ -618,7 +632,7 @@ impl KmsBackend {
 
         // M1 framebuffers are diagnostic-only and never active, but their GEM
         // registrations belong to this DRM-master/topology epoch.
-        if !self.pstate.direct.root().active() {
+        if self.pstate.direct.active_scopes().is_empty() {
             self.pstate.scanout_m1.clear("VT suspend");
         }
 
@@ -704,7 +718,7 @@ impl KmsBackend {
         // A retained direct framebuffer must be released against the old
         // routes even when the connector set is unchanged. Any active removal
         // likewise requires all old CRTCs to be disabled before pools drop.
-        let topology_quiesced = self.pstate.direct.root().active() || active_removed;
+        let topology_quiesced = !self.pstate.direct.active_scopes().is_empty() || active_removed;
         if topology_quiesced
             && let Err(error) = self.quiesce_before_topology_mutation("VT resume topology apply")
         {
@@ -717,9 +731,6 @@ impl KmsBackend {
         let rescan = self
             .platform
             .apply_connector_snapshot(snapshot, &known_connected);
-        self.pstate
-            .direct
-            .sync_output_count(self.platform.outputs.len());
         let registry_delta =
             self.reconcile_connector_registry(&rescan.connected, &rescan.dropped_keys);
         let active_topology_changed = !rescan.dropped_old_indices.is_empty();
@@ -1098,11 +1109,14 @@ impl KmsBackend {
             //    its queued flip events consumed before scene acknowledgements
             //    or BO phases are reset. Otherwise a live front buffer can be
             //    reused, or a stale event can retire a fresh post-wake flip.
-            let direct_shadow_error = if self.pstate.direct.root().active() {
-                self.materialize_direct_shadow_for_unflip().err()
-            } else {
-                None
-            };
+            let mut direct_shadow_error = None;
+            for scope in self.pstate.direct.active_scopes() {
+                if let Err(error) = self.materialize_direct_shadow_for_unflip(scope)
+                    && direct_shadow_error.is_none()
+                {
+                    direct_shadow_error = Some(error);
+                }
+            }
             let old_pending_pageflips = self.pending_pageflip_crtcs();
             log::info!("kms: dpms sleep — wait_idle_bounded");
             self.platform.wait_idle_bounded();
@@ -1129,7 +1143,9 @@ impl KmsBackend {
             }
             self.platform
                 .clear_atomic_cursor_state_after_old_events_discard();
-            self.stop_direct_after_scanout_replaced("DPMS off");
+            for scope in self.pstate.direct.active_scopes() {
+                self.stop_direct_after_scanout_replaced(scope, "DPMS off");
+            }
             self.pstate.scanout_m1.clear("DPMS off");
             log::info!("kms: dpms sleep — scene.drain_all");
             self.scene.drain_all(&mut self.platform);

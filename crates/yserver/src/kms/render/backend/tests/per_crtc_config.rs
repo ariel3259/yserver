@@ -129,6 +129,121 @@ fn two_heads() -> (KmsBackend, Rc<PowerLog>) {
 }
 
 #[test]
+// Mutation: truncate the tail owner slot when output 0 is removed.
+fn output_removal_keeps_owner_state_with_its_output_per_crtc_off() {
+    use yserver_core::backend::{CompletedPresentEvent, PresentWake};
+
+    let (mut backend, log) = two_heads();
+    let make_event = |present_id, completion_mode, emit_idle| CompletedPresentEvent {
+        client_id: yserver_protocol::x11::ClientId(1),
+        serial: u32::try_from(present_id).expect("test serial fits"),
+        host_xid: 0,
+        dst_host_xid: 0,
+        options: 0,
+        present_id,
+        window_generation: 0,
+        crtc_id: 0,
+        crtc_epoch: 0,
+        msc_offset: 0,
+        completion_clock: None,
+        wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+        completion_mode,
+        emit_idle,
+    };
+    {
+        let direct = &mut backend.pstate.direct;
+        direct.root_mut().completed.push(make_event(
+            100,
+            yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            true,
+        ));
+        direct.root_mut().deferred_successor_skips.push(make_event(
+            110,
+            yserver_protocol::x11::present::COMPLETE_MODE_SKIP,
+            false,
+        ));
+        direct.root_mut().idled.push(make_event(
+            120,
+            yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            true,
+        ));
+        direct.outputs[0].completed.push(make_event(
+            101,
+            yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            true,
+        ));
+        direct.outputs[0].deferred_successor_skips.push(make_event(
+            111,
+            yserver_protocol::x11::present::COMPLETE_MODE_SKIP,
+            false,
+        ));
+        direct.outputs[0].idled.push(make_event(
+            121,
+            yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            true,
+        ));
+        direct.outputs[1].eligible_streak = 3;
+        direct.outputs[1].reentry_blocked_until_composed = true;
+    }
+    let removed_crtc = crtc(&backend, 0);
+    let survivor_crtc = crtc(&backend, 1);
+    let name = connector(&backend, 0);
+    let id = output_id(&mut backend, &name);
+
+    assert!(
+        Backend::apply_crtc_config(&mut backend, id, &name, None, 0, 0)
+            .expect("turn output 0 off through Backend")
+    );
+
+    assert_eq!(
+        log.entries(),
+        vec![("off", removed_crtc)],
+        "per-CRTC off route"
+    );
+    assert_eq!(backend.platform.outputs.len(), 1);
+    assert_eq!(crtc(&backend, 0), survivor_crtc);
+    assert_eq!(backend.pstate.direct.outputs.len(), 1);
+    assert_eq!(backend.pstate.direct.outputs[0].eligible_streak, 3);
+    assert!(backend.pstate.direct.outputs[0].reentry_blocked_until_composed);
+    assert_eq!(
+        backend
+            .pstate
+            .direct
+            .root()
+            .completed
+            .iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>(),
+        [100, 101],
+        "the removed slot's completions append to Root"
+    );
+    assert_eq!(
+        backend
+            .pstate
+            .direct
+            .root()
+            .deferred_successor_skips
+            .iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>(),
+        [110, 111],
+        "the removed slot's deferred skips append to Root"
+    );
+    assert_eq!(
+        backend
+            .pstate
+            .direct
+            .root()
+            .idled
+            .iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>(),
+        [120, 121],
+        "the removed slot's Idle events append to Root"
+    );
+}
+
+#[test]
 // Mutation: drop the position branch in apply_crtc_config (the global
 // quiesce turns both CRTCs off and back on).
 fn position_change_moves_one_crtc_without_any_commit() {

@@ -31,6 +31,183 @@ fn recording_sink(
     recorder
 }
 
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: run tearing observation for non-Root candidates.
+fn output_candidates_leave_root_tearing_probation_unchanged() {
+    use yserver_core::backend::Backend;
+
+    let Some(mut fixture) =
+        super::commit_identity::recording_scene::RecordingSceneFixture::with_output_geometry(
+            (3840, 1080),
+            &[(0, 0, 1920, 1080, 75), (1920, 0, 1920, 1080, 75)],
+        )
+        .expect("same-refresh two-output recording fixture")
+    else {
+        eprintln!(
+            "SKIP output_candidates_leave_root_tearing_probation_unchanged: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    for device in &mut fixture.events.backend.platform.devices {
+        device.async_page_flip = true;
+    }
+    let output = fixture.install_direct_output_present(
+        1,
+        15_100,
+        yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+    );
+    let root = fixture.install_direct_present(
+        15_101,
+        yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+    );
+    let root_window = root.candidate.dst_window_xid;
+    let probation = u64::from(crate::kms::render::backend::TEARING_ENTRY_PROBATION);
+
+    for index in 0..probation - 1 {
+        let mut candidate = root.candidate;
+        candidate.present_id += index;
+        let mut event = root.event.clone();
+        event.present_id = candidate.present_id;
+        event.serial = u32::try_from(candidate.present_id).expect("root serial fits");
+        Backend::note_present_scanout_candidate(&mut fixture.events.backend, candidate);
+        assert!(
+            !Backend::try_present_direct(&mut fixture.events.backend, candidate, event)
+                .expect("Root async probation Present"),
+            "Root remains below direct admission and tearing entry thresholds"
+        );
+        assert_eq!(
+            fixture.events.backend.pstate.tearing.probation,
+            u8::try_from(index + 1).expect("probation count fits"),
+            "Root builds its partial tearing streak"
+        );
+
+        let mut declined = output.candidate;
+        declined.client_id = 2;
+        declined.present_id += index;
+        declined.valid_region_xid = 0xdead;
+        let mut declined_event = output.event.clone();
+        declined_event.client_id = yserver_protocol::x11::ClientId(2);
+        declined_event.present_id = declined.present_id;
+        declined_event.serial = u32::try_from(declined.present_id).expect("output serial fits");
+        Backend::note_present_scanout_candidate(&mut fixture.events.backend, declined);
+        assert!(
+            !Backend::try_present_direct(&mut fixture.events.backend, declined, declined_event,)
+                .expect("declined output-sized async Present"),
+            "Output(1) Present falls back to Copy"
+        );
+        assert_eq!(
+            fixture.events.backend.pstate.tearing.probation,
+            u8::try_from(index + 1).expect("probation count fits"),
+            "Output(1) does not change Root's probation count"
+        );
+        assert_eq!(
+            fixture.events.backend.pstate.tearing.probation_owner,
+            Some(root_window),
+            "Output(1) does not replace Root's probation window"
+        );
+        assert!(
+            matches!(
+                fixture.events.backend.pstate.tearing.state,
+                crate::kms::render::backend::TearingState::Off
+            ),
+            "an Output candidate cannot enter tearing"
+        );
+    }
+
+    let mut final_root = root.candidate;
+    final_root.present_id += probation - 1;
+    let mut final_event = root.event;
+    final_event.present_id = final_root.present_id;
+    final_event.serial = u32::try_from(final_root.present_id).expect("root serial fits");
+    Backend::note_present_scanout_candidate(&mut fixture.events.backend, final_root);
+    let _submitted =
+        Backend::try_present_direct(&mut fixture.events.backend, final_root, final_event)
+            .expect("Root enters at the final probation Present");
+    assert!(matches!(
+        fixture.events.backend.pstate.tearing.state,
+        crate::kms::render::backend::TearingState::On { window, .. }
+            if window == root_window
+    ));
+    assert_eq!(
+        fixture.events.backend.pstate.tearing.probation,
+        u8::try_from(probation).expect("threshold fits"),
+        "Root enters exactly at the configured threshold"
+    );
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: skip observation for every non-Root scope, incumbent included.
+fn incumbent_tearing_window_with_scope_none_ends_tearing() {
+    use yserver_core::backend::Backend;
+
+    const WINDOW: u32 = 0x7a01;
+    let Some(mut backend) = live_scene_backend() else {
+        eprintln!(
+            "SKIP incumbent_tearing_window_with_scope_none_ends_tearing: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    let recorder = recording_sink(&mut backend, 0);
+    let mut state = enter_tearing_without_direct_scanout(&mut backend, WINDOW, 15_200);
+    assert!(matches!(
+        backend.pstate.tearing.state,
+        crate::kms::render::backend::TearingState::On { window: WINDOW, .. }
+    ));
+
+    let before_async_scene = recorder.records().len();
+    damage_root_and_composite(&mut backend);
+    let async_records = recorder.records();
+    let async_scene = async_records[before_async_scene..]
+        .iter()
+        .find(|record| record.kind == AtomicCommitKind::Async)
+        .expect("Root tearing submits an async composed frame");
+    assert!(
+        async_scene
+            .flags
+            .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_ASYNC)
+    );
+    retire_composed_frame(&mut backend, &mut state, 60);
+
+    let (width, height) = backend.platform.fb_dimensions();
+    let (mut candidate, mut event, _) = prepare_direct_present_for_ids(
+        &mut backend,
+        15_300,
+        WINDOW,
+        WINDOW,
+        width / 2,
+        height / 2,
+        0,
+    );
+    candidate.completion_dst_host_xid = WINDOW;
+    event.dst_host_xid = WINDOW;
+    Backend::note_present_scanout_candidate(&mut backend, candidate);
+    assert!(
+        !Backend::try_present_direct(&mut backend, candidate, event)
+            .expect("smaller non-Root-scope Present"),
+        "the smaller source is not directly scanned out"
+    );
+    assert_tearing_off(&backend);
+
+    let before_vsync_scene = recorder.records().len();
+    damage_root_and_composite(&mut backend);
+    let post_tearing_records = recorder.records();
+    let vsync_records = &post_tearing_records[before_vsync_scene..];
+    assert!(
+        vsync_records.iter().any(|record| matches!(
+            record.kind,
+            AtomicCommitKind::Scene | AtomicCommitKind::SceneWithCursor
+        )),
+        "the post-tearing scene frame is submitted"
+    );
+    assert!(vsync_records.iter().all(|record| {
+        !record
+            .flags
+            .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_ASYNC)
+    }));
+}
+
 fn update<H: ::drm::control::ResourceHandle>(
     object: H,
     property: ::drm::control::property::Handle,
@@ -206,7 +383,7 @@ fn prepare_direct_present_for_ids_with_storage(
         direct: true,
     };
     backend.pstate.scanout_m1.entries.insert(
-        source_id,
+        (source_id, crate::kms::render::backend::DirectScope::Root),
         crate::kms::render::backend::ScanoutM1ProbeEntry::accepted_with_shape(
             crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(raw(
                 0x8100 + u32::try_from(present_id).expect("test id fits")
@@ -332,7 +509,7 @@ fn direct_backend(output_count: usize) -> Option<KmsBackend> {
         .expect("construct direct test scene");
     backend.scene.scene_structure_dirty = false;
     backend.pstate.direct.root_mut().cursor_bound_all = true;
-    backend.pstate.direct.root_mut().eligible_root_streak =
+    backend.pstate.direct.root_mut().eligible_streak =
         crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
     backend.platform.requested_flip_timing = crate::drm::async_flip::FlipTiming::Async;
     for device in &mut backend.platform.devices {
@@ -408,7 +585,7 @@ fn qualify_test_direct_async(
         );
     }
     assert_eq!(recorder.records().len(), before_warmup);
-    assert_eq!(backend.pstate.direct.root().eligible_root_streak, 7);
+    assert_eq!(backend.pstate.direct.root().eligible_streak, 7);
     assert!(backend.pstate.direct.root().current.is_none());
     assert!(backend.pstate.direct.root().pending.is_none());
     assert!(backend.pstate.direct.root().queued_successor.is_none());
@@ -554,20 +731,25 @@ fn qualify_direct_async(
         });
         let authoritative =
             crate::kms::render::backend::scanout_m2_is_authoritative_root(m0_target, root_coverage);
-        let direct_gate = backend
-            .direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
-            && crate::kms::render::backend::scanout_direct_eligible(
-                backend.scanout_allowed(),
-                backend.kms_outputs_active,
-                true,
-                backend.scene.root_overlay.is_empty(),
-                authoritative
-                    && backend.direct_shape_chain_covers_root(candidate.paint_dst_host_xid, root),
-                paint_target.is_none_or(|target| !target.has_border_clip()),
-                candidate.x_off,
-                candidate.y_off,
-                candidate.valid_region_xid,
-            );
+        let direct_gate = backend.direct_present_crtc_eligible(
+            crate::kms::render::backend::DirectScope::Root,
+            candidate.crtc_id,
+            candidate.crtc_epoch,
+        ) && crate::kms::render::backend::scanout_direct_eligible(
+            backend.scanout_allowed(),
+            backend.kms_outputs_active,
+            true,
+            backend.scene.root_overlay.is_empty(),
+            authoritative
+                && backend.direct_shape_chain_covers_root(
+                    candidate.paint_dst_host_xid,
+                    backend.direct_scope_rect(crate::kms::render::backend::DirectScope::Root),
+                ),
+            paint_target.is_none_or(|target| !target.has_border_clip()),
+            candidate.x_off,
+            candidate.y_off,
+            candidate.valid_region_xid,
+        );
         let diagnostic = format!(
             "m0={m0_target:?} root={root:?} window_rect={window_rect:?} source={}x{} root_coverage={root_coverage} authoritative={authoritative} direct_gate={direct_gate} async_devices={} topology={} crtc_eligible={}",
             candidate.src_width,
@@ -576,8 +758,13 @@ fn qualify_direct_async(
                 .platform
                 .device_for_key(output.key.device_key)
                 .is_some_and(|device| device.async_page_flip)),
-            backend.direct_scanout_topology_eligible(),
-            backend.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch),
+            backend
+                .direct_scanout_topology_eligible(crate::kms::render::backend::DirectScope::Root),
+            backend.direct_present_crtc_eligible(
+                crate::kms::render::backend::DirectScope::Root,
+                candidate.crtc_id,
+                candidate.crtc_epoch,
+            ),
         );
         let submitted = Backend::try_present_direct(backend, candidate, event)
             .unwrap_or_else(|error| panic!("direct Present entry {present_id}: {error}"));
@@ -587,7 +774,7 @@ fn qualify_direct_async(
             backend.pstate.tearing.state,
             backend.pstate.tearing.probation,
             backend.pstate.tearing.probation_owner,
-            backend.pstate.direct.root().eligible_root_streak,
+            backend.pstate.direct.root().eligible_streak,
             backend.scene.cursor_mode(),
             backend.scene.has_pending_page_flips(),
         );
@@ -1135,7 +1322,7 @@ fn present_until_direct_async(
     panic!(
         "transparent cursor did not reach direct async; tearing={:?}, m2_streak={}, commits={:?}",
         backend.pstate.tearing.state,
-        backend.pstate.direct.root().eligible_root_streak,
+        backend.pstate.direct.root().eligible_streak,
         recorder
             .records()
             .iter()
@@ -1543,7 +1730,7 @@ fn non_async_authoritative_present_resets_probation_during_reentry_barrier() {
         retire_composed_frame(&mut backend, &mut state, index as u32 + 1);
     }
     assert_eq!(backend.pstate.tearing.probation, 7);
-    assert_eq!(backend.pstate.direct.root().eligible_root_streak, 7);
+    assert_eq!(backend.pstate.direct.root().eligible_streak, 7);
     assert!(
         try_direct_present_with_live_storage(
             &mut backend,
@@ -1874,7 +2061,7 @@ fn vt_release_exits_tearing_and_resume_needs_probation() {
             assert_eq!(recorder.records().len(), before_present);
             assert_eq!(backend.pstate.tearing.probation, index as u8 + 1);
             assert_eq!(
-                backend.pstate.direct.root().eligible_root_streak,
+                backend.pstate.direct.root().eligible_streak,
                 index as u8 + 1
             );
             damage_root_and_composite(&mut backend);
@@ -2567,7 +2754,7 @@ fn direct_shape_change_on_ebusy_resets_consecutive_einval_history() {
         1,
     );
 
-    backend.pstate.direct.root_mut().eligible_root_streak =
+    backend.pstate.direct.root_mut().eligible_streak =
         crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
     set_direct_second_crtc(&mut backend, 105);
     let (candidate_b, event_b, shape_b) = prepare_direct_present(&mut backend, 72, 1600, 600);
@@ -2597,7 +2784,7 @@ fn direct_shape_change_on_ebusy_resets_consecutive_einval_history() {
             .is_empty()
     );
 
-    backend.pstate.direct.root_mut().eligible_root_streak =
+    backend.pstate.direct.root_mut().eligible_streak =
         crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
     set_direct_second_crtc(&mut backend, 201);
     let shape_a_again = try_direct_present(&mut backend, 73, 1600, 600);
@@ -2706,6 +2893,77 @@ fn live_scene_backend() -> Option<KmsBackend> {
 fn live_scene_backend_with_outputs(output_count: usize) -> Option<KmsBackend> {
     scene_backend_with_recording_pools(output_count)
         .unwrap_or_else(|error| panic!("recording scene fixture unavailable: {error}"))
+}
+
+#[test]
+// Mutation T09: let any pending direct transaction suppress cursor wakeups on all outputs.
+fn composed_cursor_wakeup_policy() {
+    use yserver_core::backend::Backend;
+
+    let mut backend = KmsBackend::for_tests();
+    super::push_test_output(&mut backend, 0x7499);
+    let fallback_id = seed_window(&mut backend, 0x7498, None, 0, 0);
+    install_direct_frame_for_target_test(&mut backend, 0x7499, fallback_id, false);
+    let mut pending = backend
+        .pstate
+        .direct
+        .root_mut()
+        .pending
+        .take()
+        .expect("test helper installed a pending frame");
+    backend.pstate.direct.root_mut().hold_direct = false;
+    pending.completion_output_idx = 1;
+    pending.awaiting_outputs = std::collections::HashSet::from([1]);
+    backend.pstate.direct.outputs[1].pending = Some(pending);
+    backend.pstate.direct.outputs[1].hold_direct = true;
+
+    // Keep the cursor move as the only possible immediate source. In
+    // particular, the pending output owner itself must not schedule a wake.
+    backend.scene.scene_structure_dirty = false;
+    for drawable in backend.store.armed_damaged_ids() {
+        if let Some(snapshot) = backend.store.peek_presentation_damage(drawable) {
+            backend.store.ack_presentation_damage(snapshot);
+        }
+    }
+    assert!(
+        !backend.for_tests_scene_wants_scene(),
+        "scene damage is quiet"
+    );
+    assert!(
+        Backend::next_wakeup(&backend).is_none(),
+        "pending Output(1) alone does not schedule an immediate wake"
+    );
+    let position = backend.platform.for_tests_seed_atomic_cursor_position(
+        0,
+        raw(51),
+        raw(61),
+        raw(62),
+        100,
+        100,
+        0,
+        0,
+    );
+    assert!(
+        backend
+            .platform
+            .for_tests_atomic_position_is_unsent(position.device_key, position.crtc,)
+    );
+
+    let wakeup = Backend::next_wakeup(&backend);
+
+    assert!(
+        wakeup.is_some_and(|deadline| deadline <= std::time::Instant::now()),
+        "an eligible cursor move on output 0 wakes despite Output(1)'s pending direct frame"
+    );
+    assert!(
+        backend.pstate.direct.outputs[1].pending.is_some(),
+        "next_wakeup does not consume Output(1)'s pending frame"
+    );
+    assert!(
+        backend
+            .platform
+            .for_tests_atomic_position_is_unsent(position.device_key, position.crtc,)
+    );
 }
 
 fn live_scene_backend_with_dead_zone() -> Option<KmsBackend> {
@@ -3207,8 +3465,8 @@ fn cursor_only_ineligibility_does_not_reset_direct_probation_while_on() {
     let recorder = recording_sink(&mut backend, 0);
     let _state = enter_tearing_without_direct_scanout(&mut backend, 0x7820, 12_200);
     recorder.clear_records();
-    backend.pstate.direct.root_mut().eligible_root_streak = 3;
-    let before_m2_probation = backend.pstate.direct.root().eligible_root_streak;
+    backend.pstate.direct.root_mut().eligible_streak = 3;
+    let before_m2_probation = backend.pstate.direct.root().eligible_streak;
     for present_id in 12_300..12_320 {
         assert!(
             try_direct_present_for_window(
@@ -3224,7 +3482,7 @@ fn cursor_only_ineligibility_does_not_reset_direct_probation_while_on() {
     }
     assert!(backend.pstate.tearing.is_on());
     assert_eq!(
-        backend.pstate.direct.root().eligible_root_streak,
+        backend.pstate.direct.root().eligible_streak,
         before_m2_probation
     );
     assert_ne!(
@@ -3252,7 +3510,7 @@ fn cursor_only_ineligibility_does_not_reset_direct_probation_while_on() {
         window.height = height;
     }
     compositor.core.top_level_order.push(cow);
-    compositor.pstate.direct.root_mut().eligible_root_streak = 0;
+    compositor.pstate.direct.root_mut().eligible_streak = 0;
 
     for index in 0..5_u64 {
         let full_id = 12_400 + index * 2;
@@ -3270,7 +3528,7 @@ fn cursor_only_ineligibility_does_not_reset_direct_probation_while_on() {
                 .expect("full compositor Present remains in M2 probation")
         );
         assert_eq!(
-            compositor.pstate.direct.root().eligible_root_streak,
+            compositor.pstate.direct.root().eligible_streak,
             1,
             "each full compositor Present advances probation after the preceding limited Present reset it"
         );
@@ -3289,12 +3547,12 @@ fn cursor_only_ineligibility_does_not_reset_direct_probation_while_on() {
             !Backend::try_present_direct(&mut compositor, candidate, event)
                 .expect("region-limited compositor Present takes Copy path")
         );
-        assert_eq!(compositor.pstate.direct.root().eligible_root_streak, 0);
+        assert_eq!(compositor.pstate.direct.root().eligible_streak, 0);
         assert!(!compositor.pstate.tearing.is_on());
     }
 
     assert_tearing_off(&compositor);
-    assert_eq!(compositor.pstate.direct.root().eligible_root_streak, 0);
+    assert_eq!(compositor.pstate.direct.root().eligible_streak, 0);
     assert!(!compositor.pstate.direct.root().active());
     assert!(!compositor.pstate.direct.root().unflip_requested);
     assert!(compositor.scene.root_overlay.is_empty());

@@ -212,12 +212,34 @@ composited, marco) draw to it and see their output on
 screen.
 
 Per-output presentation scheduling is in place. Tear-free is the
-default. Fullscreen direct scanout is implemented; a fullscreen,
-direct-scanout-eligible client that presents with
-`PresentOptionAsync` is flipped asynchronously and may tear, as
-under Xorg's modesetting driver (yserver advertises
-`PresentCapabilityAsync`, not `PresentCapabilityAsyncMayTear`).
-VRR is off by default. `--vrr` honors `_VARIABLE_REFRESH` (format 32, one nonzero item) for client-owned direct scanout. `--vrr all` ignores that property on NVIDIA DRM and applies NVIDIA/Mesa application exclusions; on other drivers it behaves like `--vrr`. Color management / HDR is a valid future direction but not yet implemented.
+default. Direct scanout is per output: a client covering exactly one
+monitor can scan out there while the others compose at their own rates,
+with no limit on the number of monitors. A whole-screen window keeps
+grouped direct scanout when all outputs share the primary device and
+their refresh rates are within 0.5%. A Present selecting another
+monitor's CRTC is composed. Tearing requires Root direct scanout (single
+monitor, or a whole-screen window on same-refresh outputs); a fullscreen
+client on one monitor that disables V-Sync is flipped synchronized while
+other monitors are on. yserver advertises
+`PresentCapabilityAsync`, not `PresentCapabilityAsyncMayTear`.
+
+VRR is off by default. `--vrr` honors `_VARIABLE_REFRESH` (format 32,
+one nonzero item) for client-owned direct scanout. `--vrr all` ignores
+that property on NVIDIA DRM and applies NVIDIA/Mesa application
+exclusions; on other drivers it behaves like `--vrr`. Under a
+compositing desktop, direct scanout and therefore VRR require the
+compositor to unredirect fullscreen windows. On Cinnamon, enable
+`org.cinnamon.muffin unredirect-fullscreen-windows` (`true`) in System
+Settings → General → “disable compositing for full-screen windows”; this
+is off by default. With it off, Muffin composites the game and the
+monitor stays at maximum refresh. A measured Cinnamon limitation, also
+seen on Xorg, is that a system-tray icon such as Steam's can create an
+override-redirect window above the fullscreen game, preventing Muffin
+from unredirecting it and keeping VRR off ([upstream issue
+#12687](https://github.com/linuxmint/cinnamon/issues/12687)). A desktop
+without a compositor, such as i3, is unaffected. VRR with multiple
+monitors enabled is validated in a later change. Color management / HDR
+is a valid future direction but not yet implemented.
 
 ## What's not in this document
 

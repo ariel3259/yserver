@@ -78,6 +78,28 @@ impl SceneCompositor {
         }
     }
 
+    /// Mark one output's scene structure as changed without adding repaint
+    /// debt to the other output damage regions.
+    #[track_caller]
+    pub fn mark_scene_structure_dirty_for_output(&mut self, output_idx: usize) {
+        let Some(extent) = self
+            .inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+            .map(|output| output.output_extent)
+        else {
+            self.note_structure_change();
+            return;
+        };
+        self.mark_scene_structure_damage_rect(
+            output_idx,
+            vk::Rect2D {
+                offset: vk::Offset2D::default(),
+                extent,
+            },
+        );
+    }
+
     /// Region-precise scene-structure damage (Stage 3+).
     #[track_caller]
     fn mark_scene_structure_damage_rect(&mut self, output_idx: usize, r: vk::Rect2D) {
@@ -86,7 +108,11 @@ impl SceneCompositor {
         } else {
             None
         };
-        self.note_structure_change();
+        // The output's retained structure region wakes and walks this output
+        // on its own. Keep the global dirty bit for changes that affect every
+        // output; raising it here would schedule unrelated outputs too.
+        self.cursor_only_wake = false;
+        self.structure_generation = self.structure_generation.wrapping_add(1);
         if let Some(inner) = self.inner.as_mut()
             && let Some(o) = inner.outputs.get_mut(output_idx)
         {

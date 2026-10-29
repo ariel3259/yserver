@@ -191,7 +191,8 @@ impl ScanoutM1ProbeEntry {
 
 pub(in crate::kms::render::backend) struct ScanoutM1ProbeCache {
     pub(in crate::kms::render::backend) topology_signature: u64,
-    pub(in crate::kms::render::backend) entries: HashMap<DrawableId, ScanoutM1ProbeEntry>,
+    pub(in crate::kms::render::backend) entries:
+        HashMap<(DrawableId, DirectScope), ScanoutM1ProbeEntry>,
 }
 
 impl ScanoutM1ProbeCache {
@@ -203,7 +204,7 @@ impl ScanoutM1ProbeCache {
     }
 
     pub(in crate::kms::render::backend) fn remove(&mut self, id: DrawableId) {
-        self.entries.remove(&id);
+        self.entries.retain(|(drawable, _), _| *drawable != id);
     }
 
     pub(in crate::kms::render::backend) fn clear(&mut self, reason: &'static str) {
@@ -249,8 +250,16 @@ pub(in crate::kms::render::backend) type DirectFrameSubmitter =
     fn(
         &mut KmsBackend,
         &mut DirectPresentFrame,
+        DirectScope,
         crate::drm::async_flip::FlipTiming,
     ) -> io::Result<crate::drm::async_flip::AsyncOutcome>;
+
+pub(in crate::kms::render::backend) type ScanoutM1Prober = fn(
+    &crate::kms::render::backend::KmsBackend,
+    DrawableId,
+    DirectScope,
+    &[crate::drm::modeset::DirectScanoutPlaneState<'_>],
+) -> io::Result<ScanoutM1ProbeEntry>;
 
 /// Require a short stable run before entering direct ownership. Compositors
 /// such as E27 alternate full-root Presents with authoritative region-limited
@@ -295,7 +304,7 @@ pub(in crate::kms::render::backend) struct ScanoutM2State {
     /// Accepted replacement identity for each output, when one exists.
     pub(in crate::kms::render::backend) unflip_awaiting_outputs: HashMap<usize, u64>,
     pub(in crate::kms::render::backend) reentry_blocked_until_composed: bool,
-    pub(in crate::kms::render::backend) eligible_root_streak: u8,
+    pub(in crate::kms::render::backend) eligible_streak: u8,
     pub(in crate::kms::render::backend) unflip_fallback_source: Option<DrawableId>,
     pub(in crate::kms::render::backend) unflip_shadow_ready: bool,
     /// The synchronized composed unflip failed and was degraded to the
@@ -326,7 +335,7 @@ impl ScanoutM2State {
             unflip_outputs_to_replace: HashSet::new(),
             unflip_awaiting_outputs: HashMap::new(),
             reentry_blocked_until_composed: false,
-            eligible_root_streak: 0,
+            eligible_streak: 0,
             unflip_fallback_source: None,
             unflip_shadow_ready: false,
             degraded_composed_unflip: false,
@@ -362,19 +371,19 @@ impl ScanoutM2State {
         self.direct_cursor_refresh_successor_deferrals.clear();
     }
 
-    pub(in crate::kms::render::backend) fn admit_eligible_root(&mut self) -> bool {
+    pub(in crate::kms::render::backend) fn admit_eligible_direct(&mut self) -> bool {
         if self.active() {
             return true;
         }
-        self.eligible_root_streak = self
-            .eligible_root_streak
+        self.eligible_streak = self
+            .eligible_streak
             .saturating_add(1)
             .min(SCANOUT_M2_ELIGIBLE_ROOT_PROBATION);
-        self.eligible_root_streak >= SCANOUT_M2_ELIGIBLE_ROOT_PROBATION
+        self.eligible_streak >= SCANOUT_M2_ELIGIBLE_ROOT_PROBATION
     }
 
-    pub(in crate::kms::render::backend) fn reset_eligible_root_probation(&mut self) {
-        self.eligible_root_streak = 0;
+    pub(in crate::kms::render::backend) fn reset_eligible_direct_probation(&mut self) {
+        self.eligible_streak = 0;
     }
 }
 
@@ -383,6 +392,12 @@ impl ScanoutM2State {
 pub(in crate::kms::render::backend) struct DirectOwners {
     root: ScanoutM2State,
     pub(in crate::kms::render::backend) outputs: Vec<ScanoutM2State>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(in crate::kms::render::backend) enum DirectScope {
+    Root,
+    Output(usize),
 }
 
 impl Default for DirectOwners {
@@ -405,19 +420,84 @@ impl DirectOwners {
 
     pub(in crate::kms::render::backend) fn sync_output_count(&mut self, count: usize) {
         if count < self.outputs.len() {
-            assert!(
-                self.outputs[count..].iter().all(|owner| !owner.active()),
-                "cannot remove an output with pending direct-scanout frames"
-            );
-            for mut owner in self.outputs.split_off(count) {
-                self.root.completed.append(&mut owner.completed);
-                self.root
-                    .deferred_successor_skips
-                    .append(&mut owner.deferred_successor_skips);
-                self.root.idled.append(&mut owner.idled);
-            }
+            let removed: Vec<_> = (count..self.outputs.len()).collect();
+            self.remove_outputs(&removed);
         }
         self.outputs.resize_with(count, ScanoutM2State::new);
+    }
+
+    /// Remove the owner slots at old output indices, preserving each
+    /// surviving output's state as the platform compacts its output vector.
+    /// Notifications from removed slots retain the existing migration to Root.
+    pub(in crate::kms::render::backend) fn remove_outputs(&mut self, output_indices: &[usize]) {
+        let mut indices = output_indices.to_vec();
+        indices.sort_unstable();
+        indices.dedup();
+        assert!(
+            indices.iter().all(|&idx| idx < self.outputs.len()),
+            "cannot remove a missing direct-scanout output slot"
+        );
+        assert!(
+            indices.iter().all(|&idx| !self.outputs[idx].active()),
+            "cannot remove an output with pending direct-scanout frames"
+        );
+
+        let mut removed = Vec::with_capacity(indices.len());
+        for idx in indices.into_iter().rev() {
+            removed.push(self.outputs.remove(idx));
+        }
+        for mut owner in removed.into_iter().rev() {
+            self.root.completed.append(&mut owner.completed);
+            self.root
+                .deferred_successor_skips
+                .append(&mut owner.deferred_successor_skips);
+            self.root.idled.append(&mut owner.idled);
+        }
+    }
+
+    pub(in crate::kms::render::backend) fn get(
+        &self,
+        scope: DirectScope,
+    ) -> Option<&ScanoutM2State> {
+        match scope {
+            DirectScope::Root => Some(&self.root),
+            DirectScope::Output(output_idx) => self.outputs.get(output_idx),
+        }
+    }
+
+    pub(in crate::kms::render::backend) fn get_mut(
+        &mut self,
+        scope: DirectScope,
+    ) -> Option<&mut ScanoutM2State> {
+        match scope {
+            DirectScope::Root => Some(&mut self.root),
+            DirectScope::Output(output_idx) => self.outputs.get_mut(output_idx),
+        }
+    }
+
+    pub(in crate::kms::render::backend) fn active_scopes(&self) -> Vec<DirectScope> {
+        if self.root.active() {
+            return vec![DirectScope::Root];
+        }
+        self.outputs
+            .iter()
+            .enumerate()
+            .filter(|(_, owner)| owner.active())
+            .map(|(output_idx, _)| DirectScope::Output(output_idx))
+            .collect()
+    }
+
+    pub(in crate::kms::render::backend) fn scope_for_output(
+        &self,
+        output_idx: usize,
+    ) -> Option<DirectScope> {
+        if self.root.active() {
+            return Some(DirectScope::Root);
+        }
+        self.outputs
+            .get(output_idx)
+            .is_some_and(ScanoutM2State::active)
+            .then_some(DirectScope::Output(output_idx))
     }
 }
 
@@ -858,6 +938,7 @@ pub struct KmsBackendState {
     pub(in crate::kms::render::backend) monotonic_clock:
         std::rc::Rc<dyn Fn() -> std::time::Instant>,
     pub(in crate::kms::render::backend) direct_frame_submitter: DirectFrameSubmitter,
+    pub(in crate::kms::render::backend) scanout_m1_prober: ScanoutM1Prober,
     pub(in crate::kms::render::backend) vt_resume_executor:
         std::rc::Rc<dyn super::session::VtResumeExecutor>,
 

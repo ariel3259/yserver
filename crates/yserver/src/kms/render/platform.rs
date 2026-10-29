@@ -245,8 +245,10 @@ pub(crate) struct KmsCursorState {
     /// Keep the latest position unsent until that CRTC's next flip event.
     cursor_retry_waits_for_flip: HashSet<::drm::control::crtc::Handle>,
     /// A rejected cursor request whose atomic detach failed. Pointer motion
-    /// retries this detach, with a device-wide terminal failure after 3 tries.
+    /// retries this detach, with a per-CRTC terminal failure after 3 tries.
     cursor_hide_recovery: HashMap<::drm::control::crtc::Handle, CursorHideRecovery>,
+    permanently_disabled_crtcs: HashSet<::drm::control::crtc::Handle>,
+    /// Device-wide disable is reserved for cursor-plane qualification.
     permanently_disabled: bool,
     /// CursorPlane::new was attempted for an active startup topology and
     /// failed transiently. Only explicit active-topology/resume boundaries
@@ -275,9 +277,9 @@ impl KmsCursorState {
 }
 
 /// Aggregate result of one pointer move fanout. A fallback change means a
-/// device/output changed HW eligibility and the scene must repaint its SW
-/// outputs even if the cursor aggregate mode still contains live HW planes.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// CRTC changed HW eligibility and the scene must repaint its SW outputs even
+/// if the cursor aggregate mode still contains live HW planes.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct CursorMoveOutcome {
     pub(crate) ebusy_count: u32,
     pub(crate) fallback_changed: bool,
@@ -285,6 +287,10 @@ pub(crate) struct CursorMoveOutcome {
     /// remains authoritative and needs another retirement boundary before its
     /// latest position/full ownership can be reconciled.
     pub(crate) retry_required: bool,
+    /// Device-qualified CRTCs whose fallback or retry state changed. Raw CRTC
+    /// handles can collide across DRM devices, so retain `CrtcKey` identity
+    /// through fanout and deferred outcome merging.
+    pub(crate) affected_crtcs: HashSet<CrtcKey>,
 }
 
 /// One Vulkan renderer endpoint. Its physical-device handle belongs to the

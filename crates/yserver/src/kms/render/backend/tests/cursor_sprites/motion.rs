@@ -421,7 +421,7 @@ fn p2_motion_inside_one_output_does_not_set_membership_dirty() {
             .events
             .backend
             .platform
-            .cursor_crtc_membership_dirty(137, 116, 0, 0, 8, 8),
+            .cursor_crtc_membership_dirty(137, 116, 0, 0, 8, 8, &[]),
         "an already-bound CRTC remains a member while the cursor stays inside it",
     );
     assert!(
@@ -1168,11 +1168,25 @@ fn p2_motion_led_hide_recovery_settles_the_applied_state() {
                 .events
                 .backend
                 .platform
+                .for_tests_cursor_crtc_permanently_disabled(
+                    fixture.scene.events.backend.platform.outputs[0]
+                        .key
+                        .device_key,
+                    hardware.crtc,
+                )
+        );
+        assert!(
+            !fixture
+                .scene
+                .events
+                .backend
+                .platform
                 .for_tests_cursor_permanently_disabled(
                     fixture.scene.events.backend.platform.outputs[0]
                         .key
                         .device_key,
-                )
+                ),
+            "one-CRTC recovery exhaustion has the master's unavailable outcome without setting the device qualification flag"
         );
         assert_eq!(
             applied_cursor_binding(&fixture.scene.events.backend, 0),

@@ -81,16 +81,21 @@ pub trait Platform: OutputSink + Sized + 'static {
     fn exit_tearing_for_window(_b: &mut XBackend<Self>, _host_xid: u32, _reason: &'static str) {}
     /// Leave direct scanout for the composed scene.
     fn request_direct_unflip(_b: &mut XBackend<Self>, _reason: &'static str) {}
+    /// Leave only owners whose retained target or paint chain uses this drawable.
+    fn request_direct_unflip_for_host_drawable(
+        _b: &mut XBackend<Self>,
+        _host_xid: u32,
+        _reason: &'static str,
+    ) {
+    }
+    /// A projected top-level stacking order changed.
+    fn on_top_level_order_changed(_b: &mut XBackend<Self>) {}
+    /// A Bounding or Clip shape changed.
+    fn on_direct_shape_changed(_b: &mut XBackend<Self>) {}
+    /// Hand cursor visibility back from Root tearing scanout.
+    fn request_tearing_cursor_handoff(_b: &mut XBackend<Self>) {}
     /// Whether every direct frame is the COW or one of its descendants.
     fn direct_frames_are_under_cow(_b: &XBackend<Self>) -> bool {
-        false
-    }
-    /// Whether a direct frame scans out storage of `host_xid`.
-    fn direct_frame_references_host_drawable(_b: &XBackend<Self>, _host_xid: u32) -> bool {
-        false
-    }
-    /// Whether a SHAPE now clips a direct frame off the root.
-    fn direct_frames_shaped_off_root(_b: &XBackend<Self>) -> bool {
         false
     }
     /// Rebind the cursor planes to `record` under direct scanout; `false` on
@@ -98,8 +103,8 @@ pub trait Platform: OutputSink + Sized + 'static {
     fn refresh_direct_cursor(
         _b: &mut XBackend<Self>,
         _record: &std::sync::Arc<crate::kms::render::cursor::CursorRecord>,
-    ) -> bool {
-        false
+    ) -> Vec<usize> {
+        Vec::new()
     }
     /// XFIXES HideCursor while no compose runs: detach the cursor planes.
     fn hide_cursor_under_direct_scanout(_b: &mut XBackend<Self>) {}

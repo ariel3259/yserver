@@ -250,7 +250,9 @@ impl PlatformBackend {
             if state.applied.is_none() && state.valid {
                 return Ok(());
             }
-            if cursor.permanently_disabled && state.applied.is_none() {
+            if (cursor.permanently_disabled || cursor.permanently_disabled_crtcs.contains(&crtc))
+                && state.applied.is_none()
+            {
                 return Ok(());
             }
             let properties = cursor
@@ -447,6 +449,9 @@ impl PlatformBackend {
                 );
             }
         }
+        outcome
+            .affected_crtcs
+            .insert(crate::kms::render::platform::CrtcKey { device_key, crtc });
         if defer_outcome {
             self.deferred_cursor_move_outcome.merge(outcome);
         }

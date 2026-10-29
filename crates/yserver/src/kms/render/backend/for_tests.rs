@@ -626,6 +626,17 @@ impl KmsBackend {
         b
     }
 
+    /// Install a recorder or controlled result for the external M1 import,
+    /// ADDFB and TEST_ONLY step while preserving the live cache/admission path.
+    #[doc(hidden)]
+    #[cfg(test)]
+    pub(in crate::kms::render::backend) fn for_tests_set_scanout_m1_prober(
+        &mut self,
+        prober: crate::kms::render::backend::ScanoutM1Prober,
+    ) {
+        self.pstate.scanout_m1_prober = prober;
+    }
+
     /// Construct the test fixture **without** initialising root
     /// storage. Used by `for_tests_with_vk` so root allocation
     /// happens after the Vk context is attached.
@@ -640,6 +651,7 @@ impl KmsBackend {
             direct: DirectOwners::default(),
             tearing: Tearing::new(),
             direct_frame_submitter: KmsBackend::submit_direct_frame_live,
+            scanout_m1_prober: KmsBackend::probe_direct_scanout_m1_live,
             vt_resume_executor: std::rc::Rc::new(
                 crate::kms::render::backend::kms::session::DrmVtResumeExecutor,
             ),

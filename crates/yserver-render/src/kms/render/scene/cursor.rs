@@ -179,8 +179,22 @@ impl SceneCompositor {
         let Some(inner) = self.inner.as_ref() else {
             return CursorPlaneMode::Sw;
         };
-        for output in &inner.outputs {
-            // Any pending transition on any output forces Mixed —
+        let outputs: Vec<_> = (0..inner.outputs.len()).collect();
+        self.cursor_mode_for_outputs(&outputs)
+    }
+
+    /// Classify cursor state for only the outputs participating in a KMS
+    /// transaction. A pending transition on an unrelated output must not
+    /// block a direct owner on this output.
+    pub fn cursor_mode_for_outputs(&self, output_indices: &[usize]) -> CursorPlaneMode {
+        let Some(inner) = self.inner.as_ref() else {
+            return CursorPlaneMode::Sw;
+        };
+        for &output_idx in output_indices {
+            let Some(output) = inner.outputs.get(output_idx) else {
+                continue;
+            };
+            // Any pending transition on a selected output forces Mixed —
             // the fast path must not move the plane until every
             // ShowOnRetire / HideOnRetire has applied.
             if output
@@ -194,7 +208,12 @@ impl SceneCompositor {
                 return CursorPlaneMode::Mixed;
             }
         }
-        classify_cursor_mode_from_per_output(inner.outputs.iter().map(|o| o.last_frame_cursor_mode))
+        classify_cursor_mode_from_per_output(output_indices.iter().filter_map(|&output_idx| {
+            inner
+                .outputs
+                .get(output_idx)
+                .map(|output| output.last_frame_cursor_mode)
+        }))
     }
 
     /// Record cursor-plane ownership after an external scanout transaction
@@ -203,20 +222,28 @@ impl SceneCompositor {
     /// `visible_by_output` is the observed plane state in scene output order.
     /// Pending scene acknowledgements own their own retirement state, so they
     /// must drain before an external observation can become authoritative.
-    pub fn record_external_cursor_plane_bindings(&mut self, visible_by_output: &[bool]) -> bool {
+    pub fn record_external_cursor_plane_bindings(
+        &mut self,
+        visible_by_output: &[bool],
+        output_indices: &[usize],
+    ) -> bool {
         let Some(inner) = self.inner.as_mut() else {
             return false;
         };
         if visible_by_output.len() != inner.outputs.len()
-            || inner
-                .outputs
-                .iter()
-                .any(|output| !output.pending_acks.is_empty())
+            || output_indices.iter().any(|&idx| {
+                inner
+                    .outputs
+                    .get(idx)
+                    .is_none_or(|output| !output.pending_acks.is_empty())
+            })
         {
             return false;
         }
-        for (output, visible) in inner.outputs.iter_mut().zip(visible_by_output) {
-            output.last_frame_cursor_mode = if *visible {
+        for &output_idx in output_indices {
+            let output = &mut inner.outputs[output_idx];
+            let visible = visible_by_output[output_idx];
+            output.last_frame_cursor_mode = if visible {
                 OutputCursorMode::Hw
             } else {
                 OutputCursorMode::Hidden
@@ -256,7 +283,11 @@ impl SceneCompositor {
     /// synchronously from the backend's `refresh_effective_cursor`.
     /// Marks each output that already has (or is retiring into) a HW
     /// binding for an output-local upload + full ShowOnRetire retry.
-    pub fn queue_steady_state_cursor_upload(&mut self, version: u64) -> bool {
+    pub fn queue_steady_state_cursor_upload(
+        &mut self,
+        version: u64,
+        output_indices: &[usize],
+    ) -> bool {
         let Some(inner) = self.inner.as_mut() else {
             return false;
         };
@@ -266,7 +297,10 @@ impl SceneCompositor {
         // capacities and failures independent and gives the cursor state
         // machine an exact success/failure point for metadata commitment.
         let mut refreshes_hw_binding = false;
-        for output in &mut inner.outputs {
+        for &output_idx in output_indices {
+            let Some(output) = inner.outputs.get_mut(output_idx) else {
+                continue;
+            };
             if cursor_output_needs_sprite_retry(
                 output.last_frame_cursor_mode,
                 output.pending_acks.iter().map(|ack| ack.cursor_transition),
@@ -279,7 +313,9 @@ impl SceneCompositor {
                 refreshes_hw_binding = true;
             }
         }
-        self.note_structure_change();
+        if !output_indices.is_empty() {
+            self.note_structure_change();
+        }
         refreshes_hw_binding
     }
 }

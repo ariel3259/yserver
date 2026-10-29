@@ -1911,7 +1911,7 @@ impl<P: Platform> XBackend<P> {
             }
             order.push(host);
         }
-        if self.core.top_level_order != order && !P::direct_frames_are_under_cow(self) {
+        if self.core.top_level_order != order {
             // A direct frame bypasses the composed root scene. A real
             // top-level restack changes that scene even when the direct
             // Present target itself is untouched, so retire it through the
@@ -1923,7 +1923,7 @@ impl<P: Platform> XBackend<P> {
             // a restack beneath it cannot change the screen. A compositing
             // desktop restacks constantly (raises, tooltips, notifications),
             // and each needless unflip showed a stale frame on Cinnamon.
-            P::request_direct_unflip(self, "top_level_stack_changed");
+            P::on_top_level_order_changed(self);
         }
         self.core.top_level_order = order;
         self.scene.wake_for_damage();
@@ -1984,9 +1984,7 @@ impl<P: Platform> XBackend<P> {
         // not invalidate the compositor's authoritative root-stage Present:
         // Cinnamon will replace it with its next Present, and forcing an
         // intermediate composed frame exposes the retained pre-direct BO.
-        if P::direct_frame_references_host_drawable(self, host_xid) {
-            P::request_direct_unflip(self, "destroy_direct_frame_drawable");
-        }
+        P::request_direct_unflip_for_host_drawable(self, host_xid, "destroy_direct_frame_drawable");
         if let Some(id) = self.store.lookup(host_xid) {
             self.store_decref_with_invalidate(id);
         }
@@ -2014,9 +2012,7 @@ impl<P: Platform> XBackend<P> {
         host_xid: u32,
     ) -> io::Result<()> {
         P::exit_tearing_for_window(self, host_xid, "window_mapped");
-        if P::direct_frame_references_host_drawable(self, host_xid) {
-            P::request_direct_unflip(self, "map_direct_frame_drawable");
-        }
+        P::request_direct_unflip_for_host_drawable(self, host_xid, "map_direct_frame_drawable");
         if let Some(geom) = self.windows.get_mut(&host_xid) {
             geom.mapped = true;
         }
@@ -2095,9 +2091,7 @@ impl<P: Platform> XBackend<P> {
         };
         geom.viewable = false;
         // A direct frame may still scan this leaf; its pins keep the image alive past the decref.
-        if P::direct_frame_references_host_drawable(self, host_xid) {
-            P::request_direct_unflip(self, "release_direct_frame_drawable");
-        }
+        P::request_direct_unflip_for_host_drawable(self, host_xid, "release_direct_frame_drawable");
         if let Some(id) = self.store.lookup(host_xid) {
             // Detach first: a pinned leaf survives the decref but must not stay the window's.
             self.store.detach_xid(host_xid);
@@ -2113,9 +2107,7 @@ impl<P: Platform> XBackend<P> {
         host_xid: u32,
     ) -> io::Result<()> {
         P::exit_tearing_for_window(self, host_xid, "window_unmapped");
-        if P::direct_frame_references_host_drawable(self, host_xid) {
-            P::request_direct_unflip(self, "unmap_direct_frame_drawable");
-        }
+        P::request_direct_unflip_for_host_drawable(self, host_xid, "unmap_direct_frame_drawable");
         if let Some(geom) = self.windows.get_mut(&host_xid) {
             geom.mapped = false;
         }
@@ -2199,9 +2191,11 @@ impl<P: Platform> XBackend<P> {
         // next root Present, so replacing direct scanout for every
         // ConfigureWindow only creates direct/composed churn. Unwind when the
         // mutation touches storage retained by the active direct frame.
-        if P::direct_frame_references_host_drawable(self, host_xid) {
-            P::request_direct_unflip(self, "configure_direct_frame_drawable");
-        }
+        P::request_direct_unflip_for_host_drawable(
+            self,
+            host_xid,
+            "configure_direct_frame_drawable",
+        );
         let Some(geom) = self.windows.get_mut(&host_xid) else {
             // Window not tracked — log + skip (e.g., configure
             // before register). v1 tolerates this.
@@ -2373,6 +2367,7 @@ impl<P: Platform> XBackend<P> {
                  layer must validate ReparentWindow before dispatching to backend"
             );
         };
+        P::request_direct_unflip_for_host_drawable(self, host_xid, "reparent_direct_frame_chain");
         let new_rank = self.alloc_window_stack_rank();
         if let Some(geom) = self.windows.get_mut(&host_xid) {
             geom.x = x;
@@ -2694,9 +2689,7 @@ impl<P: Platform> XBackend<P> {
         // fix cut 2b — the compose scheduler otherwise excludes it).
         // Input shape (2) only affects hit-testing — no redraw needed.
         if kind == 0 || kind == 1 {
-            if P::direct_frames_shaped_off_root(self) {
-                P::request_direct_unflip(self, "shape_clips_direct_frame");
-            }
+            P::on_direct_shape_changed(self);
             self.scene.wake_for_damage();
         }
         Ok(())

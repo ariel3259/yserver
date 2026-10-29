@@ -267,6 +267,30 @@ proprietary clients do not set `_VARIABLE_REFRESH`; on NVIDIA (`nvidia-drm`),
 except applications that the NVIDIA or Mesa application lists, or the
 client's environment, exclude.
 
+### Direct scanout with a desktop compositor
+
+Direct scanout, and therefore VRR, needs a compositing desktop to unredirect
+fullscreen windows. On Cinnamon, set
+`org.cinnamon.muffin unredirect-fullscreen-windows` to `true` in System
+Settings → General → “disable compositing for full-screen windows”. This
+setting is off by default; with it off, Muffin composites the game and the
+monitor stays at its maximum refresh rate.
+
+Cinnamon has a known limitation, measured on 2026-10-27 and also seen on
+Xorg: a system-tray icon (for example Steam's, which is present whenever a
+game is launched through Steam) creates an override-redirect window stacked
+above the fullscreen game. Muffin then does not unredirect the game, so VRR
+stays off ([upstream issue #12687](https://github.com/linuxmint/cinnamon/issues/12687)).
+A desktop without a compositor, such as i3, is unaffected. Direct scanout is
+per output, so a client covering exactly one monitor can scan out there while
+other monitors keep composing at their own rates. A Present selecting another
+monitor's CRTC is composed. A whole-screen window can use grouped direct
+scanout when all outputs share the primary device and refresh rates within
+0.5%. Tearing requires Root direct scanout (single monitor, or a whole-screen
+window on same-refresh outputs); a fullscreen client on one monitor that
+disables V-Sync is flipped synchronized while other monitors are on. VRR
+with multiple monitors enabled is validated in a later change.
+
 It picks the lowest free display, mints a per-session
 MIT-MAGIC-COOKIE-1 (a server copy plus an entry in `~/.Xauthority`),
 waits for the socket, runs the session, and tears the server down on

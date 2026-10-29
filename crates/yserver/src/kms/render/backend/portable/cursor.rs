@@ -525,12 +525,7 @@ impl<P: Platform> XBackend<P> {
             return;
         };
         self.display_cursor_by_handle(xid);
-        if P::tearing_active(self)
-            && self.tearing_cursor_wants_visible()
-            && P::direct_scanout_owns_frame(self)
-        {
-            P::request_direct_unflip(self, "tearing_cursor_handoff");
-        }
+        P::request_tearing_cursor_handoff(self);
     }
 
     /// Arm (reset to frame 0) or clear the cursor animation for the
@@ -691,18 +686,7 @@ impl<P: Platform> XBackend<P> {
                 bgra_bytes: Some(std::sync::Arc::new(record.bgra_bytes.clone())),
             });
 
-        if P::tearing_active(self) {
-            if self.tearing_cursor_wants_visible() && P::direct_scanout_owns_frame(self) {
-                P::request_direct_unflip(self, "tearing_cursor_handoff");
-            }
-            return;
-        }
-        if P::direct_scanout_owns_frame(self) {
-            if !P::refresh_direct_cursor(self, &record) {
-                P::request_direct_unflip(self, "cursor_show_failed");
-            }
-            return;
-        }
+        P::request_tearing_cursor_handoff(self);
 
         // Stage 5 Phase D — steady-state HW sprite-change. When the
         // plane is fully bound, the scene won't re-tick (v2's
@@ -712,29 +696,32 @@ impl<P: Platform> XBackend<P> {
         // queueing path; if any output is transitioning, the
         // bytes land in the deferred slot until the wait set
         // drains.
-        let refreshes_visible_cursor = !P::tearing_active(self)
-            && match self.scene.cursor_mode() {
+        let direct_owns_frame = P::direct_scanout_owns_frame(self);
+        let refreshed_direct_outputs = if direct_owns_frame {
+            P::refresh_direct_cursor(self, &record)
+        } else {
+            Vec::new()
+        };
+        // Root tearing suppresses the scene-wide cursor upload, but an
+        // independent Output owner still refreshes its own hardware cursor
+        // through the owner-aware path above.
+        if P::tearing_active(self) {
+            return;
+        }
+        let refreshes_visible_cursor = direct_owns_frame
+            || match self.scene.cursor_mode() {
                 crate::kms::render::scene::CursorPlaneMode::Hw
                 | crate::kms::render::scene::CursorPlaneMode::Mixed => true,
                 crate::kms::render::scene::CursorPlaneMode::Hidden
                 | crate::kms::render::scene::CursorPlaneMode::Sw => false,
             };
         if refreshes_visible_cursor {
-            // Direct root scanout does not need a composed primary-plane
-            // retirement merely to replace cursor pixels. Update the atomic
-            // cursor planes in place; if any output rejects the operation,
-            // fall through to the scene state machine and unwind M2 so its
-            // ordinary per-output retry/fallback can retire safely.
-            if P::direct_scanout_owns_frame(self)
-                && !P::tearing_active(self)
-                && P::refresh_direct_cursor(self, &record)
-            {
-                return;
-            }
-            let refreshes_hw_binding = self.scene.queue_steady_state_cursor_upload(record.version);
-            if refreshes_hw_binding && P::direct_scanout_owns_frame(self) {
-                P::request_direct_unflip(self, "direct_cursor_refresh_failed");
-            }
+            let output_count = self.platform.output_layouts().len();
+            let queued_outputs: Vec<_> = (0..output_count)
+                .filter(|output_idx| !refreshed_direct_outputs.contains(output_idx))
+                .collect();
+            self.scene
+                .queue_steady_state_cursor_upload(record.version, &queued_outputs);
         }
         // The scene blit ordering: register_cursor already marks
         // scene_structure_dirty so the next tick repaints; no extra

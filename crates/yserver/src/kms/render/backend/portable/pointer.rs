@@ -616,38 +616,41 @@ impl<P: Platform> XBackend<P> {
             // transition pending) also wakes the scene so the software
             // cursor stays in sync with the eventual plane bind.
             let cursor_mode = self.scene.cursor_mode();
+            let (hot_x, hot_y, cw, ch) = self
+                .effective_cursor_xid
+                .and_then(|xid| self.cursor_records.get(&xid))
+                .map(|rec| {
+                    (
+                        rec.hot_x,
+                        rec.hot_y,
+                        i32::from(rec.width),
+                        i32::from(rec.height),
+                    )
+                })
+                .unwrap_or((0, 0, 0, 0));
+            let tearing_active = P::tearing_active(self);
             if self.effective_cursor_hidden() {
                 // The effective cursor has no visible pixels, so pointer
                 // motion has no cursor sprite to move.
-            } else if P::tearing_active(self) {
-                // Tearing owns cursor policy until exit. Keep motion on the
-                // platform's capped scene-wake path.
-                P::cursor_motion_during_tearing(self, true);
-            } else if matches!(
-                cursor_mode,
-                crate::kms::render::scene::CursorPlaneMode::Hw
-                    | crate::kms::render::scene::CursorPlaneMode::Mixed
-            ) {
-                #[allow(clippy::cast_possible_truncation)]
-                let cx = new_x as i32;
-                #[allow(clippy::cast_possible_truncation)]
-                let cy = new_y as i32;
-                let (hot_x, hot_y, cw, ch) = self
-                    .effective_cursor_xid
-                    .and_then(|xid| self.cursor_records.get(&xid))
-                    .map(|rec| {
-                        (
-                            rec.hot_x,
-                            rec.hot_y,
-                            i32::from(rec.width),
-                            i32::from(rec.height),
-                        )
-                    })
-                    .unwrap_or((0, 0, 0, 0));
+            } else if tearing_active
+                || matches!(
+                    cursor_mode,
+                    crate::kms::render::scene::CursorPlaneMode::Hw
+                        | crate::kms::render::scene::CursorPlaneMode::Mixed
+                )
+            {
+                if tearing_active {
+                    // Keep Root tearing motion on the capped scene-wake path.
+                    // The KMS hook also moves an independent Output owner's
+                    // visible hardware cursor.
+                    P::cursor_motion_during_tearing(self, true);
+                }
                 let mixed = matches!(
                     cursor_mode,
                     crate::kms::render::scene::CursorPlaneMode::Mixed
                 );
+                #[allow(clippy::cast_possible_truncation)]
+                let (cx, cy) = (new_x as i32, new_y as i32);
                 P::move_hw_cursor(self, mixed, (cx, cy), (hot_x, hot_y), (cw, ch));
             } else {
                 // Software cursors need repaint; an all-Hidden cursor also

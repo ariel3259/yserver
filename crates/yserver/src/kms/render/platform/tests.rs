@@ -1801,15 +1801,24 @@ fn cursor_move_outcome_merge_keeps_cross_device_retry_liveness() {
         ebusy_count: 2,
         fallback_changed: false,
         retry_required: false,
+        affected_crtcs: HashSet::from([crate::kms::render::platform::CrtcKey {
+            device_key: drm_key(0),
+            crtc: ::drm::control::from_u32(7).expect("nonzero test CRTC"),
+        }]),
     };
     aggregate.merge(CursorMoveOutcome {
         ebusy_count: 3,
         fallback_changed: true,
         retry_required: true,
+        affected_crtcs: HashSet::from([crate::kms::render::platform::CrtcKey {
+            device_key: drm_key(1),
+            crtc: ::drm::control::from_u32(7).expect("nonzero test CRTC"),
+        }]),
     });
     assert_eq!(aggregate.ebusy_count, 5);
     assert!(aggregate.fallback_changed);
     assert!(aggregate.retry_required);
+    assert_eq!(aggregate.affected_crtcs.len(), 2);
 }
 /// Test fixture works at all: open `for_tests`, query
 /// dimensions, query poll_fds, no Vk required.

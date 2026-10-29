@@ -1050,7 +1050,8 @@ impl Platform for SurfacePlatform {
             log::warn!("surface maybe_composite: timeout close failed: {e:?}");
         }
         b.tick_cursor_animation();
-        b.compose_tick();
+        let skip_outputs = vec![false; b.platform.output_layouts().len()];
+        b.compose_tick(&skip_outputs);
         b.rootless_tick();
         b.drain_paint_submit_telemetry();
         b.flush_host_cursor();

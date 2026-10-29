@@ -830,13 +830,7 @@ fn submit_direct_successor(
             .queued_successor
             .is_some(),
         fixture.events.backend.pstate.direct.root().unflip_requested,
-        fixture
-            .events
-            .backend
-            .pstate
-            .direct
-            .root()
-            .eligible_root_streak,
+        fixture.events.backend.pstate.direct.root().eligible_streak,
     );
     direct.candidate = candidate;
     direct.event = event;
@@ -1127,7 +1121,10 @@ fn prepare_property_present_source(
         direct: true,
     };
     fixture.events.backend.pstate.scanout_m1.entries.insert(
-        direct.source_id,
+        (
+            direct.source_id,
+            crate::kms::render::backend::DirectScope::Root,
+        ),
         crate::kms::render::backend::ScanoutM1ProbeEntry::accepted_with_shape(
             crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(
                 super::recording_scene::raw(0x8130),
@@ -1166,7 +1163,7 @@ fn start_property_direct(
         .pstate
         .direct
         .root_mut()
-        .eligible_root_streak = crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
+        .eligible_streak = crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
     let offset = super::direct_unflip::record_count(fixture, fd);
     request_present(
         &mut state,
@@ -1407,7 +1404,10 @@ fn vrr_standalone_clear_event_retires_nothing() {
         .pstate
         .scanout_m1
         .entries
-        .get(&current_before.1)
+        .get(&(
+            current_before.1,
+            crate::kms::render::backend::DirectScope::Root,
+        ))
         .and_then(crate::kms::render::backend::ScanoutM1ProbeEntry::framebuffer)
         .map(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle)
         .expect("current direct frame retains its framebuffer");
@@ -1489,7 +1489,10 @@ fn vrr_standalone_clear_event_retires_nothing() {
         .pstate
         .scanout_m1
         .entries
-        .get(&current_after.1)
+        .get(&(
+            current_after.1,
+            crate::kms::render::backend::DirectScope::Root,
+        ))
         .and_then(crate::kms::render::backend::ScanoutM1ProbeEntry::framebuffer)
         .map(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle)
         .expect("standalone clear event retains the direct framebuffer");
@@ -1759,7 +1762,10 @@ fn vrr_property_mode_reads_like_xorg() {
         direct: true,
     };
     fixture.events.backend.pstate.scanout_m1.entries.insert(
-        direct.source_id,
+        (
+            direct.source_id,
+            crate::kms::render::backend::DirectScope::Root,
+        ),
         crate::kms::render::backend::ScanoutM1ProbeEntry::accepted_with_shape(
             crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(
                 super::recording_scene::raw(0x8130),
@@ -1788,7 +1794,7 @@ fn vrr_property_mode_reads_like_xorg() {
         .pstate
         .direct
         .root_mut()
-        .eligible_root_streak = crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
+        .eligible_streak = crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
     let start = super::direct_unflip::record_count(&fixture, fd);
     request_present(
         &mut state,
@@ -4911,6 +4917,215 @@ fn vrr_standalone_clear_retried_after_error() {
     super::atomic_events::complete_recorded_attempt(&mut fixture, fd, &attempts[1], retry_id, 88);
     finish_property_direct_scanout(&mut fixture, fd);
     fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: select only the first matching direct owner with `find_map`.
+fn vrr_property_change_reaches_every_owner_of_the_window() {
+    use crate::kms::render::backend::DirectScope;
+    use yserver_core::backend::WindowHandle;
+    use yserver_protocol::x11::ResourceId;
+
+    for (retiring_idx, current_idx) in [(0, 1), (1, 0)] {
+        let Some(fixture) = super::recording_scene::RecordingSceneFixture::with_route(
+            2,
+            super::recording_scene::P1SceneRoute::Shared,
+        )
+        .expect("two-output VRR recording scene") else {
+            eprintln!(
+                "SKIP vrr_property_change_reaches_every_owner_of_the_window: Vulkan fixture unavailable"
+            );
+            return;
+        };
+        let mut fixture = fixture.cleanup_guard();
+        fixture.events.backend.pstate.vrr_mode = crate::launch::VrrMode::Property;
+        for layout in &mut fixture.events.backend.platform.outputs {
+            layout.output.crtc_vrr_enabled_prop = Some(handle(VRR_PROP_ID));
+            layout.output.connector_vrr_capable = true;
+        }
+
+        let output0 = fixture.install_direct_output_present(0, 18_060, 0);
+        let output1 = fixture.install_direct_output_present(1, 18_061, 0);
+        let fd = super::direct_unflip::fd(&fixture);
+        let mut state = present_request_state(&output0);
+        let shared_host_xid = 0x7b20;
+        state
+            .resources
+            .window_mut(ResourceId(output0.target_xid))
+            .expect("Output(0) property window")
+            .host_xid = WindowHandle::from_raw(shared_host_xid);
+        add_property_window(&mut state, output1.target_xid, shared_host_xid);
+        let property = state.atoms.intern("_VARIABLE_REFRESH", false).0;
+        request_vrr_property(
+            &mut state,
+            &mut fixture.events.backend,
+            output0.target_xid,
+            property,
+            yserver_core::xinput::XA_CARDINAL.0,
+            32,
+            &[1],
+            1,
+        );
+
+        let direct0 =
+            super::direct_unflip::submit_output_present_via_backend(&mut fixture, &output0, 0);
+        let direct1 =
+            super::direct_unflip::submit_output_present_via_backend(&mut fixture, &output1, 1);
+        let direct_ids = [
+            super::support::accepted_event_id(&direct0).expect("Output(0) direct ID"),
+            super::support::accepted_event_id(&direct1).expect("Output(1) direct ID"),
+        ];
+        let crtcs = [
+            fixture.events.backend.platform.outputs[0].output.crtc,
+            fixture.events.backend.platform.outputs[1].output.crtc,
+        ];
+        assert!(contains_vrr_property(&direct0, crtcs[0], 1));
+        assert!(contains_vrr_property(&direct1, crtcs[1], 1));
+        super::atomic_events::complete_recorded_attempt(
+            &mut fixture,
+            fd,
+            &direct0,
+            direct_ids[0],
+            92,
+        );
+        super::atomic_events::complete_recorded_attempt(
+            &mut fixture,
+            fd,
+            &direct1,
+            direct_ids[1],
+            93,
+        );
+        assert_eq!(
+            Backend::drain_completed_present_events(&mut fixture.events.backend)
+                .into_iter()
+                .map(|event| event.present_id)
+                .collect::<Vec<_>>(),
+            [output0.candidate.present_id, output1.candidate.present_id]
+        );
+        let before_pins = fixture.events.backend.present_source_pins.len();
+
+        let retiring = if retiring_idx == 0 {
+            &output0
+        } else {
+            &output1
+        };
+        Backend::unmap_subwindow(&mut fixture.events.backend, None, retiring.target_xid)
+            .expect("retiring owner's unmap enters through Backend");
+        assert!(fixture.events.backend.pstate.direct.outputs[retiring_idx].unflip_requested);
+
+        let clear_start = super::direct_unflip::record_count(&fixture, fd);
+        delete_vrr_property(
+            &mut state,
+            &mut fixture.events.backend,
+            output0.target_xid,
+            property,
+            4,
+        );
+        Backend::maybe_composite(&mut fixture.events.backend)
+            .expect("run the property-change scheduling pass");
+
+        for output_idx in 0..2 {
+            let owner = &fixture.events.backend.pstate.direct.outputs[output_idx];
+            let frame = owner
+                .current
+                .as_ref()
+                .expect("both owners still retain the window");
+            assert!(
+                !frame.candidate.variable_refresh,
+                "Output({output_idx}) current candidate sees the deleted property"
+            );
+            assert_eq!(
+                fixture
+                    .events
+                    .backend
+                    .pstate
+                    .direct
+                    .scope_for_output(output_idx),
+                Some(DirectScope::Output(output_idx))
+            );
+        }
+        let current_crtc = crtcs[current_idx];
+        let after_change = super::direct_unflip::records_since(&fixture, fd, clear_start);
+        let current_clear = after_change.iter().find(|record| {
+            super::support::accepted_event_id(record).is_some()
+                && record.kind == AtomicCommitKind::VrrOnly
+                && contains_vrr_property(record, current_crtc, 0)
+        });
+        assert!(
+            current_clear.is_some(),
+            "the still-current owner on output {current_idx} gets a standalone VRR clear"
+        );
+        assert!(
+            after_change.iter().all(|record| {
+                super::support::accepted_event_id(record).is_none()
+                    || record.kind == AtomicCommitKind::VrrOnly
+            }),
+            "property deletion does not require or submit another Present"
+        );
+        assert_eq!(
+            fixture.events.backend.present_source_pins.len(),
+            before_pins,
+            "the standalone property clear retains the existing direct frames"
+        );
+        for (offset, record) in after_change.iter().enumerate() {
+            let Some(event_id) = super::support::accepted_event_id(record) else {
+                continue;
+            };
+            super::atomic_events::complete_recorded_attempt(
+                &mut fixture,
+                fd,
+                record,
+                event_id,
+                94 + u32::try_from(offset).expect("record index fits"),
+            );
+        }
+        for (output_idx, direct) in [(0, &output0), (1, &output1)] {
+            if !fixture.events.backend.pstate.direct.outputs[output_idx].unflip_requested {
+                Backend::unmap_subwindow(&mut fixture.events.backend, None, direct.target_xid)
+                    .expect("request remaining owner unflip through Backend");
+            }
+        }
+        let cleanup_start = super::direct_unflip::record_count(&fixture, fd);
+        Backend::maybe_composite(&mut fixture.events.backend)
+            .expect("submit both output-owner replacements");
+        fixture.events.wait_for_submitted_gpu_work();
+        let cleanup_records = super::direct_unflip::records_since(&fixture, fd, cleanup_start);
+        for (offset, record) in cleanup_records.iter().enumerate() {
+            let Some(event_id) = super::support::accepted_event_id(record) else {
+                continue;
+            };
+            super::atomic_events::complete_recorded_attempt(
+                &mut fixture,
+                fd,
+                record,
+                event_id,
+                100 + u32::try_from(offset).expect("cleanup record index fits"),
+            );
+        }
+        assert!(
+            fixture
+                .events
+                .backend
+                .pstate
+                .direct
+                .outputs
+                .iter()
+                .all(|owner| owner.current.is_none()),
+            "both direct owners release their current frames after replacement"
+        );
+        assert!(fixture.events.backend.present_source_pins.is_empty());
+        let mut idled = Backend::drain_retired_present_idle_events(&mut fixture.events.backend)
+            .into_iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>();
+        idled.sort_unstable();
+        assert_eq!(
+            idled,
+            [output0.candidate.present_id, output1.candidate.present_id]
+        );
+        fixture.finish_after_normal_drain();
+    }
 }
 
 #[test]

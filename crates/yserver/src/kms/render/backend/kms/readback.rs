@@ -1,6 +1,6 @@
 use crate::kms::render::{
     backend::{
-        DirectPresentFrame, KmsBackend, SCANOUT_READBACK_GRANULE, ScanoutReadOrigin,
+        DirectPresentFrame, DirectScope, KmsBackend, SCANOUT_READBACK_GRANULE, ScanoutReadOrigin,
         ScanoutReadRoute, ScanoutReadSelection, portable::dump_cursor_record_to_ppm,
     },
     platform::PlatformBackend,
@@ -25,14 +25,11 @@ fn scanout_selection_phases(
 
 /// Rebase a root-absolute rect into the direct source drawable's own space.
 ///
-/// The flipped source is blitted so that its `(0, 0)` lands at
-/// (`x_off`, `y_off`) of the root-covering paint target — the same mapping
-/// `materialize_direct_shadow_for_unflip` uses for its fallback Copy. M2
-/// eligibility pins that target to the root origin
-/// (`scanout_m2_is_authoritative_root`'s `root_coverage`) and both offsets to
-/// zero (`scanout_direct_eligible`), so today this is the identity; it is
-/// derived from the candidate anyway so relaxing either rule cannot silently
-/// shift the read.
+/// The flipped source is blitted so that its `(0, 0)` lands at the owner's
+/// paint-target origin plus (`x_off`, `y_off`) — the same mapping
+/// `materialize_direct_shadow_for_unflip` uses for its fallback Copy. Root
+/// owners use the root origin; Output owners use their output's root-space
+/// origin.
 fn direct_scanout_route_for_rect(
     backend: &KmsBackend,
     output_idx: usize,
@@ -54,8 +51,20 @@ fn direct_scanout_route_for_rect(
         )));
     }
     let extent = drawable.storage.extent;
-    let sx = i64::from(rect.offset.x) - i64::from(frame.candidate.x_off);
-    let sy = i64::from(rect.offset.y) - i64::from(frame.candidate.y_off);
+    let (target_x, target_y) = match backend.pstate.direct.scope_for_output(output_idx) {
+        Some(DirectScope::Root) => (0, 0),
+        Some(DirectScope::Output(owner_output_idx)) => {
+            let (x, y, _, _) = backend.platform.output_root_rect(owner_output_idx);
+            (i64::from(x), i64::from(y))
+        }
+        None => {
+            return Err(io::Error::other(format!(
+                "output {output_idx} direct source 0x{source_xid:x} has no owner scope"
+            )));
+        }
+    };
+    let sx = i64::from(rect.offset.x) - target_x - i64::from(frame.candidate.x_off);
+    let sy = i64::from(rect.offset.y) - target_y - i64::from(frame.candidate.y_off);
     if sx < 0
         || sy < 0
         || sx + i64::from(rect.extent.width) > i64::from(extent.width)

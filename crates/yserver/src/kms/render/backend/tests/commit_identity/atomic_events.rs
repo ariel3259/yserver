@@ -97,7 +97,7 @@ pub(super) fn submit_damaged_frame(
     attempts
 }
 
-pub(super) fn complete_recorded_attempt(
+pub(crate) fn complete_recorded_attempt(
     fixture: &mut RecordingSceneFixture,
     fd: RawFd,
     record: &AtomicCommitRecord,

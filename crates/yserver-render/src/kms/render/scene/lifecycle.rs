@@ -236,6 +236,17 @@ impl SceneCompositor {
         }
     }
 
+    /// Mark the scanout BO history for one output wholly stale.
+    pub fn invalidate_scanout_damage_for_output(&mut self, output_idx: usize) {
+        if let Some(output) = self
+            .inner
+            .as_mut()
+            .and_then(|inner| inner.outputs.get_mut(output_idx))
+        {
+            output.damage.invalidate();
+        }
+    }
+
     pub fn rebuild_outputs(
         &mut self,
         sink: &dyn OutputSink,

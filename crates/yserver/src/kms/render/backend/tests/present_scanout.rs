@@ -343,7 +343,11 @@ fn present_randr_crtc_routes_equal_raw_handles_to_the_owning_device() {
     assert!(!b.present_absolute_vblank_arm_supported(primary_xid));
     assert!(b.present_absolute_vblank_arm_supported(secondary_xid));
     assert!(
-        !b.direct_present_crtc_eligible(secondary_xid, b.present_crtc_clock_epoch(secondary_xid),),
+        !b.direct_present_crtc_eligible(
+            crate::kms::render::backend::DirectScope::Root,
+            secondary_xid,
+            b.present_crtc_clock_epoch(secondary_xid),
+        ),
         "a secondary-card CRTC cannot own the primary-device grouped framebuffer"
     );
 }
@@ -355,7 +359,11 @@ fn present_clock_epoch_changes_on_route_removal_and_readd() {
     bind_test_randr_crtc(&mut b, 0, crtc_id);
     let first = b.present_crtc_clock_epoch(crtc_id);
     assert_ne!(first, 0);
-    assert!(b.direct_present_crtc_eligible(crtc_id, first));
+    assert!(b.direct_present_crtc_eligible(
+        crate::kms::render::backend::DirectScope::Root,
+        crtc_id,
+        first
+    ));
 
     b.refresh_present_crtc_clock_epochs();
     assert_eq!(b.present_crtc_clock_epoch(crtc_id), first);
@@ -372,7 +380,11 @@ fn present_clock_epoch_changes_on_route_removal_and_readd() {
     assert_ne!(second, 0);
     assert_ne!(second, first, "off-to-on starts a new MSC epoch");
     assert!(
-        !b.direct_present_crtc_eligible(crtc_id, first),
+        !b.direct_present_crtc_eligible(
+            crate::kms::render::backend::DirectScope::Root,
+            crtc_id,
+            first
+        ),
         "a candidate captured in the old domain cannot enter direct scanout"
     );
 }
@@ -390,7 +402,11 @@ fn off_randr_crtc_has_no_present_domain_or_direct_path() {
     assert_eq!(b.present_get_ust_msc(crtc_id), (0, 0));
     assert!(!b.present_flip_in_flight(crtc_id));
     assert!(!b.present_absolute_vblank_arm_supported(crtc_id));
-    assert!(!b.direct_present_crtc_eligible(crtc_id, 0));
+    assert!(!b.direct_present_crtc_eligible(
+        crate::kms::render::backend::DirectScope::Root,
+        crtc_id,
+        0
+    ));
 }
 
 /// With DPMS off the CRTCs are powered down and CRTC_QUEUE_SEQUENCE
@@ -849,8 +865,14 @@ fn destroy_subwindow_retires_current_direct_idle_once_after_replacement() {
     assert!(b.store.get(target_id).is_none());
     assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(2));
 
-    b.stop_direct_after_scanout_replaced("destroy-subwindow test replacement");
-    b.stop_direct_after_scanout_replaced("destroy-subwindow duplicate replacement");
+    b.stop_direct_after_scanout_replaced(
+        crate::kms::render::backend::DirectScope::Root,
+        "destroy-subwindow test replacement",
+    );
+    b.stop_direct_after_scanout_replaced(
+        crate::kms::render::backend::DirectScope::Root,
+        "destroy-subwindow duplicate replacement",
+    );
 
     assert!(!b.present_source_pins.contains_key(&source_pin));
     assert!(!b.present_source_pins.contains_key(&cow_pin));
@@ -891,7 +913,10 @@ fn final_cow_release_defers_storage_until_direct_replacement() {
     assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
     assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(2));
 
-    b.stop_direct_after_scanout_replaced("final COW release test replacement");
+    b.stop_direct_after_scanout_replaced(
+        crate::kms::render::backend::DirectScope::Root,
+        "final COW release test replacement",
+    );
 
     assert!(!b.deferred_cow_release);
     assert!(b.cow_id.is_none());
@@ -902,6 +927,271 @@ fn final_cow_release_defers_storage_until_direct_replacement() {
     assert_eq!(b.store.get(source_id).map(|d| d.refcount), Some(1));
     assert_eq!(b.drain_retired_present_idle_events().len(), 1);
     assert!(b.drain_retired_present_idle_events().is_empty());
+}
+
+#[test]
+// Mutation: call finish_deferred_cow_release on every owner stop.
+fn deferred_cow_release_last_owner() {
+    use crate::kms::render::backend::DirectScope;
+    use std::{
+        os::fd::{AsFd, AsRawFd},
+        time::Duration,
+    };
+    use yserver_core::{backend::Backend, server::ServerState};
+
+    fn submit_replacement(backend: &KmsBackend, output_idx: usize, framebuffer_id: u32) -> u64 {
+        let device = backend
+            .platform
+            .primary_device()
+            .expect("fixture has a primary DRM device");
+        let output = &backend.platform.outputs[output_idx].output;
+        let plane = crate::drm::modeset::ComposedScanoutPlaneState {
+            output,
+            fb: ::drm::control::from_u32(framebuffer_id).expect("nonzero test framebuffer handle"),
+            in_fence_fd: None,
+        };
+        crate::drm::modeset::submit_composed_scanout(
+            &device.device,
+            &device.atomic_commit_sink,
+            &[plane],
+            &[],
+        )
+        .expect("record accepted composed replacement")
+    }
+
+    fn stage_replacement(backend: &mut KmsBackend, output_idx: usize, event_id: u64) {
+        let owner = &mut backend.pstate.direct.outputs[output_idx];
+        owner.unflip_outputs_to_replace.insert(output_idx);
+        owner.unflip_awaiting_outputs.insert(output_idx, event_id);
+    }
+
+    fn complete_replacement(
+        backend: &mut KmsBackend,
+        state: &mut ServerState,
+        output_idx: usize,
+        event_id: u64,
+        frame: u32,
+    ) {
+        let output = &backend.platform.outputs[output_idx];
+        let event_source = backend.platform.devices[0]
+            .test_page_flip_event_source
+            .as_ref()
+            .expect("headless fixture has an injected page-flip source")
+            .clone();
+        event_source.queue_flip_with_cookie(
+            output.output.crtc,
+            frame,
+            event_id,
+            Duration::from_micros(u64::from(frame) * 1_000),
+        );
+        let device_fd = backend.platform.devices[0].device.as_fd().as_raw_fd();
+        Backend::on_page_flip_ready(backend, state, device_fd);
+    }
+
+    let mut b = KmsBackend::for_tests();
+    push_test_output(&mut b, 0x5912);
+    let _recorder = atomic_cursor_recording_sink(&mut b);
+    let cow_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+    assert!(
+        Backend::get_overlay_window(&mut b, None).expect("materialize shared COW"),
+        "both Output owners use one materialized COW"
+    );
+    let cow_id = b.cow_id.expect("materialized COW id");
+
+    let (source0, _, source_pin0, cow_pin0) =
+        install_direct_frame_for_target_test(&mut b, 0x5910, cow_id, true);
+    let mut frame0 = b
+        .pstate
+        .direct
+        .root_mut()
+        .current
+        .take()
+        .expect("first seeded direct frame");
+    frame0.completion_output_idx = 0;
+    frame0.candidate.crtc_id = u32::from(b.platform.outputs[0].output.crtc);
+    frame0.event.crtc_id = frame0.candidate.crtc_id;
+    b.pstate.direct.outputs[0].current = Some(frame0);
+    b.pstate.direct.outputs[0].hold_direct = true;
+
+    let (source1, _, source_pin1, cow_pin1) =
+        install_direct_frame_for_target_test(&mut b, 0x5920, cow_id, true);
+    let mut frame1 = b
+        .pstate
+        .direct
+        .root_mut()
+        .current
+        .take()
+        .expect("second seeded direct frame");
+    frame1.candidate.present_id = 78;
+    frame1.event.present_id = 78;
+    frame1.event.serial = 10;
+    frame1.completion_output_idx = 1;
+    frame1.candidate.crtc_id = u32::from(b.platform.outputs[1].output.crtc);
+    frame1.event.crtc_id = frame1.candidate.crtc_id;
+    b.pstate.direct.outputs[1].current = Some(frame1);
+    b.pstate.direct.outputs[1].hold_direct = true;
+    b.pstate.direct.root_mut().hold_direct = false;
+    b.pstate.direct.outputs[0].unflip_shadow_ready = true;
+    b.pstate.direct.outputs[1].unflip_shadow_ready = true;
+
+    assert_eq!(
+        b.pstate.direct.active_scopes(),
+        [DirectScope::Output(0), DirectScope::Output(1)],
+        "two independent Output owners share the seeded COW"
+    );
+    assert_eq!(
+        b.store.get(cow_id).map(|drawable| drawable.refcount),
+        Some(3)
+    );
+
+    assert!(
+        Backend::prepare_overlay_release(&mut b, None).expect("prepare first COW release"),
+        "first release has a materialized COW"
+    );
+    Backend::retire_overlay_window(&mut b, None);
+    assert!(
+        b.deferred_cow_release,
+        "first release waits for both owners"
+    );
+    assert_eq!(
+        b.cow_id,
+        Some(cow_id),
+        "first release preserves COW identity"
+    );
+    assert!(
+        b.windows.contains_key(&cow_xid),
+        "first release preserves COW projection"
+    );
+    assert_eq!(
+        b.store.get(cow_id).map(|drawable| drawable.refcount),
+        Some(3)
+    );
+    assert!(b.pstate.direct.outputs[0].unflip_requested);
+    assert!(b.pstate.direct.outputs[1].unflip_requested);
+    assert_eq!(b.present_source_pins.get(&source_pin0), Some(&source0));
+    assert_eq!(b.present_source_pins.get(&cow_pin0), Some(&cow_id));
+    assert_eq!(b.present_source_pins.get(&source_pin1), Some(&source1));
+    assert_eq!(b.present_source_pins.get(&cow_pin1), Some(&cow_id));
+
+    let output1_event = submit_replacement(&b, 1, 0x5922);
+    stage_replacement(&mut b, 1, output1_event);
+    let mut state = ServerState::new();
+    complete_replacement(&mut b, &mut state, 1, output1_event, 58);
+
+    assert_eq!(
+        b.pstate.direct.active_scopes(),
+        [DirectScope::Output(0)],
+        "Output 1 replacement retires only its owner"
+    );
+    assert!(
+        b.deferred_cow_release,
+        "first owner stop defers final COW release"
+    );
+    assert_eq!(
+        b.cow_id,
+        Some(cow_id),
+        "first owner stop preserves COW identity"
+    );
+    assert!(
+        b.windows.contains_key(&cow_xid),
+        "first owner stop preserves COW projection"
+    );
+    assert_eq!(
+        b.store.get(cow_id).map(|drawable| drawable.refcount),
+        Some(2)
+    );
+    assert_eq!(b.present_source_pins.get(&source_pin0), Some(&source0));
+    assert_eq!(b.present_source_pins.get(&cow_pin0), Some(&cow_id));
+    assert!(!b.present_source_pins.contains_key(&source_pin1));
+    assert!(!b.present_source_pins.contains_key(&cow_pin1));
+    assert_eq!(
+        b.store.get(source1).map(|drawable| drawable.refcount),
+        Some(1)
+    );
+    assert_eq!(
+        Backend::drain_retired_present_idle_events(&mut b)
+            .into_iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>(),
+        [78],
+        "Output 1 replacement retires its idle notification exactly once"
+    );
+    assert!(
+        Backend::get_overlay_window(&mut b, None).expect("reacquire deferred COW"),
+        "reacquisition reuses deferred COW storage"
+    );
+    assert_eq!(
+        b.cow_id,
+        Some(cow_id),
+        "reacquisition keeps the same COW identity"
+    );
+    assert!(
+        b.windows.contains_key(&cow_xid),
+        "reacquisition restores COW projection"
+    );
+    assert!(
+        Backend::prepare_overlay_release(&mut b, None).expect("prepare final COW release"),
+        "final release has the reacquired COW"
+    );
+    Backend::retire_overlay_window(&mut b, None);
+    assert!(
+        b.deferred_cow_release,
+        "final release waits for Output 0 replacement"
+    );
+    assert_eq!(
+        b.cow_id,
+        Some(cow_id),
+        "final release still pins the COW before replacement"
+    );
+
+    let output0_event = submit_replacement(&b, 0, 0x5921);
+    stage_replacement(&mut b, 0, output0_event);
+    complete_replacement(&mut b, &mut state, 0, output0_event, 59);
+
+    assert!(
+        b.pstate.direct.active_scopes().is_empty(),
+        "last replacement stops all owners"
+    );
+    assert!(
+        !b.deferred_cow_release,
+        "last owner stop finishes deferred COW release"
+    );
+    assert!(
+        b.cow_id.is_none(),
+        "last owner stop clears the COW identity"
+    );
+    assert!(
+        !b.windows.contains_key(&cow_xid),
+        "last owner stop removes the COW projection"
+    );
+    assert!(
+        b.store.get(cow_id).is_none(),
+        "last owner stop deletes COW storage"
+    );
+    assert!(!b.present_source_pins.contains_key(&source_pin0));
+    assert!(!b.present_source_pins.contains_key(&cow_pin0));
+    assert!(!b.present_source_pins.contains_key(&source_pin1));
+    assert!(!b.present_source_pins.contains_key(&cow_pin1));
+    assert_eq!(
+        b.store.get(source0).map(|drawable| drawable.refcount),
+        Some(1)
+    );
+    assert_eq!(
+        b.store.get(source1).map(|drawable| drawable.refcount),
+        Some(1)
+    );
+    assert_eq!(
+        Backend::drain_retired_present_idle_events(&mut b)
+            .into_iter()
+            .map(|event| event.present_id)
+            .collect::<Vec<_>>(),
+        [77],
+        "Output 0 replacement retires its idle notification exactly once"
+    );
+    assert!(
+        Backend::drain_retired_present_idle_events(&mut b).is_empty(),
+        "both replacement notifications have been drained"
+    );
 }
 
 #[test]
@@ -950,7 +1240,10 @@ fn get_cow_during_deferred_release_reuses_backend_identity() {
     assert!(rematerialized, "core must rebuild its logical COW resource");
     assert!(!b.deferred_cow_release);
     assert_eq!(b.cow_id, Some(cow_id));
-    b.stop_direct_after_scanout_replaced("reclaimed COW test replacement");
+    b.stop_direct_after_scanout_replaced(
+        crate::kms::render::backend::DirectScope::Root,
+        "reclaimed COW test replacement",
+    );
     assert_eq!(b.cow_id, Some(cow_id));
     assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(1));
 }
@@ -1150,7 +1443,10 @@ fn logical_resize_keeps_old_cow_pinned_until_direct_replacement() {
         Some(new_cow_id)
     );
 
-    b.stop_direct_after_scanout_replaced("logical resize test replacement");
+    b.stop_direct_after_scanout_replaced(
+        crate::kms::render::backend::DirectScope::Root,
+        "logical resize test replacement",
+    );
     assert!(b.store.get(old_cow_id).is_none());
     assert_eq!(b.cow_id, Some(new_cow_id));
     assert!(b.store.get(new_cow_id).is_some());
@@ -1197,13 +1493,13 @@ fn direct_scanout_topology_requires_one_drm_device() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     push_test_output(&mut b, 2);
     assert!(
-        b.direct_scanout_topology_eligible(),
+        b.direct_scanout_topology_eligible(crate::kms::render::backend::DirectScope::Root),
         "two equal-refresh outputs on the primary card may use grouped direct scanout"
     );
 
     b.platform.outputs[1].key.device_key = test_device_key(1);
     assert!(
-        !b.direct_scanout_topology_eligible(),
+        !b.direct_scanout_topology_eligible(crate::kms::render::backend::DirectScope::Root),
         "one atomic direct transaction cannot span DRM devices"
     );
 }
@@ -1364,8 +1660,14 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
     latest_successor.event.serial = 11;
 
     b.pstate.direct.root_mut().pending = Some(predecessor);
-    b.queue_direct_successor(first_successor);
-    b.queue_direct_successor(latest_successor);
+    b.queue_direct_successor(
+        crate::kms::render::backend::DirectScope::Root,
+        first_successor,
+    );
+    b.queue_direct_successor(
+        crate::kms::render::backend::DirectScope::Root,
+        latest_successor,
+    );
 
     assert_eq!(
         b.pstate
@@ -1468,7 +1770,7 @@ fn direct_scanout_topology_rejects_heterogeneous_refresh() {
     b.platform.outputs[1].output.picked.vrefresh = 75;
 
     assert!(
-        !b.direct_scanout_topology_eligible(),
+        !b.direct_scanout_topology_eligible(crate::kms::render::backend::DirectScope::Root),
         "heterogeneous synthetic refresh rates stay on per-output composition"
     );
 }
@@ -1490,17 +1792,17 @@ fn direct_scanout_topology_compares_precise_fractional_timings() {
     };
     b.platform.outputs[0].output.picked = timing.clone();
     b.platform.outputs[1].output.picked = timing;
-    assert!(b.direct_scanout_topology_eligible());
+    assert!(b.direct_scanout_topology_eligible(crate::kms::render::backend::DirectScope::Root));
 
     // 60 vs 59.94 Hz: two "60 Hz" monitors, within the grouping tolerance.
     b.platform.outputs[1].output.picked.clock_khz = 148_352;
-    assert!(b.direct_scanout_topology_eligible());
+    assert!(b.direct_scanout_topology_eligible(crate::kms::render::backend::DirectScope::Root));
 
     // The advertised integer still says 60, but the kernel timing is 50 Hz.
     // The grouped path must go by the timing, not the integer.
     b.platform.outputs[1].output.picked.clock_khz = 123_750;
     assert!(
-        !b.direct_scanout_topology_eligible(),
+        !b.direct_scanout_topology_eligible(crate::kms::render::backend::DirectScope::Root),
         "same integer vrefresh is insufficient when kernel timing is available"
     );
 }
@@ -1653,6 +1955,127 @@ fn present_flip_in_flight_mirrors_scene_state() {
         !b.present_flip_in_flight(0x5fff),
         "an unknown/off CRTC never borrows another output's flip state"
     );
+}
+
+#[test]
+// Mutation: read Root pending/replacement fields for every output query.
+fn output_present_in_flight_policy() {
+    use crate::kms::render::{
+        backend::{DirectPresentFrame, ScanoutM0Target},
+        store::DrawableId,
+        target::PaintTarget,
+    };
+    use std::collections::HashSet;
+    use yserver_core::backend::{CompletedPresentEvent, PresentScanoutCandidate, PresentWake};
+
+    // Each row gets a fresh backend so pending frames and replacement markers
+    // cannot leak into another query's classification.
+    for (row, queried_output, phase, expected_in_flight) in [
+        // D12: pending direct state is visible on its owner output.
+        ("pending_owner_query", 1, 0_u32, true),
+        // D12: the pending output does not make its peer look busy.
+        ("pending_other_output_query", 0, 0_u32, false),
+        // D12: a requested replacement marker remains output-local.
+        ("replacement_requested_owner_query", 1, 1_u32, true),
+        // D12: a peer query does not borrow the replacement marker.
+        ("replacement_requested_other_output_query", 0, 1_u32, false),
+    ] {
+        let mut backend = KmsBackend::for_tests();
+        push_test_output(&mut backend, 0x5001);
+        backend.scene.scene_structure_dirty = false;
+        backend.scene.test_set_flip_in_flight(false);
+        let output_crtcs = [
+            u32::from(backend.platform.outputs[0].output.crtc),
+            u32::from(backend.platform.outputs[1].output.crtc),
+        ];
+        bind_test_randr_crtc(&mut backend, 0, output_crtcs[0]);
+        bind_test_randr_crtc(&mut backend, 1, output_crtcs[1]);
+        let output_idx = 1;
+        let present_id = 0xD1_2000
+            + u64::from(phase) * 10
+            + u64::try_from(queried_output).expect("output index fits");
+        let source_id = DrawableId::for_tests(present_id);
+        let fallback_id = DrawableId::for_tests(present_id + 1);
+        let crtc_id = output_crtcs[output_idx];
+        let crtc_epoch = backend.present_crtc_clock_epoch(crtc_id);
+        let candidate = PresentScanoutCandidate {
+            client_id: 1,
+            client_pid: None,
+            present_id,
+            crtc_id,
+            crtc_epoch,
+            src_pixmap_xid: 0xD120,
+            dst_window_xid: 0xD121,
+            variable_refresh: false,
+            src_host_xid: 0xD122,
+            paint_dst_host_xid: 0xD121,
+            completion_dst_host_xid: 0xD121,
+            src_width: 800,
+            src_height: 600,
+            x_off: 0,
+            y_off: 0,
+            valid_region_xid: 0,
+            update_region_xid: 0,
+            update_is_full: true,
+            explicit_sync: false,
+            options: 0,
+        };
+        let frame = DirectPresentFrame {
+            source_pin: 1,
+            fallback_target_pin: 2,
+            source_id,
+            candidate,
+            target: ScanoutM0Target::Unredirected,
+            present_received_at: std::time::Instant::now(),
+            present_received_monotonic: None,
+            fallback_target: PaintTarget::new(fallback_id, (0, 0), None, 24),
+            event: CompletedPresentEvent {
+                client_id: yserver_protocol::x11::ClientId(1),
+                serial: u32::try_from(present_id).expect("Present serial fits"),
+                host_xid: 0xD122,
+                dst_host_xid: 0xD121,
+                options: 0,
+                present_id,
+                window_generation: 0,
+                crtc_id,
+                crtc_epoch,
+                msc_offset: 0,
+                completion_clock: None,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_FLIP,
+                emit_idle: false,
+            },
+            completion_output_idx: output_idx,
+            completion_clock: None,
+            awaiting_outputs: HashSet::from([output_idx]),
+            accepted_event_id: Some(0xD120),
+            async_outcome: crate::drm::async_flip::AsyncOutcome::NotRequested,
+        };
+        let owner = &mut backend.pstate.direct.outputs[output_idx];
+        if phase == 0 {
+            owner.pending = Some(frame);
+        } else {
+            owner.current = Some(frame);
+            owner.unflip_requested = true;
+            owner.unflip_outputs_to_replace = HashSet::from([output_idx]);
+        }
+        assert!(
+            owner.active(),
+            "{row}: the output-scoped marker is paired with an active owner"
+        );
+
+        let queried_crtc = output_crtcs[queried_output];
+        assert_eq!(
+            Backend::present_flip_in_flight(&backend, queried_crtc),
+            expected_in_flight,
+            "{row}: Present sees only the queried output's direct transaction"
+        );
+        assert_eq!(
+            Backend::present_display_idle(&backend, queried_crtc),
+            !expected_in_flight,
+            "{row}: idle-display classification follows the queried output owner"
+        );
+    }
 }
 
 #[test]
@@ -1921,12 +2344,14 @@ fn scanout_m1_redirected_game_and_region_present_never_reach_probe_cache() {
         Some(crate::kms::render::store::DrawableId::for_tests(99)),
         crate::kms::render::backend::ScanoutM0Target::Other,
         crate::kms::render::backend::ScanoutM0Coverage::Output(0),
+        None,
         candidate,
     );
     b.maybe_probe_scanout_m1(
         Some(crate::kms::render::store::DrawableId::for_tests(100)),
         crate::kms::render::backend::ScanoutM0Target::CowDescendant,
         crate::kms::render::backend::ScanoutM0Coverage::Root,
+        Some(crate::kms::render::backend::DirectScope::Root),
         PresentScanoutCandidate {
             valid_region_xid: 0xDEAD,
             ..candidate
@@ -1985,6 +2410,829 @@ fn scanout_m1_probe_eligible_accepts_unredirected_fullscreen() {
         0,
         0,
     ));
+}
+
+type ScanoutM1PlaneObservation = (u32, u32, u32, u32, u32);
+type ScanoutM1ProbeObservation = (
+    crate::kms::render::backend::DirectScope,
+    Vec<ScanoutM1PlaneObservation>,
+);
+
+thread_local! {
+    static SCANOUT_M1_PROBES: std::cell::RefCell<Vec<ScanoutM1ProbeObservation>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub(super) fn record_scanout_m1_probe(
+    _: &crate::kms::render::backend::KmsBackend,
+    _: crate::kms::render::store::DrawableId,
+    scope: crate::kms::render::backend::DirectScope,
+    planes: &[crate::drm::modeset::DirectScanoutPlaneState<'_>],
+) -> std::io::Result<crate::kms::render::backend::ScanoutM1ProbeEntry> {
+    let observations: Vec<_> = planes
+        .iter()
+        .map(|plane| {
+            (
+                u32::from(plane.output.crtc),
+                plane.src_x,
+                plane.src_y,
+                plane.src_w,
+                plane.src_h,
+            )
+        })
+        .collect();
+    SCANOUT_M1_PROBES.with(|probes| probes.borrow_mut().push((scope, observations)));
+    let crtcs = planes
+        .iter()
+        .map(|plane| plane.output.crtc)
+        .collect::<Vec<_>>();
+    let plane = planes.first().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "probe has no output plane",
+        )
+    })?;
+    Ok(
+        crate::kms::render::backend::ScanoutM1ProbeEntry::accepted_with_shape(
+            crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(
+                ::drm::control::from_u32(0x8f42).expect("nonzero test framebuffer"),
+            ),
+            crate::drm::async_flip::AsyncShape {
+                fourcc: 0x3432_5258,
+                modifier: 0,
+                pitch: plane.src_w * 4,
+                width: plane.src_w,
+                height: plane.src_h,
+                crtcs,
+                direct: true,
+            },
+        ),
+    )
+}
+
+fn output_admission_fixture_with_geometry(
+    output_idx: usize,
+    present_id: u64,
+    screen_size: (u16, u16),
+    outputs: &[(i32, i32, u16, u16, u32)],
+) -> Option<(
+    super::commit_identity::recording_scene::RecordingSceneFixture,
+    super::commit_identity::recording_scene::DirectPresentSetup,
+)> {
+    use yserver_core::backend::Backend;
+
+    let mut fixture =
+        match super::commit_identity::recording_scene::RecordingSceneFixture::with_output_geometry(
+            screen_size,
+            outputs,
+        ) {
+            Ok(Some(fixture)) => fixture,
+            Ok(None) => {
+                eprintln!("SKIP output admission: Vulkan scene fixture unavailable");
+                return None;
+            }
+            Err(error) => panic!("output admission fixture construction failed: {error}"),
+        };
+    let direct = fixture.install_direct_output_present(output_idx, present_id, 0);
+    let backend = &mut fixture.events.backend;
+    SCANOUT_M1_PROBES.with(|probes| probes.borrow_mut().clear());
+    backend.for_tests_set_scanout_m1_prober(record_scanout_m1_probe);
+    Backend::note_present_scanout_candidate(backend, direct.candidate);
+    Some((fixture, direct))
+}
+
+pub(super) fn output_admission_fixture(
+    output_idx: usize,
+    present_id: u64,
+) -> Option<(
+    super::commit_identity::recording_scene::RecordingSceneFixture,
+    super::commit_identity::recording_scene::DirectPresentSetup,
+)> {
+    output_admission_fixture_with_geometry(
+        output_idx,
+        present_id,
+        (3840, 1080),
+        &[(0, 0, 1920, 1080, 75), (1920, 0, 1920, 1080, 240)],
+    )
+}
+
+fn scanout_m1_probe_observations() -> Vec<ScanoutM1ProbeObservation> {
+    SCANOUT_M1_PROBES.with(|probes| probes.borrow().clone())
+}
+
+fn draw_direct_admission_overlay(backend: &mut KmsBackend, client_id: u32, x: i16) {
+    use yserver_core::backend::{Backend, DrawState, GcFunction, OriginContext, SubwindowMode};
+
+    let origin = Some(OriginContext {
+        client_id: yserver_protocol::x11::ClientId(client_id),
+        nested_seq: 0,
+        opcode: 70,
+    });
+    Backend::apply_draw_state(
+        backend,
+        origin,
+        &DrawState {
+            function: GcFunction::Invert,
+            subwindow_mode: SubwindowMode::IncludeInferiors,
+            ..DrawState::default()
+        },
+    )
+    .expect("set reversible root overlay draw state");
+    Backend::fill_rectangle(
+        backend,
+        origin,
+        backend.core.window_id,
+        u32::MAX,
+        x,
+        10,
+        50,
+        1,
+    )
+    .expect("draw root overlay through Backend");
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation rows: P15 keeps probation after rejection; P16 ignores an active owner's rejection.
+fn output_rejection_by_owner_phase() {
+    use yserver_core::backend::Backend;
+
+    let probation = usize::from(crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION);
+    for (row, present_id) in [("probation", 816), ("active_pending", 817)] {
+        let Some((mut fixture, direct)) = output_admission_fixture(1, present_id) else {
+            eprintln!(
+                "SKIP output_rejection_by_owner_phase: Vulkan scene fixture unavailable ({row})"
+            );
+            return;
+        };
+        let fd = fixture.kms_fd(1);
+        let output0_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+        let output1_crtc = fixture.events.backend.platform.outputs[1].output.crtc;
+        let start = fixture.events.recorders[&fd].records().len();
+
+        // Mutation P15: a scoped rejection must reset this owner's streak.
+        if row == "probation" {
+            for _ in 0..probation - 1 {
+                assert!(
+                    !Backend::try_present_direct(
+                        &mut fixture.events.backend,
+                        direct.candidate,
+                        direct.event.clone(),
+                    )
+                    .expect("eligible Output Present before rejection"),
+                    "{row}: probation must not admit before its final eligible attempt"
+                );
+            }
+            let mut rejected = direct.candidate;
+            rejected.valid_region_xid = 0x55;
+            assert!(
+                !Backend::try_present_direct(
+                    &mut fixture.events.backend,
+                    rejected,
+                    direct.event.clone(),
+                )
+                .expect("region-limited Output Present remains composed"),
+                "{row}: region-limited Present stays composed"
+            );
+            assert!(
+                !fixture.events.backend.pstate.direct.outputs[1].active(),
+                "{row}: rejected Present does not create an Output owner"
+            );
+
+            for attempt in 0..probation {
+                let entered = Backend::try_present_direct(
+                    &mut fixture.events.backend,
+                    direct.candidate,
+                    direct.event.clone(),
+                )
+                .expect("eligible Output Present after rejection");
+                assert_eq!(
+                    entered,
+                    attempt + 1 == probation,
+                    "{row}: rejection restarts probation at attempt {attempt}"
+                );
+            }
+            assert!(
+                fixture.events.backend.pstate.direct.outputs[1].active(),
+                "{row}: a fresh full probation run admits Output 1"
+            );
+            let records = fixture.events.recorders[&fd].records();
+            assert!(
+                records[start..].iter().any(|record| {
+                    record
+                        .flags
+                        .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_EVENT)
+                        && record.events.len() == 1
+                        && record.events[0].crtc == output1_crtc
+                }),
+                "{row}: final admission records an Output 1 direct commit"
+            );
+            assert!(
+                records[start..].iter().all(|record| {
+                    !record
+                        .flags
+                        .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_EVENT)
+                        || record.events.iter().all(|event| event.crtc != output0_crtc)
+                }),
+                "{row}: admission emits no direct commit for Output 0"
+            );
+        // Mutation P16: a rejected successor must unflip this active owner.
+        } else {
+            for attempt in 0..probation {
+                let entered = Backend::try_present_direct(
+                    &mut fixture.events.backend,
+                    direct.candidate,
+                    direct.event.clone(),
+                )
+                .expect("eligible Output Present through Backend");
+                assert_eq!(
+                    entered,
+                    attempt + 1 == probation,
+                    "{row}: initial owner enters on the final probation attempt"
+                );
+            }
+            let owner = &fixture.events.backend.pstate.direct.outputs[1];
+            assert!(
+                owner.active() && (owner.pending.is_some() || owner.current.is_some()),
+                "{row}: accepted direct Present leaves Output 1 active or pending"
+            );
+
+            let mut rejected = direct.candidate;
+            rejected.valid_region_xid = 0x56;
+            assert!(
+                !Backend::try_present_direct(
+                    &mut fixture.events.backend,
+                    rejected,
+                    direct.event.clone(),
+                )
+                .expect("region-limited Output successor stays composed"),
+                "{row}: rejected successor does not enter direct scanout"
+            );
+            let owner = &fixture.events.backend.pstate.direct.outputs[1];
+            assert!(
+                owner.unflip_requested,
+                "{row}: active owner requests unflip"
+            );
+            assert_eq!(
+                owner.unflip_fallback_source,
+                Some(direct.source_id),
+                "{row}: rejected successor becomes the composed fallback source"
+            );
+            assert!(
+                !owner.unflip_shadow_ready,
+                "{row}: rejected successor leaves its shadow pending"
+            );
+            assert!(
+                owner.current.is_some() || owner.pending.is_some(),
+                "{row}: source owner remains retained until replacement"
+            );
+            assert!(
+                fixture.events.recorders[&fd].records()[start..]
+                    .iter()
+                    .any(|record| {
+                        record
+                            .flags
+                            .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_EVENT)
+                            && record.events.iter().any(|event| event.crtc == output1_crtc)
+                    }),
+                "{row}: accepted Output 1 commit remains recorded"
+            );
+        }
+        fixture.finish();
+    }
+}
+
+#[test]
+// Mutation rows: P19 omits mode-size equality; P20 omits pairwise separation.
+fn output_geometry_admission() {
+    use crate::kms::render::backend::{ScanoutM1OutputGeometry, scanout_m1_output_is_unoverlapped};
+
+    let output = |x, width, mode_width| ScanoutM1OutputGeometry {
+        x,
+        y: 0,
+        width,
+        height: 1080,
+        mode_width,
+        mode_height: 1080,
+    };
+    let rows = [
+        (
+            "valid_separated_control",
+            [output(0, 1920, 1920), output(1920, 1920, 1920)],
+            true,
+        ),
+        // Mutation P19: omit selected output's logical-to-mode size equality.
+        (
+            "mode_size_mismatch",
+            [output(0, 1920, 1920), output(1920, 1920, 1919)],
+            false,
+        ),
+        // Mutation P20: omit pairwise output separation for Output scope.
+        (
+            "overlap",
+            [output(0, 1920, 1920), output(960, 1920, 1920)],
+            false,
+        ),
+    ];
+
+    for (row, geometries, expected) in rows {
+        let actual = scanout_m1_output_is_unoverlapped(1, &geometries);
+        assert_eq!(
+            actual, expected,
+            "{row}: selected Output geometry admission result"
+        );
+    }
+}
+
+#[test]
+// Mutation rows: P17 drops selected-CRTC ownership; P18 admits mixed-refresh Root.
+fn scoped_crtc_admission() {
+    use crate::kms::render::{
+        backend::{DirectScope, KmsBackend},
+        store::{DrawableKind, Storage},
+    };
+    use yserver_core::backend::{
+        Backend, CompletedPresentEvent, PresentScanoutCandidate, PresentWake,
+    };
+
+    fn fixture(
+        row: &str,
+        present_id: u64,
+        root: bool,
+        selected_output: usize,
+        output1_refresh: u32,
+    ) -> (
+        KmsBackend,
+        PresentScanoutCandidate,
+        CompletedPresentEvent,
+        DirectScope,
+        crate::kms::render::store::DrawableId,
+    ) {
+        let mut backend =
+            KmsBackend::for_tests_with_direct_submitter(KmsBackend::submit_direct_frame_for_tests);
+        push_test_output(&mut backend, 0x5a01);
+        backend.platform.outputs[1].x = 800;
+        backend.platform.outputs[1].output.picked.vrefresh = output1_refresh;
+        backend.platform.fb_w = 1600;
+
+        let target_xid = 0x5a10 + u32::try_from(present_id).expect("test Present id fits");
+        let source_xid = target_xid + 1;
+        let (x, width) = if root { (0, 1600) } else { (800, 800) };
+        let old_target_id = seed_window(&mut backend, target_xid, None, x, 0);
+        let geometry = backend
+            .windows
+            .get_mut(&target_xid)
+            .expect("seeded candidate window exists");
+        geometry.width = width;
+        geometry.height = 600;
+        backend.core.top_level_order.push(target_xid);
+        backend.store.detach_xid(target_xid);
+        backend.store_decref_with_invalidate(old_target_id);
+        let target_id = backend
+            .store
+            .allocate(
+                target_xid,
+                DrawableKind::Window,
+                24,
+                true,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: u32::from(width),
+                        height: 600,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("allocate null fallback storage");
+
+        let source_id = backend
+            .store
+            .allocate(
+                source_xid,
+                DrawableKind::Pixmap,
+                24,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: u32::from(width),
+                        height: 600,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("allocate null source storage");
+        assert_eq!(
+            backend
+                .store
+                .get(target_id)
+                .map(|drawable| drawable.scene_participating),
+            Some(true),
+            "{row}: fallback window remains scene participating"
+        );
+
+        let output_crtcs = [
+            u32::from(backend.platform.outputs[0].output.crtc),
+            u32::from(backend.platform.outputs[1].output.crtc),
+        ];
+        bind_test_randr_crtc(&mut backend, 0, output_crtcs[0]);
+        bind_test_randr_crtc(&mut backend, 1, output_crtcs[1]);
+        let crtc_id = output_crtcs[selected_output];
+        let crtc_epoch = backend.present_crtc_clock_epoch(crtc_id);
+        let candidate = PresentScanoutCandidate {
+            client_id: 1,
+            client_pid: None,
+            present_id,
+            crtc_id,
+            crtc_epoch,
+            src_pixmap_xid: source_xid,
+            dst_window_xid: target_xid,
+            variable_refresh: false,
+            src_host_xid: source_xid,
+            paint_dst_host_xid: target_xid,
+            completion_dst_host_xid: target_xid,
+            src_width: width,
+            src_height: 600,
+            x_off: 0,
+            y_off: 0,
+            valid_region_xid: 0,
+            update_region_xid: 0,
+            update_is_full: true,
+            explicit_sync: false,
+            options: 0,
+        };
+        let event = CompletedPresentEvent {
+            client_id: yserver_protocol::x11::ClientId(1),
+            serial: u32::try_from(present_id).expect("test serial fits"),
+            host_xid: source_xid,
+            dst_host_xid: target_xid,
+            options: 0,
+            present_id,
+            window_generation: 0,
+            crtc_id,
+            crtc_epoch,
+            msc_offset: 0,
+            completion_clock: None,
+            wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_FLIP,
+            emit_idle: false,
+        };
+        Backend::set_cursor_hidden(&mut backend, true);
+        backend.for_tests_set_scanout_m1_prober(record_scanout_m1_probe);
+        Backend::note_present_scanout_candidate(&mut backend, candidate);
+        let scope = if root {
+            DirectScope::Root
+        } else {
+            DirectScope::Output(1)
+        };
+        let output_indices = match scope {
+            DirectScope::Root => vec![0, 1],
+            DirectScope::Output(output_idx) => vec![output_idx],
+        };
+        let planes: Vec<_> = output_indices
+            .iter()
+            .map(|&output_idx| {
+                let layout = &backend.platform.outputs[output_idx];
+                let (src_x, src_y) = match scope {
+                    DirectScope::Root => (
+                        u32::try_from(layout.x)
+                            .unwrap_or_else(|_| panic!("{row}: Root output x is non-negative")),
+                        u32::try_from(layout.y)
+                            .unwrap_or_else(|_| panic!("{row}: Root output y is non-negative")),
+                    ),
+                    DirectScope::Output(_) => (0, 0),
+                };
+                crate::drm::modeset::DirectScanoutPlaneState {
+                    output: &layout.output,
+                    src_x,
+                    src_y,
+                    src_w: u32::from(layout.width),
+                    src_h: u32::from(layout.height),
+                }
+            })
+            .collect();
+        let controlled_m1 = record_scanout_m1_probe(&backend, source_id, scope, &planes)
+            .unwrap_or_else(|error| panic!("{row}: controlled M1 result: {error}"));
+        backend
+            .pstate
+            .scanout_m1
+            .entries
+            .insert((source_id, scope), controlled_m1);
+        (backend, candidate, event, scope, source_id)
+    }
+
+    let probation = usize::from(crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION);
+    let rows = [
+        // Mutation P17: output 1 must reject a candidate selected on output 0.
+        ("wrong_selected_crtc", false, 0, 60, 0x5b01, false),
+        ("valid_output_control", false, 1, 240, 0x5b02, true),
+        // Mutation P18: mixed-refresh Root remains composed on this topology.
+        ("mixed_refresh_root", true, 0, 240, 0x5b03, false),
+    ];
+    for (row, root, selected_output, output1_refresh, present_id, admitted) in rows {
+        let (mut backend, candidate, event, scope, source_id) =
+            fixture(row, present_id, root, selected_output, output1_refresh);
+        assert!(
+            backend
+                .pstate
+                .scanout_m1
+                .entries
+                .get(&(source_id, scope))
+                .and_then(crate::kms::render::backend::ScanoutM1ProbeEntry::framebuffer)
+                .is_some(),
+            "{row}: controlled M1 result accepts this candidate scope"
+        );
+        if row == "mixed_refresh_root" {
+            assert_ne!(
+                backend.platform.outputs[0].output.picked.vrefresh,
+                backend.platform.outputs[1].output.picked.vrefresh,
+                "{row}: Root row uses mixed refresh rates"
+            );
+        }
+        for attempt in 0..probation {
+            let entered = Backend::try_present_direct(&mut backend, candidate, event.clone())
+                .unwrap_or_else(|error| panic!("{row}: Present admission failed: {error}"));
+            assert_eq!(
+                entered,
+                admitted && attempt + 1 == probation,
+                "{row}: direct admission result at probation attempt {attempt}"
+            );
+        }
+
+        if admitted {
+            let owner = backend
+                .pstate
+                .direct
+                .get(scope)
+                .unwrap_or_else(|| panic!("{row}: valid Output scope exists"));
+            assert!(owner.active(), "{row}: valid Output owns the pending frame");
+            let pending = owner
+                .pending
+                .as_ref()
+                .unwrap_or_else(|| panic!("{row}: pending direct frame"));
+            assert_eq!(
+                pending.candidate.present_id, present_id,
+                "{row}: pending frame belongs to this Present"
+            );
+            assert_eq!(
+                pending.completion_output_idx, 1,
+                "{row}: completion is attributed to the selected Output"
+            );
+            assert_eq!(
+                pending.awaiting_outputs,
+                std::collections::HashSet::from([1]),
+                "{row}: Output submission waits only for its own CRTC"
+            );
+            assert!(
+                backend
+                    .pstate
+                    .scanout_m1
+                    .entries
+                    .get(&(source_id, scope))
+                    .and_then(crate::kms::render::backend::ScanoutM1ProbeEntry::framebuffer)
+                    .is_some(),
+                "{row}: controlled M1 probe accepted this source and scope"
+            );
+        } else {
+            let owner = backend
+                .pstate
+                .direct
+                .get(scope)
+                .unwrap_or_else(|| panic!("{row}: rejected candidate scope exists"));
+            assert!(!owner.active(), "{row}: rejected scope has no direct owner");
+            assert!(
+                owner.pending.is_none() && owner.current.is_none(),
+                "{row}: rejected scope retains no submitted or current frame"
+            );
+            assert!(
+                !backend.pstate.direct.root().active(),
+                "{row}: rejected candidate does not create Root ownership"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: key M1 results by DrawableId alone, so the second output reuses the first probe.
+fn output_probe_per_scope() {
+    use yserver_core::{backend::Backend, host_x11::HostSubwindowConfig};
+
+    let Some((mut fixture, mut direct)) = output_admission_fixture_with_geometry(
+        0,
+        815,
+        (3840, 1080),
+        &[(0, 0, 1920, 1080, 60), (1920, 0, 1920, 1080, 60)],
+    ) else {
+        eprintln!("SKIP output_probe_per_scope: Vulkan scene fixture unavailable");
+        return;
+    };
+    let output1_crtc = u32::from(fixture.events.backend.platform.outputs[1].output.crtc);
+    Backend::configure_subwindow(
+        &mut fixture.events.backend,
+        None,
+        direct.target_xid,
+        HostSubwindowConfig {
+            x: Some(1920),
+            ..Default::default()
+        },
+    )
+    .expect("move the same window to output 1 through Backend");
+    direct.candidate.crtc_id = output1_crtc;
+    direct.candidate.crtc_epoch = fixture
+        .events
+        .backend
+        .present_crtc_clock_epoch(output1_crtc);
+    direct.event.crtc_id = output1_crtc;
+    direct.event.crtc_epoch = direct.candidate.crtc_epoch;
+    Backend::note_present_scanout_candidate(&mut fixture.events.backend, direct.candidate);
+
+    let observations = scanout_m1_probe_observations();
+    assert_eq!(
+        observations,
+        vec![
+            (
+                crate::kms::render::backend::DirectScope::Output(0),
+                vec![(
+                    u32::from(fixture.events.backend.platform.outputs[0].output.crtc),
+                    0,
+                    0,
+                    1920,
+                    1080,
+                )],
+            ),
+            (
+                crate::kms::render::backend::DirectScope::Output(1),
+                vec![(output1_crtc, 0, 0, 1920, 1080)],
+            ),
+        ],
+        "the same source is probed once for each output's plane at source origin (0, 0)",
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m1
+            .entries
+            .contains_key(&(
+                direct.source_id,
+                crate::kms::render::backend::DirectScope::Output(0),
+            ))
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m1
+            .entries
+            .contains_key(&(
+                direct.source_id,
+                crate::kms::render::backend::DirectScope::Output(1),
+            ))
+    );
+
+    Backend::free_pixmap(
+        &mut fixture.events.backend,
+        None,
+        direct.candidate.src_host_xid,
+    )
+    .expect("retire source pixmap through Backend");
+    let root = fixture.events.backend.core.window_id;
+    let (root_width, root_height) = (
+        fixture.events.backend.platform.fb_w,
+        fixture.events.backend.platform.fb_h,
+    );
+    Backend::clear_area(
+        &mut fixture.events.backend,
+        None,
+        root,
+        0,
+        None,
+        0,
+        0,
+        root_width,
+        root_height,
+        (0, 0),
+    )
+    .expect("submit pending source writes through Backend damage");
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("flush pending source writes through the scene scheduler");
+    fixture.events.wait_for_submitted_gpu_work();
+    for _ in 0..32 {
+        Backend::before_block(&mut fixture.events.backend);
+    }
+    assert!(
+        fixture.events.backend.store.get(direct.source_id).is_none(),
+        "Backend free and render retirement drop the drawable before its probe entries are checked"
+    );
+    assert!(
+        !fixture
+            .events
+            .backend
+            .pstate
+            .scanout_m1
+            .entries
+            .keys()
+            .any(|(source_id, _)| *source_id == direct.source_id)
+    );
+    fixture
+        .extra_drawables
+        .retain(|&xid| xid != direct.candidate.src_host_xid);
+    fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: use global root-overlay emptiness instead of filtering to scope outputs.
+fn root_overlay_on_other_output_does_not_block_output_admission() {
+    use yserver_core::backend::Backend;
+
+    let Some((mut other_overlay_fixture, other_direct)) = output_admission_fixture(1, 816) else {
+        eprintln!(
+            "SKIP root_overlay_on_other_output_does_not_block_output_admission: Vulkan scene fixture unavailable"
+        );
+        return;
+    };
+    draw_direct_admission_overlay(&mut other_overlay_fixture.events.backend, 817, 10);
+    assert!(
+        !other_overlay_fixture
+            .events
+            .backend
+            .scene
+            .root_overlay
+            .is_empty()
+    );
+    assert!(
+        other_overlay_fixture
+            .events
+            .backend
+            .scene
+            .root_overlay
+            .apply_list_for_output((
+                other_overlay_fixture.events.backend.platform.outputs[1].x,
+                other_overlay_fixture.events.backend.platform.outputs[1].y,
+                1920,
+                1080,
+            ))
+            .is_empty()
+    );
+    for attempt in 0..crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION {
+        assert_eq!(
+            Backend::try_present_direct(
+                &mut other_overlay_fixture.events.backend,
+                other_direct.candidate,
+                other_direct.event.clone(),
+            )
+            .expect("unrelated root overlay does not block Output(1)"),
+            attempt + 1 == crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION,
+        );
+    }
+    assert!(other_overlay_fixture.events.backend.pstate.direct.outputs[1].active());
+    other_overlay_fixture.finish();
+
+    let Some((mut selected_overlay_fixture, selected_direct)) = output_admission_fixture(1, 818)
+    else {
+        eprintln!(
+            "SKIP root_overlay_on_other_output_does_not_block_output_admission: second Vulkan scene fixture unavailable"
+        );
+        return;
+    };
+    draw_direct_admission_overlay(&mut selected_overlay_fixture.events.backend, 819, 1930);
+    assert!(
+        !selected_overlay_fixture
+            .events
+            .backend
+            .scene
+            .root_overlay
+            .apply_list_for_output((
+                selected_overlay_fixture.events.backend.platform.outputs[1].x,
+                selected_overlay_fixture.events.backend.platform.outputs[1].y,
+                1920,
+                1080,
+            ))
+            .is_empty()
+    );
+    for _ in 0..crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION {
+        assert!(
+            !Backend::try_present_direct(
+                &mut selected_overlay_fixture.events.backend,
+                selected_direct.candidate,
+                selected_direct.event.clone(),
+            )
+            .expect("overlay on Output(1) keeps Present composed")
+        );
+    }
+    assert!(
+        !selected_overlay_fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .outputs[1]
+            .active()
+    );
+    selected_overlay_fixture.finish();
 }
 
 #[test]
@@ -2147,8 +3395,10 @@ fn direct_shape_chain_hides_root_only_when_a_shape_misses_the_root() {
         height: h,
     };
     let root_width_i16 = i16::try_from(w).unwrap();
-    let hides =
-        |b: &crate::kms::render::backend::KmsBackend| b.direct_shape_chain_hides_root(stage, root);
+    let root_rect = b.direct_scope_rect(crate::kms::render::backend::DirectScope::Root);
+    let hides = |b: &crate::kms::render::backend::KmsBackend| {
+        b.direct_shape_chain_hides_root(stage, root_rect)
+    };
 
     assert!(!hides(&b), "unshaped chain");
     b.core.shape_bounding.insert(cow, Vec::new());
@@ -2404,8 +3654,10 @@ fn direct_shape_chain_requires_every_shape_to_cover_the_root() {
         height: h,
     };
     let half = i16::try_from(w / 2).unwrap();
-    let covers =
-        |b: &crate::kms::render::backend::KmsBackend| b.direct_shape_chain_covers_root(stage, root);
+    let root_rect = b.direct_scope_rect(crate::kms::render::backend::DirectScope::Root);
+    let covers = |b: &crate::kms::render::backend::KmsBackend| {
+        b.direct_shape_chain_covers_root(stage, root_rect)
+    };
 
     assert!(covers(&b), "unshaped chain");
     b.core.shape_bounding.insert(cow, Vec::new());
@@ -2507,13 +3759,13 @@ fn scanout_m2_authoritative_root_accepts_unredirected_fullscreen() {
 fn scanout_m2_requires_stable_eligible_root_stream_before_entry() {
     let mut state = crate::kms::render::backend::ScanoutM2State::new();
     for _ in 1..crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION {
-        assert!(!state.admit_eligible_root());
+        assert!(!state.admit_eligible_direct());
     }
-    assert!(state.admit_eligible_root());
-    assert!(state.admit_eligible_root(), "admission remains saturated");
+    assert!(state.admit_eligible_direct());
+    assert!(state.admit_eligible_direct(), "admission remains saturated");
 
-    state.reset_eligible_root_probation();
-    assert!(!state.admit_eligible_root());
+    state.reset_eligible_direct_probation();
+    assert!(!state.admit_eligible_direct());
 }
 
 #[test]
@@ -2521,9 +3773,9 @@ fn scanout_m2_ineligible_root_resets_short_eligible_bursts() {
     let mut state = crate::kms::render::backend::ScanoutM2State::new();
     for _ in 0..16 {
         for _ in 0..(crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1) {
-            assert!(!state.admit_eligible_root());
+            assert!(!state.admit_eligible_direct());
         }
-        state.reset_eligible_root_probation();
+        state.reset_eligible_direct_probation();
     }
 }
 
@@ -2532,10 +3784,12 @@ fn active_direct_scanout_unflips_on_cursor_output_fallback() {
     let mut backend = crate::kms::render::backend::KmsBackend::for_tests();
     let fallback_id = seed_window(&mut backend, 0x6e00, None, 0, 0);
     install_direct_frame_for_target_test(&mut backend, 0x6e10, fallback_id, true);
+    let affected_crtc = output_crtc_key(&backend, 0);
     backend.handle_cursor_move_outcome(crate::kms::render::platform::CursorMoveOutcome {
         ebusy_count: 0,
         fallback_changed: true,
         retry_required: false,
+        affected_crtcs: std::collections::HashSet::from([affected_crtc]),
     });
     assert!(backend.pstate.direct.root().unflip_requested);
     assert!(!backend.pstate.direct.root().hold_direct);
@@ -2547,10 +3801,12 @@ fn active_direct_scanout_unflips_and_wakes_for_cursor_rollback_retry() {
     let fallback_id = seed_window(&mut backend, 0x6e20, None, 0, 0);
     install_direct_frame_for_target_test(&mut backend, 0x6e30, fallback_id, true);
     backend.scene.scene_structure_dirty = false;
+    let affected_crtc = output_crtc_key(&backend, 0);
     backend.handle_cursor_move_outcome(crate::kms::render::platform::CursorMoveOutcome {
         ebusy_count: 0,
         fallback_changed: false,
         retry_required: true,
+        affected_crtcs: std::collections::HashSet::from([affected_crtc]),
     });
     assert!(backend.scene.scene_structure_dirty);
     assert!(backend.pstate.direct.root().unflip_requested);
@@ -2827,7 +4083,7 @@ fn atomic_cursor_scanout_backend_with_hidden_cursor(hidden: bool) -> Option<KmsB
         }
     }
     backend.pstate.direct.root_mut().cursor_bound_all = true;
-    backend.pstate.direct.root_mut().eligible_root_streak =
+    backend.pstate.direct.root_mut().eligible_streak =
         crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
     Some(backend)
 }
@@ -3103,7 +4359,7 @@ fn prepare_atomic_cursor_direct_present_with_extent(
         )
         .expect("allocate fullscreen Present source");
     backend.pstate.scanout_m1.entries.insert(
-        source_id,
+        (source_id, crate::kms::render::backend::DirectScope::Root),
         crate::kms::render::backend::ScanoutM1ProbeEntry::accepted(
             crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(atomic_cursor_raw(
                 0x8100 + suffix,
@@ -3182,7 +4438,7 @@ fn hidden_cursor_allows_fullscreen_direct_scanout_without_unflip() {
     Backend::maybe_composite(&mut backend).expect("schedule hidden-cursor scene");
 
     let direct = prepare_atomic_cursor_direct_present(&mut backend, 91);
-    backend.pstate.scanout_m1.entries.remove(&direct.source_id);
+    backend.pstate.scanout_m1.remove(direct.source_id);
     Backend::note_present_scanout_candidate(&mut backend, direct.candidate);
     assert_eq!(
         backend.pstate.scanout_m0.m1_probe_reject, 1,
@@ -3193,7 +4449,10 @@ fn hidden_cursor_allows_fullscreen_direct_scanout_without_unflip() {
         "the M1 diagnostic must report Hidden as direct-compatible"
     );
     backend.pstate.scanout_m1.entries.insert(
-        direct.source_id,
+        (
+            direct.source_id,
+            crate::kms::render::backend::DirectScope::Root,
+        ),
         crate::kms::render::backend::ScanoutM1ProbeEntry::accepted(
             crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(atomic_cursor_raw(
                 0x9e01,
@@ -3677,7 +4936,7 @@ fn first_direct_entry_declines_behind_cursor_commit_without_retaining_state() {
     assert!(backend.scene.root_overlay.is_empty());
     // The root overlay correctly reset direct-scanout probation. Restore the
     // admitted fixture state so this last Present isolates cursor retirement.
-    backend.pstate.direct.root_mut().eligible_root_streak =
+    backend.pstate.direct.root_mut().eligible_streak =
         crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
     // A Copy completion is ready only once its GPU signal has executed; wait for the
     // device (bounded by the driver) instead of racing a slow software ICD.
@@ -3792,12 +5051,12 @@ fn eligible_fullscreen_present_records_cursor_positions_for_both_outputs() {
         )
         .expect("fullscreen Present source");
     backend.pstate.scanout_m1.entries.insert(
-        source_id,
+        (source_id, crate::kms::render::backend::DirectScope::Root),
         crate::kms::render::backend::ScanoutM1ProbeEntry::accepted(
             crate::drm::modeset::DirectScanoutProbeFramebuffer::for_tests(atomic_cursor_raw(71)),
         ),
     );
-    backend.pstate.direct.root_mut().eligible_root_streak =
+    backend.pstate.direct.root_mut().eligible_streak =
         crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1;
 
     let crtc_id = u32::from(backend.platform.outputs[0].output.crtc);
@@ -3976,3 +5235,6 @@ fn shape_triggered_composed_unflip_records_cursor_positions_for_both_outputs() {
             .for_tests_atomic_position_is_unsent(position.device_key, position.crtc)
     }));
 }
+
+#[path = "present_scanout_a3.rs"]
+pub(crate) mod a3;

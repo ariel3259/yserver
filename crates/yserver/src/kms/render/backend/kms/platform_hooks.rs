@@ -11,7 +11,7 @@ use yserver_core::{
 };
 
 use crate::kms::render::{
-    backend::{KmsBackend, KmsBackendState, seam::Platform},
+    backend::{DirectScope, KmsBackend, KmsBackendState, seam::Platform},
     platform::PlatformBackend,
     present_batch::{PendingPresentBatch, PresentBatchWait},
     scene::OutputLayout,
@@ -57,7 +57,7 @@ impl Platform for PlatformBackend {
     }
 
     fn direct_scanout_owns_frame(b: &KmsBackend) -> bool {
-        b.pstate.direct.root().active()
+        !b.pstate.direct.active_scopes().is_empty()
     }
 
     fn tearing_active(b: &KmsBackend) -> bool {
@@ -143,107 +143,123 @@ impl Platform for PlatformBackend {
         b.request_direct_unflip(reason);
     }
 
+    fn request_direct_unflip_for_host_drawable(
+        b: &mut KmsBackend,
+        host_xid: u32,
+        reason: &'static str,
+    ) {
+        b.request_direct_unflip_for_host_drawable(host_xid, reason);
+    }
+
+    fn on_top_level_order_changed(b: &mut KmsBackend) {
+        if !b.direct_frames_are_under_cow() {
+            b.request_direct_unflip_for(DirectScope::Root, "top_level_stack_changed");
+        }
+    }
+
+    fn on_direct_shape_changed(b: &mut KmsBackend) {
+        if b.direct_frames_shaped_off_root() {
+            b.request_direct_unflip_for(DirectScope::Root, "shape_clips_direct_frame");
+        }
+    }
+
+    fn request_tearing_cursor_handoff(b: &mut KmsBackend) {
+        b.request_tearing_cursor_handoff();
+    }
+
     fn direct_frames_are_under_cow(b: &KmsBackend) -> bool {
         b.direct_frames_are_under_cow()
-    }
-
-    fn direct_frame_references_host_drawable(b: &KmsBackend, host_xid: u32) -> bool {
-        b.direct_frame_references_host_drawable(host_xid)
-    }
-
-    fn direct_frames_shaped_off_root(b: &KmsBackend) -> bool {
-        b.direct_frames_shaped_off_root()
     }
 
     fn refresh_direct_cursor(
         b: &mut KmsBackend,
         record: &std::sync::Arc<crate::kms::render::cursor::CursorRecord>,
-    ) -> bool {
+    ) -> Vec<usize> {
         b.refresh_direct_cursor_on_all_outputs(record)
     }
 
     fn hide_cursor_under_direct_scanout(b: &mut KmsBackend) {
-        if !b.pstate.direct.root().active() {
-            return;
-        }
-        if !b.platform.any_cursor_plane_visible() {
-            for output_idx in 0..b.platform.outputs.len() {
-                b.platform.clear_direct_cursor_retry(output_idx);
-            }
-            b.pstate
-                .direct
-                .root_mut()
-                .clear_all_direct_cursor_refresh_pending();
-            if !b.sync_direct_cursor_scene_state() {
-                b.request_direct_unflip("cursor_scene_sync_failed");
-            }
-            return;
-        }
-        let mut failed = false;
-        for output_idx in 0..b.platform.outputs.len() {
-            if !b.platform.cursor_plane_visible_for_output(output_idx) {
-                b.platform.clear_direct_cursor_retry(output_idx);
-                b.pstate
-                    .direct
-                    .root_mut()
-                    .clear_direct_cursor_refresh_pending(output_idx);
+        for scope in b.pstate.direct.active_scopes() {
+            let output_indices = b.direct_scope_outputs(scope);
+            if !output_indices
+                .iter()
+                .any(|&idx| b.platform.cursor_plane_visible_for_output(idx))
+            {
+                for &output_idx in &output_indices {
+                    b.platform.clear_direct_cursor_retry(output_idx);
+                }
+                if let Some(owner) = b.pstate.direct.get_mut(scope) {
+                    owner.clear_all_direct_cursor_refresh_pending();
+                }
+                if !b.sync_direct_cursor_scene_state(&output_indices) {
+                    b.request_direct_unflip_for(scope, "cursor_scene_sync_failed");
+                }
                 continue;
             }
-            let atomic_path = b
-                .platform
-                .device_for_output(&b.platform.outputs[output_idx].key)
-                .is_some_and(|device| {
-                    device.cursor.state_path()
-                        == crate::kms::cursor_plane::topology::CursorStatePath::Atomic
-                });
-            match b.platform.cursor_plane_hide_on_crtc(output_idx) {
-                Ok(()) => {
+            let mut failed = false;
+            for &output_idx in &output_indices {
+                if !b.platform.cursor_plane_visible_for_output(output_idx) {
                     b.platform.clear_direct_cursor_retry(output_idx);
-                    b.pstate
-                        .direct
-                        .root_mut()
-                        .clear_direct_cursor_refresh_pending(output_idx);
+                    if let Some(owner) = b.pstate.direct.get_mut(scope) {
+                        owner.clear_direct_cursor_refresh_pending(output_idx);
+                    }
+                    continue;
                 }
-                Err(error)
-                    if error.kind() == io::ErrorKind::WouldBlock
-                        || error.raw_os_error() == Some(libc::EBUSY) =>
-                {
-                    b.platform.clear_direct_cursor_retry(output_idx);
-                    b.pstate
-                        .direct
-                        .root_mut()
-                        .mark_direct_cursor_refresh_pending(output_idx);
-                    log::debug!(
-                        "scanout_m2: direct cursor hide deferred on output {output_idx}; retrying on CRTC event"
-                    );
-                }
-                Err(error)
-                    if atomic_path
-                        && error.raw_os_error() != Some(libc::EINVAL)
-                        && error.raw_os_error() != Some(libc::EBUSY) =>
-                {
-                    if !b.schedule_direct_cursor_retry(
-                        output_idx,
-                        "hide",
-                        &error,
-                        "cursor_hide_failed",
-                    ) {
+                let atomic_path = b
+                    .platform
+                    .device_for_output(&b.platform.outputs[output_idx].key)
+                    .is_some_and(|device| {
+                        device.cursor.state_path()
+                            == crate::kms::cursor_plane::topology::CursorStatePath::Atomic
+                    });
+                match b.platform.cursor_plane_hide_on_crtc(output_idx) {
+                    Ok(()) => {
+                        b.platform.clear_direct_cursor_retry(output_idx);
+                        if let Some(owner) = b.pstate.direct.get_mut(scope) {
+                            owner.clear_direct_cursor_refresh_pending(output_idx);
+                        }
+                    }
+                    Err(error)
+                        if error.kind() == io::ErrorKind::WouldBlock
+                            || error.raw_os_error() == Some(libc::EBUSY) =>
+                    {
+                        b.platform.clear_direct_cursor_retry(output_idx);
+                        if let Some(owner) = b.pstate.direct.get_mut(scope) {
+                            owner.mark_direct_cursor_refresh_pending(output_idx);
+                        }
+                        log::debug!(
+                            "scanout_m2: direct cursor hide deferred on output {output_idx}; retrying on CRTC event"
+                        );
+                    }
+                    Err(error)
+                        if atomic_path
+                            && error.raw_os_error() != Some(libc::EINVAL)
+                            && error.raw_os_error() != Some(libc::EBUSY) =>
+                    {
+                        if !b.schedule_direct_cursor_retry(
+                            scope,
+                            output_idx,
+                            "hide",
+                            &error,
+                            "cursor_hide_failed",
+                        ) {
+                            failed = true;
+                        }
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "scanout_m2: direct cursor hide failed on output {output_idx}: {error}; unflipping"
+                        );
                         failed = true;
                     }
                 }
-                Err(error) => {
-                    log::warn!(
-                        "scanout_m2: cursor hide failed on output {output_idx}: {error}; unflipping"
-                    );
-                    failed = true;
-                }
             }
-        }
-        if failed {
-            b.request_direct_unflip("cursor_hide_failed");
-        }
-        if !b.sync_direct_cursor_scene_state() {
-            b.request_direct_unflip("cursor_scene_sync_failed");
+            if failed {
+                b.request_direct_unflip_for(scope, "cursor_hide_failed");
+            }
+            if !b.sync_direct_cursor_scene_state(&output_indices) {
+                b.request_direct_unflip_for(scope, "cursor_scene_sync_failed");
+            }
         }
     }
 
@@ -280,23 +296,30 @@ impl Platform for PlatformBackend {
         (hot_x, hot_y): (u16, u16),
         (cw, ch): (i32, i32),
     ) {
-        if mixed {
-            // Hardware and software cursor ownership may coexist on
-            // arbitrary cards. Record/dispatch every visible HW plane
-            // position and also repaint the SW outputs.
-            match b.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
-                Ok(outcome) => {
-                    b.handle_cursor_move_outcome(outcome);
-                }
-                Err(e) => log::debug!("render cursor mixed path: move failed: {e}"),
-            }
-            b.scene.wake_for_damage();
-        } else if !b.pstate.direct.root().active()
-            && cw > 0
-            && ch > 0
-            && b.platform
-                .cursor_crtc_membership_dirty(cx, cy, hot_x, hot_y, cw, ch)
+        if b.pstate.tearing.is_on()
+            && !b
+                .pstate
+                .direct
+                .active_scopes()
+                .iter()
+                .any(|scope| matches!(scope, DirectScope::Output(_)))
         {
+            return;
+        }
+        let membership_changed = if mixed || cw == 0 || ch == 0 {
+            false
+        } else {
+            let direct_outputs: Vec<_> = b
+                .pstate
+                .direct
+                .active_scopes()
+                .into_iter()
+                .flat_map(|scope| b.direct_scope_outputs(scope))
+                .collect();
+            b.platform
+                .cursor_crtc_membership_dirty(cx, cy, hot_x, hot_y, cw, ch, &direct_outputs)
+        };
+        if membership_changed {
             // The cursor footprint crossed onto/off a CRTC the
             // plane isn't bound to. The move-only fast path
             // can't rebind across CRTCs, so route this motion
@@ -307,14 +330,22 @@ impl Platform for PlatformBackend {
             // so the seam crossing must be detected here or the
             // cursor stays frozen on the CRTC it was last bound
             // to (invisible on the screen it moved onto).
-            b.scene.wake_for_damage();
-        } else {
-            match b.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
-                Ok(outcome) => {
-                    b.handle_cursor_move_outcome(outcome);
-                }
-                Err(e) => log::debug!("render cursor fast path: move failed: {e}"),
+        }
+        // Hardware and software cursor ownership may coexist on arbitrary
+        // cards. Always dispatch visible HW positions once, then repaint SW
+        // outputs for a mixed cursor or membership transition.
+        match b.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
+            Ok(outcome) => b.handle_cursor_move_outcome(outcome),
+            Err(error) if mixed => {
+                log::debug!("render cursor mixed path: move failed: {error}")
             }
+            Err(error) if membership_changed => {
+                log::debug!("render cursor membership move: {error}")
+            }
+            Err(error) => log::debug!("render cursor fast path: move failed: {error}"),
+        }
+        if mixed || membership_changed {
+            b.scene.wake_for_damage();
         }
     }
 
@@ -323,20 +354,20 @@ impl Platform for PlatformBackend {
     }
 
     fn prepare_cow_release(b: &mut KmsBackend) -> io::Result<()> {
-        if b.pstate.direct.root().active() {
+        for scope in b.pstate.direct.active_scopes() {
             // Do this while cow_id and its storage owner are authoritative.
             // Failure leaves the COW and the direct pins untouched, so core
             // can keep the caller's claim and let the compositor retry, or
             // fail safely without freeing a scanned buffer. Success only
             // copies the scanned frame into its fallback target early, as
             // any unflip does (`submit_composed_unflip`); nothing to undo.
-            b.materialize_direct_shadow_for_unflip()?;
+            b.materialize_direct_shadow_for_unflip(scope)?;
         }
         Ok(())
     }
 
     fn defer_cow_release(b: &mut KmsBackend) -> bool {
-        if b.pstate.direct.root().active() {
+        if !b.pstate.direct.active_scopes().is_empty() {
             b.request_direct_unflip("release_last_overlay_window");
             b.deferred_cow_release = true;
             return true;
@@ -796,7 +827,11 @@ impl Platform for PlatformBackend {
     fn drain_retired_present_idle_events(
         b: &mut KmsBackend,
     ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
-        std::mem::take(&mut b.pstate.direct.root_mut().idled)
+        let mut idled = std::mem::take(&mut b.pstate.direct.root_mut().idled);
+        for owner in &mut b.pstate.direct.outputs {
+            idled.append(&mut owner.idled);
+        }
+        idled
     }
 
     fn present_crtc_clock_epoch(b: &KmsBackend, crtc_id: u32) -> u64 {

@@ -423,6 +423,179 @@ fn root_get_image_reads_scanout_pixels_not_root_storage() {
     );
 }
 
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: rebase by x_off/y_off only.
+fn get_image_of_output_owner_at_nonzero_origin_reads_client_pixels() {
+    use std::time::Duration;
+    use yserver_core::backend::Backend;
+
+    let mut fixture =
+        match super::commit_identity::recording_scene::RecordingSceneFixture::with_output_geometry(
+            (3840, 1080),
+            &[(0, 0, 1920, 1080, 75), (1920, 0, 1920, 1080, 240)],
+        ) {
+            Ok(Some(fixture)) => fixture,
+            Ok(None) => {
+                eprintln!(
+                    "SKIP get_image_of_output_owner_at_nonzero_origin_reads_client_pixels: Vulkan fixture unavailable"
+                );
+                return;
+            }
+            Err(error) => panic!("readback fixture construction failed: {error}"),
+        };
+    let direct = fixture.install_direct_output_present(1, 881, 0);
+    let backend = &mut fixture.events.backend;
+    backend.for_tests_set_scanout_m1_prober(super::present_scanout::record_scanout_m1_probe);
+    Backend::note_present_scanout_candidate(backend, direct.candidate);
+
+    const COMPOSED_COLOR: u32 = 0x0012_3456;
+    const DIRECT_COLOR: u32 = 0x00ab_cdef;
+    let root_xid = backend.core.window_id;
+    Backend::fill_rectangle(backend, None, root_xid, COMPOSED_COLOR, 0, 0, 1920, 1080)
+        .expect("fill output 0's composed root background");
+    Backend::fill_rectangle(
+        backend,
+        None,
+        direct.candidate.src_host_xid,
+        DIRECT_COLOR,
+        0,
+        0,
+        1920,
+        1080,
+    )
+    .expect("fill output-sized direct Present source");
+    let device_fd = fixture.kms_fd(1);
+    let start = fixture.events.recorders[&device_fd].records().len();
+    for attempt in 0..crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION {
+        let entered = Backend::try_present_direct(
+            &mut fixture.events.backend,
+            direct.candidate,
+            direct.event.clone(),
+        )
+        .expect("output-sized Present through Backend");
+        assert_eq!(
+            entered,
+            attempt + 1 == crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION,
+            "Output(1) enters after its own probation",
+        );
+    }
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("compose output 0 while output 1 is direct");
+
+    let backend = &fixture.events.backend;
+    let output1_crtc = backend.platform.outputs[1].output.crtc;
+    let output0_crtc = backend.platform.outputs[0].output.crtc;
+    let direct_frame = backend.pstate.direct.outputs[1]
+        .pending
+        .as_ref()
+        .expect("Present submitted Output(1)'s direct frame");
+    let commit_id = direct_frame
+        .accepted_event_id
+        .expect("direct Present commit identity");
+    let records = fixture.events.recorders[&device_fd].records();
+    let direct_record = records
+        .iter()
+        .find(|record| {
+            super::commit_identity::support::accepted_event_id(record) == Some(commit_id)
+        })
+        .expect("recorded direct output commit");
+    assert_eq!(direct_record.events.len(), 1);
+    assert_eq!(direct_record.events[0].crtc, output1_crtc);
+    let composed_record = records[start..]
+        .iter()
+        .find(|record| {
+            record.kind == crate::drm::atomic::AtomicCommitKind::Scene
+                && record.events.iter().any(|event| event.crtc == output0_crtc)
+        })
+        .expect("recorded composed output 0 commit");
+    let composed_commit_id = super::commit_identity::support::accepted_event_id(composed_record)
+        .expect("composed output 0 commit identity");
+
+    fixture.events.queue_commit_completion(
+        device_fd,
+        output1_crtc,
+        commit_id,
+        240,
+        Duration::from_millis(2_400),
+    );
+    fixture.events.queue_commit_completion(
+        device_fd,
+        output0_crtc,
+        composed_commit_id,
+        75,
+        Duration::from_micros(13_333),
+    );
+    Backend::on_page_flip_ready(
+        &mut fixture.events.backend,
+        &mut fixture.events.state,
+        device_fd,
+    );
+    let completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].present_id, direct.candidate.present_id);
+    assert!(
+        fixture
+            .events
+            .backend
+            .direct_scanout_frame_for_output(1)
+            .is_some(),
+        "the retired Present owns output 1's direct frame"
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .direct_scanout_frame_for_output(0)
+            .is_none(),
+        "output 0 remains composed"
+    );
+
+    let inside_output1 = fixture
+        .events
+        .backend
+        .get_image_pixels_for_tests(root_xid, 2, 1931, 13, 5, 4, !0)
+        .expect("GetImage inside output 1")
+        .expect("output 1 GetImage bytes");
+    assert!(
+        inside_output1
+            .chunks_exact(4)
+            .all(|pixel| pixel[..3] == [0xef, 0xcd, 0xab]),
+        "GetImage of the direct output returns client pixels"
+    );
+
+    let spanning = fixture
+        .events
+        .backend
+        .get_image_pixels_for_tests(root_xid, 2, 1918, 13, 8, 4, !0)
+        .expect("GetImage spanning both outputs")
+        .expect("spanning GetImage bytes");
+    for row in 0..4 {
+        let pixels = &spanning[row * 8 * 4..(row + 1) * 8 * 4];
+        assert!(
+            pixels[..2 * 4]
+                .chunks_exact(4)
+                .all(|pixel| pixel[..3] == [0x56, 0x34, 0x12]),
+            "output 0's composed pixels occupy the first two columns"
+        );
+        assert!(
+            pixels[2 * 4..]
+                .chunks_exact(4)
+                .all(|pixel| pixel[..3] == [0xef, 0xcd, 0xab]),
+            "output 1's direct client pixels occupy the remaining columns"
+        );
+    }
+    assert!(
+        fixture.events.recorders[&device_fd].records()[start..]
+            .iter()
+            .any(|record| {
+                super::commit_identity::support::accepted_event_id(record) == Some(commit_id)
+            }),
+        "the recorded output 1 commit remains the source of the readback"
+    );
+    fixture.finish();
+}
+
 /// Protocol-visible half of the direct-scanout stale-read bug: a
 /// root-source read (here root `GetImage`, which shares
 /// `read_root_scanout_assembled` with root-source `CopyArea` and the root
@@ -1430,7 +1603,6 @@ fn a_hotplug_that_shrank_the_extent_leaves_root_storage_alone() {
 
     // B's route is retired, so the extent shrinks.
     b.platform.outputs.pop();
-    b.pstate.direct.sync_output_count(b.platform.outputs.len());
     b.platform.scanout_pools.pop();
     b.platform.bo_generations.pop();
     b.platform.first_pageflip_logged.pop();
