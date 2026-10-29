@@ -31,6 +31,52 @@ fn recording_sink(
     recorder
 }
 
+fn retire_recorded_output_commits(
+    fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixture,
+    output_idx: usize,
+    record_start: usize,
+    frame_start: u32,
+) {
+    use yserver_core::backend::Backend;
+
+    let device_fd = fixture.kms_fd(output_idx);
+    let crtc = fixture.events.backend.platform.outputs[output_idx]
+        .output
+        .crtc;
+    let mut delivered = std::collections::HashSet::new();
+    for offset in 0..16_u32 {
+        let pending = fixture.events.recorders[&device_fd]
+            .records()
+            .into_iter()
+            .skip(record_start)
+            .filter_map(|record| {
+                let id = super::commit_identity::support::accepted_event_id(&record)?;
+                (record.device_fd == device_fd
+                    && record.events.iter().any(|event| event.crtc == crtc)
+                    && !delivered.contains(&id))
+                .then_some(id)
+            })
+            .next();
+        let Some(id) = pending else {
+            return;
+        };
+        fixture.events.queue_commit_completion(
+            device_fd,
+            crtc,
+            id,
+            frame_start.saturating_add(offset),
+            std::time::Duration::from_micros(u64::from(frame_start + offset)),
+        );
+        Backend::on_page_flip_ready(
+            &mut fixture.events.backend,
+            &mut fixture.events.state,
+            device_fd,
+        );
+        delivered.insert(id);
+    }
+    panic!("Output({output_idx}) accepted too many commits to retire in the fixture");
+}
+
 fn enter_output_owner_through_backend(
     fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixture,
     direct: &super::commit_identity::recording_scene::DirectPresentSetup,
@@ -74,13 +120,7 @@ fn enter_output_owner_through_backend(
         .expect("Output Present produced one accepted direct commit");
     let tearing_outputs = fixture.events.backend.tearing_scope_outputs();
     if tearing_outputs.contains(&output_idx) && direct_record.kind != AtomicCommitKind::Async {
-        let mut delivered = std::collections::HashSet::new();
-        super::cursor_sprites::support::retire_pending_output(
-            &mut fixture.events,
-            &mut delivered,
-            output_idx,
-            30,
-        );
+        retire_recorded_output_commits(fixture, output_idx, before, 30);
         let mut async_candidate = direct.candidate;
         async_candidate.present_id += 10_000;
         let mut async_event = direct.event.clone();
@@ -103,12 +143,7 @@ fn enter_output_owner_through_backend(
             })
             .expect("tearing owner follow-up Present is recorded");
         assert_eq!(async_record.kind, AtomicCommitKind::Async);
-        super::cursor_sprites::support::retire_pending_output(
-            &mut fixture.events,
-            &mut delivered,
-            output_idx,
-            31,
-        );
+        retire_recorded_output_commits(fixture, output_idx, async_before, 31);
         return async_record;
     }
     direct_record
@@ -1123,7 +1158,7 @@ fn tearing_composite_diagnostics(backend: &KmsBackend, recorder_count: Option<us
         backend
             .pstate
             .tearing
-            .cursor_compose_interval(&backend.platform),
+            .cursor_compose_interval(&backend.platform, &backend.tearing_scope_outputs()),
     )
 }
 
@@ -1247,7 +1282,7 @@ fn seed_pending_tearing_cursor_wake(backend: &mut KmsBackend) {
     let interval = backend
         .pstate
         .tearing
-        .cursor_compose_interval(&backend.platform);
+        .cursor_compose_interval(&backend.platform, &backend.tearing_scope_outputs());
     let now = std::time::Instant::now();
     backend.pstate.tearing.last_cursor_compose = Some(now);
     backend.pstate.tearing.deferred_cursor_wake = Some(now + interval);
@@ -4925,7 +4960,7 @@ fn task5_cursor_only_motion_recomposes_at_most_once_per_refresh() {
             refresh_probe
                 .pstate
                 .tearing
-                .cursor_compose_interval(&refresh_probe.platform),
+                .cursor_compose_interval(&refresh_probe.platform, &[0, 1],),
             std::time::Duration::from_nanos(1_000_000_000 / 75),
             "a multi-output tearing window uses its shortest refresh interval"
         );
@@ -4937,7 +4972,7 @@ fn task5_cursor_only_motion_recomposes_at_most_once_per_refresh() {
     let interval = backend
         .pstate
         .tearing
-        .cursor_compose_interval(&backend.platform);
+        .cursor_compose_interval(&backend.platform, &backend.tearing_scope_outputs());
 
     Backend::warp_pointer_root(&mut backend, &mut state, 100, 100);
     Backend::maybe_composite(&mut backend).expect("compose first cursor motion");
@@ -5092,7 +5127,7 @@ fn task5_client_frame_is_never_deferred_by_cursor_cap() {
     let interval = backend
         .pstate
         .tearing
-        .cursor_compose_interval(&backend.platform);
+        .cursor_compose_interval(&backend.platform, &backend.tearing_scope_outputs());
     let last_compose = std::time::Instant::now() + std::time::Duration::from_secs(30);
     backend.pstate.tearing.last_cursor_compose = Some(last_compose);
     Backend::warp_pointer_root(&mut backend, &mut state, 101, 100);
@@ -5491,3 +5526,4 @@ fn paused_tearing_owner_keeps_tearing() {
 
 mod round2;
 mod round3;
+mod task2;

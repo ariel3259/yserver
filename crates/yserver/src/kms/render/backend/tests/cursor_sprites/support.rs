@@ -702,7 +702,7 @@ pub(crate) fn enter_held_direct(
                     backend.scene.scene_structure_dirty,
                     backend.scene.output_ready_for_submit(0, &backend.platform),
                     backend.scene.has_pending_page_flip(0),
-                    backend.scene.cursor_transition_pending(),
+                    backend.scene.cursor_transition_pending(&[0]),
                     backend.platform.cursor_commit_in_flight_for_output(0),
                     backend.pstate.direct.root().active(),
                 )

@@ -960,10 +960,11 @@ impl Tearing {
     pub(in crate::kms::render::backend) fn cursor_compose_interval(
         &self,
         platform: &PlatformBackend,
+        output_indices: &[usize],
     ) -> std::time::Duration {
-        let refresh_hz = platform
-            .outputs
+        let refresh_hz = output_indices
             .iter()
+            .filter_map(|&output_idx| platform.outputs.get(output_idx))
             .map(|output| output.output.picked.vrefresh)
             .filter(|refresh_hz| *refresh_hz > 0)
             .max()

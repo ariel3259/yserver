@@ -109,15 +109,18 @@ impl SceneCompositor {
     /// compose. A direct owner can keep another output's damage pending while
     /// the scheduler continues to visit this output.
     pub fn output_wants_compose(&self, output_idx: usize, store: &DrawableStore) -> bool {
+        self.scene_structure_dirty || self.output_has_pending_compose(output_idx, store)
+    }
+
+    /// Whether one output has retained, failed-submit, or presentation damage
+    /// independent of the scene-wide structure-dirty wake.
+    pub fn output_has_pending_compose(&self, output_idx: usize, store: &DrawableStore) -> bool {
         let Some(inner) = self.inner.as_ref() else {
             return true;
         };
         let Some(output) = inner.outputs.get(output_idx) else {
             return false;
         };
-        if self.scene_structure_dirty {
-            return true;
-        }
         let armed = store.armed_damaged_ids();
         let all: Vec<&std::collections::HashSet<crate::kms::render::store::DrawableId>> = inner
             .outputs

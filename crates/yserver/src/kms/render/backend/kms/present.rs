@@ -377,7 +377,7 @@ impl KmsBackend {
             .note_qualifying_present(candidate.dst_window_xid);
         if probation >= TEARING_ENTRY_PROBATION
             && !was_on
-            && !self.scene.cursor_transition_pending()
+            && !self.scene.cursor_transition_pending(&candidate_outputs)
         {
             self.pstate.tearing.state = TearingState::On {
                 window: candidate.dst_window_xid,
@@ -1155,6 +1155,15 @@ impl KmsBackend {
             target,
             tearing_gate_ignoring_cursor,
         );
+        let tearing_outputs = self.tearing_scope_outputs();
+        let candidate_overlaps_tearing = candidate_scope.is_some_and(|scope| {
+            self.direct_scope_outputs(scope)
+                .iter()
+                .any(|output_idx| tearing_outputs.contains(output_idx))
+        });
+        let tearing_cursor_exception = self.pstate.tearing.is_on()
+            && candidate_overlaps_tearing
+            && tearing_gate_ignoring_cursor;
         self.platform.set_tearing_on(self.pstate.tearing.is_on());
         self.register_tearing_copy_fallback(candidate, candidate_scope, source_id);
         if candidate_scope.is_some_and(|scope| {
@@ -1179,8 +1188,7 @@ impl KmsBackend {
             // Present turns playback into direct/composed thrash. Only an
             // ineligible authoritative successor within the candidate's scope
             // invalidates that owner and must expose its Copy fallback.
-            if authoritative_root && !(self.pstate.tearing.is_on() && tearing_gate_ignoring_cursor)
-            {
+            if authoritative_root && !tearing_cursor_exception {
                 self.pstate
                     .direct
                     .root_mut()
@@ -1229,7 +1237,8 @@ impl KmsBackend {
                     }
                 }
             } else if let Some(scope @ DirectScope::Output(_)) = candidate_scope {
-                if let Some(owner) = self.pstate.direct.get_mut(scope) {
+                if !tearing_cursor_exception && let Some(owner) = self.pstate.direct.get_mut(scope)
+                {
                     owner.reset_eligible_direct_probation();
                 }
                 self.request_direct_unflip_for(scope, "ineligible_authoritative_output_present");

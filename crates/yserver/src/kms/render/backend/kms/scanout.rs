@@ -475,7 +475,12 @@ impl KmsBackend {
     }
 
     fn scene_output_ready_for_scheduled_compose(&self, output_idx: usize) -> bool {
-        !self.output_is_direct(output_idx) || self.output_has_degraded_unflip(output_idx)
+        let paced_by_tearing = self
+            .tearing_cursor_compose_deadline(self.monotonic_now())
+            .is_some()
+            && self.tearing_scope_outputs().contains(&output_idx);
+        !paced_by_tearing
+            && (!self.output_is_direct(output_idx) || self.output_has_degraded_unflip(output_idx))
     }
 
     fn scene_output_wants_scheduled_compose(&self, output_idx: usize) -> bool {
@@ -506,18 +511,21 @@ impl KmsBackend {
     }
 
     fn scene_cursor_eligible_outputs(&self) -> Vec<bool> {
+        let pacing_deadline = self.tearing_cursor_compose_deadline(self.monotonic_now());
+        let tearing_outputs = self.tearing_scope_outputs();
         (0..self.platform.outputs.len())
             .map(|output_idx| {
-                !self
-                    .pstate
-                    .direct
-                    .scope_for_output(output_idx)
-                    .and_then(|scope| self.pstate.direct.get(scope))
-                    .is_some_and(|owner| {
-                        owner.pending.is_some()
-                            || owner.queued_successor.is_some()
-                            || owner.unflip_requested
-                    })
+                pacing_deadline.is_none_or(|_| !tearing_outputs.contains(&output_idx))
+                    && !self
+                        .pstate
+                        .direct
+                        .scope_for_output(output_idx)
+                        .and_then(|scope| self.pstate.direct.get(scope))
+                        .is_some_and(|owner| {
+                            owner.pending.is_some()
+                                || owner.queued_successor.is_some()
+                                || owner.unflip_requested
+                        })
             })
             .collect()
     }
@@ -2310,6 +2318,10 @@ impl KmsBackend {
         use crate::kms::render::scene::{OutputRoute, OutputSink};
 
         let outputs = self.direct_scope_outputs(scope);
+        let tearing_outputs = self.tearing_scope_outputs();
+        let tearing_intersects_scope = outputs
+            .iter()
+            .any(|output_idx| tearing_outputs.contains(output_idx));
         let scope_is_on_primary = match scope {
             DirectScope::Root => self.direct_scanout_topology_eligible(DirectScope::Root),
             DirectScope::Output(output_idx) => {
@@ -2329,7 +2341,7 @@ impl KmsBackend {
         !outputs.is_empty()
             // This handoff needs a fresh scene frame so the newest Present
             // Copy replaces the retained direct frame in the same commit.
-            && (!self.pstate.tearing.is_on() || tearing_cursor_handoff)
+            && (!tearing_intersects_scope || tearing_cursor_handoff)
             && scope_is_on_primary
             && !self.platform.scanout_commit_in_flight_for_outputs(&outputs)
             && outputs.iter().all(|&output_idx| {
@@ -3714,16 +3726,18 @@ impl KmsBackend {
         if !self.pstate.tearing.is_on() || self.effective_cursor_hidden() {
             return false;
         }
+        let Some(scope) = self.tearing_scope() else {
+            return false;
+        };
+        let outputs = self.direct_scope_outputs(scope);
+        let owner = self.pstate.direct.get(scope);
         matches!(
-            self.scene.cursor_mode(),
+            self.scene.cursor_mode_for_outputs(&outputs),
             crate::kms::render::scene::CursorPlaneMode::Sw
-        ) || (self.pstate.direct.root().unflip_reason == Some("tearing_cursor_handoff")
-            && !self
-                .pstate
-                .direct
-                .root()
-                .unflip_outputs_to_replace
-                .is_empty())
+        ) || owner.is_some_and(|owner| {
+            owner.unflip_reason == Some("tearing_cursor_handoff")
+                && !owner.unflip_outputs_to_replace.is_empty()
+        })
     }
 
     /// Earliest time a cursor-only software-scene wake may be composed while
@@ -3732,33 +3746,36 @@ impl KmsBackend {
         &self,
         now: std::time::Instant,
     ) -> Option<std::time::Instant> {
+        let outputs = self.tearing_scope_outputs();
         if !self.tearing_cursor_compose_cap_applies()
             || !self.scene.cursor_only_wake_pending()
-            || self.store.has_pending_presentation_damage()
-            || self.scene.owes_repaint()
+            || outputs.iter().any(|&output_idx| {
+                self.scene
+                    .output_has_pending_compose(output_idx, &self.store)
+            })
         {
             return None;
         }
 
         let last_compose = self.pstate.tearing.last_cursor_compose?;
-        let deadline = last_compose + self.pstate.tearing.cursor_compose_interval(&self.platform);
+        let deadline = last_compose
+            + self
+                .pstate
+                .tearing
+                .cursor_compose_interval(&self.platform, &outputs);
         (now < deadline).then_some(deadline)
     }
 
     pub(super) fn scene_wants_compose(&self) -> bool {
-        let cursor_compose_blocked = self
-            .tearing_cursor_compose_deadline(self.monotonic_now())
-            .is_some();
         let now = self.monotonic_now();
         let live_direct_vrr_wanted = self.live_direct_vrr_wanted_by_output();
         let cursor_eligible_outputs = self.scene_cursor_eligible_outputs();
-        (self.scene_has_ready_scheduled_output() && !cursor_compose_blocked)
-            || (!cursor_compose_blocked
-                && self.platform.has_eligible_atomic_cursor_move_for_outputs(
-                    now,
-                    &live_direct_vrr_wanted,
-                    &cursor_eligible_outputs,
-                ))
+        self.scene_has_ready_scheduled_output()
+            || self.platform.has_eligible_atomic_cursor_move_for_outputs(
+                now,
+                &live_direct_vrr_wanted,
+                &cursor_eligible_outputs,
+            )
     }
 
     #[cfg(test)]
@@ -4339,9 +4356,16 @@ impl KmsBackend {
                     };
                     match submitted {
                         Ok(true) => {
-                            self.pstate
-                                .tearing
-                                .note_composed_submit(self.monotonic_now());
+                            let tearing_outputs = self.tearing_scope_outputs();
+                            let unflip_outputs = self.direct_scope_outputs(scope);
+                            if unflip_outputs
+                                .iter()
+                                .any(|output_idx| tearing_outputs.contains(output_idx))
+                            {
+                                self.pstate
+                                    .tearing
+                                    .note_composed_submit(self.monotonic_now());
+                            }
                         }
                         Ok(false) => {}
                         Err(error) => {
@@ -4385,14 +4409,7 @@ impl KmsBackend {
             return Ok(());
         }
         let vrr_before = self.vrr_committed_snapshot();
-        let composed_outputs = if self
-            .tearing_cursor_compose_deadline(self.monotonic_now())
-            .is_some()
-        {
-            None
-        } else {
-            self.compose_tick(&skip_outputs)
-        };
+        let composed_outputs = self.compose_tick(&skip_outputs);
         self.log_vrr_committed_changes(&vrr_before, None, "inherited");
         // `scene.tick` drains already-signalled copied completions itself,
         // without entering backend_scanout_on_scanout_render_completion.
@@ -4415,10 +4432,12 @@ impl KmsBackend {
                 }
             }
         }
-        if composed_outputs
-            .as_ref()
-            .is_some_and(|outputs| !outputs.is_empty())
-        {
+        let tearing_outputs = self.tearing_scope_outputs();
+        if composed_outputs.as_ref().is_some_and(|outputs| {
+            outputs
+                .iter()
+                .any(|output_idx| tearing_outputs.contains(output_idx))
+        }) {
             self.pstate
                 .tearing
                 .note_composed_submit(self.monotonic_now());

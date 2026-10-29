@@ -195,7 +195,7 @@ fn transparent_cursor_is_hidden_for_direct_scanout_and_define_cursor_handoff() {
     );
     assert!(backend.pstate.tearing.deferred_cursor_wake.is_none());
     assert!(!backend.scene.has_pending_page_flips());
-    assert!(!backend.scene.cursor_transition_pending());
+    assert!(!backend.scene.cursor_transition_pending(&[0]));
     assert_eq!(
         backend.scene.cursor_mode(),
         crate::kms::render::scene::CursorPlaneMode::Hidden
@@ -233,7 +233,7 @@ fn transparent_cursor_is_hidden_for_direct_scanout_and_define_cursor_handoff() {
     );
     assert!(!backend.platform.any_cursor_plane_visible());
     assert!(!backend.scene.has_pending_page_flips());
-    assert!(!backend.scene.cursor_transition_pending());
+    assert!(!backend.scene.cursor_transition_pending(&[0]));
     assert_commit_sequence(
         &recorder,
         &[
@@ -357,7 +357,7 @@ fn entry_waits_for_queued_show_on_retire() {
             .events
             .backend
             .scene
-            .cursor_transition_pending()
+            .cursor_transition_pending(&[0])
     );
     assert_eq!(
         recorder.records()[before_show].kind,
@@ -398,7 +398,7 @@ fn entry_waits_for_queued_show_on_retire() {
             .events
             .backend
             .scene
-            .cursor_transition_pending()
+            .cursor_transition_pending(&[0])
     );
     assert!(
         !fixture
@@ -417,7 +417,7 @@ fn entry_waits_for_queued_show_on_retire() {
             .events
             .backend
             .scene
-            .cursor_transition_pending()
+            .cursor_transition_pending(&[0])
     );
     assert!(
         fixture

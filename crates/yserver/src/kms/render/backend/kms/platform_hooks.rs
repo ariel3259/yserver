@@ -118,7 +118,11 @@ impl Platform for PlatformBackend {
 
         b.scene.wake_for_cursor_damage();
         let now = b.monotonic_now();
-        let interval = b.pstate.tearing.cursor_compose_interval(&b.platform);
+        let outputs = b.tearing_scope_outputs();
+        let interval = b
+            .pstate
+            .tearing
+            .cursor_compose_interval(&b.platform, &outputs);
         match b.pstate.tearing.last_cursor_compose {
             Some(last_compose) if now < last_compose + interval => {
                 b.pstate.tearing.deferred_cursor_wake = Some(last_compose + interval);

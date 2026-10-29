@@ -76,13 +76,15 @@ impl SceneBuild {
 impl SceneCompositor {
     /// Whether any submitted, unretired frame still carries a cursor-plane
     /// action. Tearing entry waits for these actions to retire first.
-    pub fn cursor_transition_pending(&self) -> bool {
+    pub fn cursor_transition_pending(&self, output_indices: &[usize]) -> bool {
         self.inner.as_ref().is_some_and(|inner| {
-            inner.outputs.iter().any(|output| {
-                output
-                    .pending_acks
-                    .iter()
-                    .any(|ack| ack.cursor_transition.is_some())
+            output_indices.iter().any(|&output_idx| {
+                inner.outputs.get(output_idx).is_some_and(|output| {
+                    output
+                        .pending_acks
+                        .iter()
+                        .any(|ack| ack.cursor_transition.is_some())
+                })
             })
         })
     }
