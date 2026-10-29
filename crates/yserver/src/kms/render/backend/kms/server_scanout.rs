@@ -39,17 +39,20 @@ impl KmsBackendState {
         owner.hold_direct = false;
     }
 
-    /// The active owners whose pending, queued or current frame names `id`
-    /// as its source or fallback target.
-    pub(in crate::kms::render::backend) fn direct_scopes_referencing_drawable(
+    /// The active owners whose pending, queued or current frame names any of
+    /// `ids` as its source or fallback target. Keep aggregation here so both
+    /// backend cancellation and state-only retirement use the same resolver.
+    pub(in crate::kms::render::backend) fn direct_scopes_referencing_drawables(
         &self,
-        id: DrawableId,
+        ids: &[DrawableId],
     ) -> Vec<DirectScope> {
-        self.direct
-            .active_scopes()
-            .into_iter()
-            .filter(|&scope| {
-                self.direct.get(scope).is_some_and(|owner| {
+        let mut scopes = Vec::new();
+        for &id in ids {
+            for scope in self.direct.active_scopes() {
+                if scopes.contains(&scope) {
+                    continue;
+                }
+                let references_id = self.direct.get(scope).is_some_and(|owner| {
                     [
                         owner.pending.as_ref(),
                         owner.queued_successor.as_ref(),
@@ -58,9 +61,13 @@ impl KmsBackendState {
                     .into_iter()
                     .flatten()
                     .any(|frame| frame.source_id == id || frame.fallback_target.backing_id() == id)
-                })
-            })
-            .collect()
+                });
+                if references_id {
+                    scopes.push(scope);
+                }
+            }
+        }
+        scopes
     }
 
     /// Every member of a `Complete` rotation that holds `id`, and `id`.
@@ -84,15 +91,7 @@ impl KmsBackendState {
         if self.server_scanout.retire(id) {
             // Promoted server-owned sources are admitted as Root candidates only, so
             // this state-only callback cannot reference a queued Output first entry.
-            let mut scopes = Vec::new();
-            for member in members {
-                for scope in self.direct_scopes_referencing_drawable(member) {
-                    if !scopes.contains(&scope) {
-                        scopes.push(scope);
-                    }
-                }
-            }
-            for scope in scopes {
+            for scope in self.direct_scopes_referencing_drawables(&members) {
                 self.mark_direct_unflip_for(scope, "server_source_retired");
             }
         }
@@ -388,7 +387,7 @@ impl KmsBackend {
     ) -> bool {
         !self
             .pstate
-            .direct_scopes_referencing_drawable(id)
+            .direct_scopes_referencing_drawables(&[id])
             .is_empty()
     }
 

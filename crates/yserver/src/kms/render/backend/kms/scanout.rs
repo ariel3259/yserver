@@ -703,15 +703,7 @@ impl KmsBackend {
         ids: &[DrawableId],
         reason: &'static str,
     ) {
-        let mut scopes = Vec::new();
-        for &id in ids {
-            for scope in self.pstate.direct_scopes_referencing_drawable(id) {
-                if !scopes.contains(&scope) {
-                    scopes.push(scope);
-                }
-            }
-        }
-        for scope in scopes {
+        for scope in self.pstate.direct_scopes_referencing_drawables(ids) {
             self.request_direct_unflip_for(scope, reason);
         }
     }

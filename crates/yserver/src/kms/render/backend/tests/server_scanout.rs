@@ -2288,7 +2288,7 @@ fn disqualification_leaves_an_unrelated_output_owner_direct() {
 
 #[test]
 fn an_output_owner_holding_a_promoted_source_defers_its_export_and_unflips() {
-    // Mutation: direct_scopes_referencing_drawable reads only the Root owner.
+    // Mutation: direct_scopes_referencing_drawables reads only the Root owner.
     let a_xid = 0x0067_0021;
     let (mut b, _, a) = promoted_backend(a_xid);
     hold_on_output_owner(&mut b, 0, Some(a));
