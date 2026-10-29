@@ -164,7 +164,7 @@ impl KmsBackend {
         suppressed
     }
 
-    fn direct_candidate_gate(
+    pub(in crate::kms::render::backend) fn direct_candidate_gate(
         &self,
         candidate: PresentScanoutCandidate,
         target: ScanoutM0Target,
@@ -217,7 +217,7 @@ impl KmsBackend {
                 .scanout_m1
                 .entries
                 .get(&(frame.source_id, scope))
-                .and_then(ScanoutM1ProbeEntry::framebuffer)
+                .and_then(crate::kms::render::backend::ScanoutM1ProbeEntry::framebuffer)
                 .is_some()
     }
 
