@@ -573,12 +573,8 @@ impl Platform for PlatformBackend {
         KmsBackend::backend_present_present_absolute_vblank_arm_supported(b, crtc_id)
     }
 
-    fn arm_present_absolute_vblank(
-        b: &mut KmsBackend,
-        randr_crtc_id: u32,
-        targets: &[u64],
-    ) -> io::Result<usize> {
-        KmsBackend::backend_present_arm_present_absolute_vblank(b, randr_crtc_id, targets)
+    fn arm_present_shared_wake(b: &mut KmsBackend, randr_crtc_id: u32) -> io::Result<bool> {
+        KmsBackend::backend_present_arm_present_shared_wake(b, randr_crtc_id)
     }
 
     fn present_scanout_blackout(b: &KmsBackend) -> bool {

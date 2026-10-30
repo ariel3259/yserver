@@ -228,6 +228,51 @@ fn dispatch_present_body(
     .unwrap();
 }
 
+fn dispatch_future_present_pixmap(
+    state: &mut ServerState,
+    backend: &mut RecordingBackend,
+    window: u32,
+    pixmap: u32,
+    present_id: u32,
+    target_msc: u64,
+) {
+    if state.resources.window(ResourceId(window)).is_none() {
+        create_present_test_window(state, window, 0, 0, 32, 32);
+        let target = state
+            .resources
+            .window_mut(ResourceId(window))
+            .expect("created Present window");
+        target.host_xid = crate::backend::WindowHandle::from_raw(window | 0x0040_0000);
+        target.map_state = crate::resources::MapState::Viewable;
+    }
+    state.resources.create_pixmap(
+        ClientId(1),
+        CreatePixmapRequest {
+            depth: 24,
+            pixmap: ResourceId(pixmap),
+            drawable: ResourceId(window),
+            width: 32,
+            height: 32,
+        },
+    );
+    let _ = state.resources.set_pixmap_host_xid(
+        ResourceId(pixmap),
+        crate::backend::PixmapHandle::from_raw(pixmap | 0x0040_0000)
+            .expect("valid test pixmap host xid"),
+    );
+    let mut body = pixmap_body(window, pixmap);
+    body[8..12].copy_from_slice(&present_id.to_le_bytes());
+    body[44..52].copy_from_slice(&target_msc.to_le_bytes());
+    dispatch_present_body(
+        state,
+        backend,
+        ClientId(1),
+        u16::try_from(present_id).unwrap(),
+        yserver_protocol::x11::present::PIXMAP,
+        &body,
+    );
+}
+
 fn run_core_present_wait_drain(
     state: &mut ServerState,
     backend: &mut RecordingBackend,
@@ -395,7 +440,7 @@ fn future_synced_acquire_wait_is_superseded_without_blocking_successor_completio
     let mut backend = RecordingBackend::new();
     backend.present_ust_msc = (100, 0x1000);
     backend.present_display_idle = false;
-    backend.present_absolute_vblank_arm_supported = false;
+    backend.present_absolute_vblank_arm_supported = true;
     backend.present_scanout_blackout = false;
     backend.present_syncobj_wait = crate::backend::PresentSourceWait::Deferred(WAIT_ID);
     backend.seed_dri3_syncobj_for_test(ACQUIRE, ClientId(CLIENT));
@@ -2007,7 +2052,7 @@ fn epoch_mismatch_is_not_rearmed_and_fails_open_unpaced() {
     backend.present_absolute_vblank_arm_supported = true;
 
     crate::core_loop::run::arm_present_idle_vblanks(&mut state, &mut backend);
-    assert!(backend.armed_absolute_vblank_targets.is_empty());
+    assert!(backend.armed_shared_wake_crtcs.is_empty());
     assert!(state.present_pending_exec.contains_key(&PRESENT_ID));
     drain_due_present_pending_exec(&mut state, &mut backend);
     assert!(state.present_pending_exec.is_empty());
@@ -2244,11 +2289,7 @@ fn run_loop_groups_all_present_arm_sites_by_crtc_epoch() {
     seed_present_domain_clock(&mut state, 22, 2, 200, 2);
     backend.present_absolute_vblank_arm_supported = true;
     crate::core_loop::run::arm_present_idle_vblanks(&mut state, &mut backend);
-    assert_eq!(backend.armed_absolute_vblank_crtcs, vec![11, 22]);
-    assert_eq!(
-        backend.armed_absolute_vblank_targets,
-        vec![vec![109], vec![219]]
-    );
+    assert_eq!(backend.armed_shared_wake_crtcs, vec![11, 22]);
 }
 
 #[test]
@@ -4190,19 +4231,19 @@ fn blackout_holds_back_completions_behind_a_not_source_ready_entry_until_it_reso
 /// (vi) Arm failure / `Ok(0)`: entries execute immediately in the
 /// same pass (the third arming call site, `run::arm_present_idle_vblanks`).
 #[test]
-fn absolute_arm_ok_zero_executes_parked_entries_immediately() {
+fn shared_wake_false_executes_distant_parked_entries_immediately() {
     const PRESENT_ID: u64 = 505;
     const WINDOW_HOST_XID: u32 = 0x0040_0b01;
     const PIXMAP_HOST_XID: u32 = 0x0040_0b02;
     const CLOCK: u64 = 100;
-    const EFF: u64 = 110; // future: eff - 1 = 109 is what should be armed.
+    const EFF: u64 = 110;
 
     let mut state = ServerState::new();
     let mut backend = RecordingBackend::new();
     backend.present_ust_msc = (CLOCK, 0x1000);
     seed_present_clock(&mut state, CLOCK, 0x1000);
     backend.present_absolute_vblank_arm_supported = true;
-    backend.arm_present_absolute_vblank_result = Some(Ok(0));
+    backend.arm_present_shared_wake_result = Some(Ok(false));
 
     state.present_pending_exec.insert(
         PRESENT_ID,
@@ -4217,11 +4258,7 @@ fn absolute_arm_ok_zero_executes_parked_entries_immediately() {
 
     crate::core_loop::run::arm_present_idle_vblanks(&mut state, &mut backend);
 
-    assert_eq!(
-        backend.armed_absolute_vblank_targets,
-        vec![vec![EFF - 1]],
-        "the arm is called with eff - 1 (the -1 is core-side)"
-    );
+    assert_eq!(backend.armed_shared_wake_crtcs, [0]);
     assert!(
         backend.calls().iter().any(|call| matches!(
             call,
@@ -4236,7 +4273,7 @@ fn absolute_arm_ok_zero_executes_parked_entries_immediately() {
 }
 
 #[test]
-fn absolute_arm_err_executes_parked_entries_immediately() {
+fn shared_wake_err_executes_distant_parked_entries_immediately() {
     const PRESENT_ID: u64 = 506;
     const WINDOW_HOST_XID: u32 = 0x0040_0c01;
     const PIXMAP_HOST_XID: u32 = 0x0040_0c02;
@@ -4248,7 +4285,7 @@ fn absolute_arm_err_executes_parked_entries_immediately() {
     backend.present_ust_msc = (CLOCK, 0x1000);
     seed_present_clock(&mut state, CLOCK, 0x1000);
     backend.present_absolute_vblank_arm_supported = true;
-    backend.arm_present_absolute_vblank_result = Some(Err(std::io::ErrorKind::Other));
+    backend.arm_present_shared_wake_result = Some(Err(std::io::ErrorKind::Other));
 
     state.present_pending_exec.insert(
         PRESENT_ID,
@@ -4277,7 +4314,7 @@ fn absolute_arm_err_executes_parked_entries_immediately() {
 }
 
 #[test]
-fn absolute_arm_success_leaves_entry_parked() {
+fn shared_wake_success_leaves_entry_parked() {
     const PRESENT_ID: u64 = 507;
     const WINDOW_HOST_XID: u32 = 0x0040_0d01;
     const PIXMAP_HOST_XID: u32 = 0x0040_0d02;
@@ -4311,56 +4348,428 @@ fn absolute_arm_success_leaves_entry_parked() {
             .all(|call| !matches!(call, RecordedCall::CopyArea { .. })),
         "a successful arm must not execute — the entry stays parked, awaiting the arm's event"
     );
+    assert_eq!(backend.armed_shared_wake_crtcs, [0]);
     assert_eq!(state.present_pending_exec.len(), 1);
 }
 
-/// Review fix (minor): the arm target is `eff.wrapping_sub(1)`, not a
-/// plain `eff - 1` — with a wrapped clock, `eff` can legitimately be
-/// `0` (the vblank right after `u64::MAX`), and a plain subtraction
-/// would debug-panic. Picks a clock/eff pair where `eff == 0` is
-/// genuinely future-target (`msc_is_after(0, clock_msc + 1)` wraps
-/// true) and asserts the arm receives `u64::MAX`, not a panic.
+// Mutation: treat a target at or before the completion clock as ahead.
 #[test]
-fn absolute_arm_target_wraps_instead_of_panicking() {
-    const PRESENT_ID: u64 = 508;
-    const WINDOW_HOST_XID: u32 = 0x0040_0e01;
-    const PIXMAP_HOST_XID: u32 = 0x0040_0e02;
-    // clock_msc + 1 = u64::MAX - 1; eff = 0 is strictly after that in
-    // wrapped MSC order (msc_is_after(0, u64::MAX - 1) is true), so it
-    // classifies as a genuine future target whose arm target
-    // (eff - 1, wrapped) is u64::MAX.
-    const CLOCK: u64 = u64::MAX - 2;
-    const EFF: u64 = 0;
+fn shared_wake_held_presents_past_target_arm_nothing() {
+    use crate::server::PresentCompleteGate;
+    use yserver_protocol::x11::present as x11present;
+
+    const WINDOW: u32 = 0x0001_5101;
+    const EVENT_ID: u32 = 0x0010_5101;
+    const BLOCKER: u64 = 0;
+    const FIRST: u64 = 1;
+    const COUNT: u64 = 40;
+    const CLOCK: u64 = 100;
 
     let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    peer.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("bound core round-trip waits");
     let mut backend = RecordingBackend::new();
-    backend.present_ust_msc = (CLOCK, 0x1000);
-    seed_present_clock(&mut state, CLOCK, 0x1000);
+    backend.present_ust_msc = (CLOCK, 1_000);
     backend.present_absolute_vblank_arm_supported = true;
-
-    state.present_pending_exec.insert(
-        PRESENT_ID,
-        present_pending_entry_with(
-            PRESENT_ID,
-            WINDOW_HOST_XID,
-            PIXMAP_HOST_XID,
-            Some(EFF),
-            true,
-        ),
+    seed_present_domain_clock(&mut state, 11, 1, CLOCK, 1_000);
+    backend.present_crtc_clock_epoch_by_crtc.insert(11, 1);
+    state.present_event_selections.insert(
+        EVENT_ID,
+        crate::server::PresentEventSelection {
+            owner: ClientId(1),
+            window: ResourceId(WINDOW),
+            event_mask: x11present::EVENT_MASK_COMPLETE_NOTIFY,
+        },
     );
+    state.present_complete_gate.insert(
+        BLOCKER,
+        PresentCompleteGate {
+            crtc_id: 11,
+            crtc_epoch: 1,
+            msc_offset: 0,
+            effective_target_msc: CLOCK,
+            owner: ClientId(1),
+            dst_window_xid: WINDOW,
+        },
+    );
+    create_present_test_window(&mut state, WINDOW, 0, 0, 32, 32);
+    let target = state
+        .resources
+        .window_mut(ResourceId(WINDOW))
+        .expect("created Present window");
+    target.host_xid = crate::backend::WindowHandle::from_raw(WINDOW | 0x0040_0000);
+    target.map_state = crate::resources::MapState::Viewable;
+    for present_id in FIRST..FIRST + COUNT {
+        let pixmap = 0x0041_5100 + present_id as u32;
+        state.resources.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(pixmap),
+                drawable: ResourceId(WINDOW),
+                width: 32,
+                height: 32,
+            },
+        );
+        assert!(state.resources.set_pixmap_host_xid(
+            ResourceId(pixmap),
+            crate::backend::PixmapHandle::from_raw(pixmap).expect("valid Present pixmap host xid"),
+        ));
+        let mut body = pixmap_body(WINDOW, pixmap);
+        body[8..12].copy_from_slice(&(present_id as u32).to_le_bytes());
+        body[36..40].copy_from_slice(&crate::present_scheduler::PRESENT_OPTION_ASYNC.to_le_bytes());
+        body[44..52].copy_from_slice(&CLOCK.to_le_bytes());
+        let sequence = u16::try_from((present_id - FIRST) * 2 + 1).unwrap();
+        assert!(
+            run_core_present_request_and_wait(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                sequence,
+                sequence + 1,
+                x11present::PIXMAP,
+                &body,
+            )
+            .is_empty()
+        );
+    }
+    assert!(state.present_complete_gate.contains_key(&BLOCKER));
+    assert_eq!(backend.enqueued_present_completions.len(), COUNT as usize);
+    assert_eq!(
+        backend
+            .enqueued_present_completions
+            .iter()
+            .map(|(event, _)| event.present_id)
+            .collect::<Vec<_>>(),
+        (FIRST..FIRST + COUNT).collect::<Vec<_>>()
+    );
+    backend.completed_present_events_to_drain.extend(
+        std::mem::take(&mut backend.enqueued_present_completions)
+            .into_iter()
+            .map(|(event, _)| event),
+    );
+    let blocked_wire = run_core_present_wait_drain(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        u16::try_from(COUNT * 2 + 1).unwrap(),
+    );
+    assert!(
+        blocked_wire.is_empty(),
+        "the older gate must hold the real completions: wire={}, pending={}, gates={:?}",
+        blocked_wire.len(),
+        state.present_pending_complete.len(),
+        state.present_complete_gate
+    );
+    assert_eq!(state.present_pending_complete.len(), COUNT as usize);
+
+    assert!(
+        backend.armed_shared_wake_crtcs.is_empty(),
+        "reached completions must not arm: arms={:?}, targets={:?}, clocks={:?}",
+        backend.armed_shared_wake_crtcs,
+        state
+            .present_pending_complete
+            .iter()
+            .map(|pending| pending.effective_target_msc)
+            .collect::<Vec<_>>(),
+        state.present_crtc_clocks
+    );
+    state.present_complete_gate.remove(&BLOCKER);
+    let wire = run_core_present_wait_drain(
+        &mut state,
+        &mut backend,
+        &mut peer,
+        u16::try_from(COUNT * 2 + 2).unwrap(),
+    );
+    assert!(state.present_pending_complete.is_empty());
+    let serials: Vec<u32> = wire
+        .chunks_exact(40)
+        .map(|event| u32::from_le_bytes(event[20..24].try_into().unwrap()))
+        .collect();
+    assert_eq!(
+        serials,
+        (FIRST..FIRST + COUNT)
+            .map(|id| id as u32)
+            .collect::<Vec<_>>()
+    );
+}
+
+// Mutation: restore per-target arming or stop re-arming after the first wake.
+#[test]
+fn shared_wake_future_targets_make_one_call_per_domain_per_iteration() {
+    use yserver_protocol::x11::present as x11present;
+
+    const FIRST_WINDOW: u32 = 0x0001_5201;
+    const SECOND_WINDOW: u32 = 0x0001_5202;
+    const FIRST_EVENT: u32 = 0x0010_5201;
+    const SECOND_EVENT: u32 = 0x0010_5202;
+    const COUNT_PER_WINDOW: u64 = 66;
+    const FIRST_ID: u64 = 1;
+    const CLOCK: u64 = u64::MAX - 32;
+    let tick_msc = |step: u64| {
+        if step <= 32 {
+            CLOCK.wrapping_add(step)
+        } else {
+            step - 32
+        }
+    };
+
+    let mut state = ServerState::new();
+    let mut first_peer = install_client(&mut state, 1);
+    first_peer
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("bound completion round-trip waits");
+    let mut backend = RecordingBackend::new();
+    backend.present_crtc_clock_epoch_by_crtc.insert(11, 1);
+    backend.present_absolute_vblank_arm_supported = true;
+    state.present_event_selections.extend([
+        (
+            FIRST_EVENT,
+            crate::server::PresentEventSelection {
+                owner: ClientId(1),
+                window: ResourceId(FIRST_WINDOW),
+                event_mask: x11present::EVENT_MASK_COMPLETE_NOTIFY,
+            },
+        ),
+        (
+            SECOND_EVENT,
+            crate::server::PresentEventSelection {
+                owner: ClientId(1),
+                window: ResourceId(SECOND_WINDOW),
+                event_mask: x11present::EVENT_MASK_COMPLETE_NOTIFY,
+            },
+        ),
+    ]);
+
+    for step in 1..=COUNT_PER_WINDOW {
+        let target = tick_msc(step);
+        for (window, present_id) in [
+            (FIRST_WINDOW, FIRST_ID + (step - 1) * 2),
+            (SECOND_WINDOW, FIRST_ID + (step - 1) * 2 + 1),
+        ] {
+            let mut pending = due_pending_complete(
+                window,
+                present_id,
+                target,
+                x11present::COMPLETE_MODE_COPY,
+                false,
+            );
+            pending.event.crtc_id = 11;
+            pending.event.crtc_epoch = 1;
+            pending.event.serial = present_id as u32;
+            state.present_pending_complete.push(pending);
+        }
+    }
+
+    seed_present_domain_clock(&mut state, 11, 1, CLOCK, 1_000);
+    crate::core_loop::run::arm_present_idle_vblanks(&mut state, &mut backend);
+    assert_eq!(backend.armed_shared_wake_crtcs, [11]);
+
+    let mut observed = Vec::new();
+    for step in 1..=COUNT_PER_WINDOW {
+        let msc = tick_msc(step);
+        let sample = crate::backend::PresentClockSample {
+            msc,
+            ust: 1_000 + step,
+            source: crate::backend::PresentClockSource::IdleSequence,
+        };
+        seed_present_domain_clock(&mut state, 11, 1, sample.msc, sample.ust);
+        let wire = run_core_present_wait_drain(
+            &mut state,
+            &mut backend,
+            &mut first_peer,
+            u16::try_from(step).unwrap(),
+        );
+        for event in wire.chunks_exact(40) {
+            assert_eq!(u64::from_le_bytes(event[32..40].try_into().unwrap()), msc);
+            observed.push(u32::from_le_bytes(event[20..24].try_into().unwrap()));
+        }
+        assert_eq!(
+            state.present_pending_complete.len(),
+            ((COUNT_PER_WINDOW - step) * 2) as usize,
+            "after step={step}, msc={msc}"
+        );
+        assert_eq!(
+            backend.armed_shared_wake_crtcs.len(),
+            (step.min(COUNT_PER_WINDOW - 1) + 1) as usize,
+            "one shared wake request for this CRTC while future work remains"
+        );
+    }
+
+    let expected: Vec<u32> = (FIRST_ID..FIRST_ID + COUNT_PER_WINDOW * 2)
+        .map(|id| id as u32)
+        .collect();
+    assert_eq!(observed, expected);
+    assert!(state.present_pending_complete.is_empty());
+    assert!(
+        backend
+            .armed_shared_wake_crtcs
+            .iter()
+            .all(|&crtc| crtc == 11)
+    );
+}
+
+// Mutation: require a nonzero MSC even when there is no usable clock.
+#[test]
+fn shared_wake_no_usable_clock_counts_as_ahead() {
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new();
+    backend.present_absolute_vblank_arm_supported = true;
+    backend.present_crtc_clock_epoch_by_crtc.insert(11, 1);
+    let mut pending = due_pending_complete(0x1521, 1, 20, 0, false);
+    pending.event.crtc_id = 11;
+    pending.event.crtc_epoch = 1;
+    state.present_pending_complete.push(pending);
 
     crate::core_loop::run::arm_present_idle_vblanks(&mut state, &mut backend);
 
-    assert_eq!(
-        backend.armed_absolute_vblank_targets,
-        vec![vec![u64::MAX]],
-        "eff=0 wraps to u64::MAX when subtracting 1, not a panic"
+    assert_eq!(backend.armed_shared_wake_crtcs, [11]);
+}
+
+// Mutation: report a shared wake on false or error, causing distant Presents to stay parked.
+#[test]
+fn shared_wake_failure_executes_parked_entries_immediately() {
+    use crate::backend::recording::RecordedCall;
+
+    const FAR_ID: u64 = 1;
+    const NEXT_ID: u64 = 2;
+    const FAR_PIXMAP: u32 = 0x0040_5301;
+    const NEXT_PIXMAP: u32 = 0x0040_5302;
+
+    for result in [Some(Ok(false)), Some(Err(std::io::ErrorKind::Other))] {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        backend.present_ust_msc = (100, 1_000);
+        backend.present_absolute_vblank_arm_supported = true;
+        backend.arm_present_shared_wake_result = result;
+        seed_present_clock(&mut state, 100, 1_000);
+        backend.present_flip_in_flight = true;
+        dispatch_future_present_pixmap(
+            &mut state,
+            &mut backend,
+            0x1531,
+            FAR_PIXMAP,
+            FAR_ID as u32,
+            120,
+        );
+        dispatch_future_present_pixmap(
+            &mut state,
+            &mut backend,
+            0x1532,
+            NEXT_PIXMAP,
+            NEXT_ID as u32,
+            101,
+        );
+
+        crate::core_loop::run::arm_present_idle_vblanks(&mut state, &mut backend);
+
+        assert!(backend.calls().iter().any(|call| matches!(
+            call,
+            RecordedCall::CopyArea {
+                src_host_xid: FAR_PIXMAP,
+                ..
+            }
+        )));
+        assert!(!backend.calls().iter().any(|call| matches!(
+            call,
+            RecordedCall::CopyArea {
+                src_host_xid: NEXT_PIXMAP,
+                ..
+            }
+        )));
+        assert!(!state.present_pending_exec.contains_key(&FAR_ID));
+        assert!(state.present_pending_exec.contains_key(&NEXT_ID));
+    }
+}
+
+// Mutation: omit next-MSC entries while a page flip is in flight.
+#[test]
+fn shared_wake_next_msc_entry_behind_a_flip_is_armed() {
+    const PRESENT_ID: u64 = 1;
+
+    let mut state = ServerState::new();
+    let _peer = install_client(&mut state, 1);
+    let mut backend = RecordingBackend::new();
+    backend.present_ust_msc = (100, 1_000);
+    backend.present_absolute_vblank_arm_supported = true;
+    backend.present_flip_in_flight = true;
+    seed_present_clock(&mut state, 100, 1_000);
+    dispatch_future_present_pixmap(&mut state, &mut backend, 0x1541, 0x5401, 1, 101);
+
+    crate::core_loop::run::arm_present_idle_vblanks(&mut state, &mut backend);
+
+    assert_eq!(backend.armed_shared_wake_crtcs, [2]);
+    assert!(state.present_pending_exec.contains_key(&PRESENT_ID));
+    assert!(backend.calls().iter().all(|call| !matches!(
+        call,
+        crate::backend::recording::RecordedCall::CopyArea { .. }
+    )));
+}
+
+// Mutation: route NotifyMSC through the tagged shared slot instead of the idle vblank path.
+#[test]
+fn notify_msc_pacing_unchanged_with_shared_wake() {
+    use yserver_protocol::x11::present as x11present;
+
+    const WINDOW: u32 = 0x0000_1551;
+    const EVENT_ID: u32 = 0x0010_1551;
+
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    peer.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("bound core round-trip waits");
+    let mut backend = RecordingBackend::new();
+    backend.present_absolute_vblank_arm_supported = true;
+    backend.present_ust_msc = (100, 1_000);
+    seed_present_clock(&mut state, 100, 1_000);
+    state.present_event_selections.insert(
+        EVENT_ID,
+        crate::server::PresentEventSelection {
+            owner: ClientId(1),
+            window: ResourceId(WINDOW),
+            event_mask: x11present::EVENT_MASK_COMPLETE_NOTIFY,
+        },
     );
+    state
+        .present_pending_msc
+        .push(crate::server::PendingNotifyMsc {
+            owner: ClientId(1),
+            window: WINDOW,
+            crtc_id: 0,
+            crtc_epoch: 0,
+            msc_offset: 0,
+            serial: 77,
+            target_msc: 110,
+            divisor: 0,
+            remainder: 0,
+            byte_order: ClientByteOrder::LittleEndian,
+        });
+
+    assert!(run_core_present_wait_drain(&mut state, &mut backend, &mut peer, 1).is_empty());
+    assert_eq!(backend.armed_idle_vblank_targets, [(0, vec![110])]);
+    assert!(backend.armed_shared_wake_crtcs.is_empty());
+
+    assert_eq!(state.present_pending_msc.len(), 1);
+    backend.present_ust_msc = (110, 2_000);
+    seed_present_clock(&mut state, 110, 2_000);
+    let wire = run_core_present_wait_drain(&mut state, &mut backend, &mut peer, 2);
+    assert!(state.present_pending_msc.is_empty());
     assert_eq!(
-        state.present_pending_exec.len(),
-        1,
-        "the (default, always-covers) arm succeeds, so the entry stays parked"
+        wire.len(),
+        40,
+        "one NotifyMSC event is emitted on its target"
     );
+    assert_eq!(wire[0], 35, "GenericEvent");
+    assert_eq!(wire[10], x11present::COMPLETE_KIND_NOTIFY_MSC);
+    assert_eq!(
+        u32::from_le_bytes(wire[12..16].try_into().unwrap()),
+        EVENT_ID
+    );
+    assert_eq!(u32::from_le_bytes(wire[20..24].try_into().unwrap()), 77);
+    assert_eq!(u64::from_le_bytes(wire[24..32].try_into().unwrap()), 2_000);
+    assert_eq!(u64::from_le_bytes(wire[32..40].try_into().unwrap()), 110);
 }
 
 /// (vii) One-clock contract / no-reclassification: a present arriving

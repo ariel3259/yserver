@@ -232,7 +232,7 @@ impl KmsBackend {
             vt_resume_executor: std::rc::Rc::new(DrmVtResumeExecutor),
             monotonic_clock: std::rc::Rc::new(std::time::Instant::now),
             armed_vblank_targets: std::collections::HashMap::new(),
-            absolute_vblank_targets: std::collections::HashMap::new(),
+            shared_wake_armed: HashSet::new(),
             crtc_queue_sequence_unsupported_devices: HashSet::new(),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),

@@ -1544,7 +1544,7 @@ impl KmsBackend {
             self.scene.drain_output(&mut self.platform, idx);
             let crtc = CrtcKey::for_output(&self.platform.outputs[idx]);
             self.pstate.armed_vblank_targets.remove(&crtc);
-            self.pstate.absolute_vblank_targets.remove(&crtc);
+            self.pstate.shared_wake_armed.remove(&crtc);
         }
         // `enable_connector` idles the GPU itself if it replaces the pool.
         self.pstate.scanout_m1.clear("per-CRTC RANDR change");

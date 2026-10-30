@@ -13,8 +13,8 @@ use ash::vk;
 use std::{collections::HashSet, io, rc::Rc};
 use yserver_core::backend::{Backend, PresentCaps, PresentScanoutCandidate, PresentSourceWait};
 
-/// `user_data` value for an absolute per-target arm on `crtc_id` — the
-/// single producer of the encoding `on_crtc_sequence_event` decodes, so
+/// `user_data` value for the tagged shared wake on `crtc_id` — the single
+/// producer of the encoding `on_crtc_sequence_event` decodes, so
 /// the two can never drift independently of each other. Free function
 /// (not inlined into the ioctl closure) so a unit test can round-trip
 /// it straight into `on_crtc_sequence_event` without a live DRM fd.
@@ -597,8 +597,7 @@ impl KmsBackend {
             })
     }
 
-    /// Clear both armed-target maps (relative single-slot + absolute
-    /// per-target).
+    /// Clear both armed slots (untagged idle + tagged Present wake).
     ///
     /// Called at lifecycle edges where the kernel has already dropped all
     /// queued CRTC sequences: VT suspend (`run_suspend`) and DPMS-off
@@ -609,14 +608,12 @@ impl KmsBackend {
         if !self.pstate.armed_vblank_targets.is_empty() {
             self.pstate.armed_vblank_targets.clear();
         }
-        if !self.pstate.absolute_vblank_targets.is_empty() {
-            self.pstate.absolute_vblank_targets.clear();
-        }
+        self.pstate.shared_wake_armed.clear();
         self.platform.vblank_fallback.software.clear();
     }
 
-    /// Drop armed-target entries (both the relative single-slot map and
-    /// the absolute per-target map) for CRTCs no longer owned by any
+    /// Drop armed slots (both the relative idle slot and tagged Present
+    /// wake) for CRTCs no longer owned by any
     /// live output. Called after `requery_outputs_and_modeset` retires a
     /// disconnected connector. (A new sequence event for a stale CRTC is
     /// already dropped by `on_crtc_sequence_event`, but the maps must not
@@ -633,26 +630,22 @@ impl KmsBackend {
             .armed_vblank_targets
             .retain(|key, _| live.contains(key));
         self.pstate
-            .absolute_vblank_targets
-            .retain(|key, _| live.contains(key));
+            .shared_wake_armed
+            .retain(|key| live.contains(key));
     }
 
     /// Side-effect-free `DRM_CRTC_SEQUENCE` event handler.
     ///
     /// `user_data` is echoed verbatim from whichever arm queued this
     /// sequence: the low 32 bits are always the crtc_id, and the high
-    /// bit (`ABSOLUTE_SEQ_TAG`) discriminates an absolute per-target arm
-    /// from the untagged single-slot relative idle arm.
+    /// bit (`ABSOLUTE_SEQ_TAG`) discriminates the tagged shared Present
+    /// wake from the untagged single-slot relative idle arm.
     ///
     /// **Invariant** (clear-arm before any drop):
-    /// 1. Untagged event: immediately remove the relative arm's
-    ///    armed-target entry for this CRTC — ANY received sequence event
-    ///    proves the kernel's clock advanced on that pipe, so the arm is
-    ///    spent (whether or not the output is still live). Tagged event:
-    ///    retire absolute entries with `target <= sequence` from this
-    ///    CRTC's absolute set instead — the two arms are independent, so
-    ///    a tagged event must NOT clear the relative slot and vice versa
-    ///    (spec §msc-due: neither arm suppresses the other).
+    /// 1. Untagged event: immediately remove the relative idle slot.
+    ///    Tagged event: immediately remove the shared Present wake slot.
+    ///    Either event proves the kernel clock advanced on that pipe, and
+    ///    the two independent slots must not clear one another.
     /// 2. Resolve `crtc_id_raw` to a live output index; drop if stale.
     /// 3. Validate `time_ns >= 0`; negative/malformed → log + drop.
     /// 4. Record `(sequence /*msc*/, ust_micros)` into the general per-output
@@ -677,15 +670,8 @@ impl KmsBackend {
         let crtc_handle = ::drm::control::from_u32(crtc_id_raw);
         let crtc_key = crtc_handle.map(|crtc| CrtcKey::new(device_key, crtc));
         if tagged {
-            if let Some(key) = crtc_key
-                && let Some(targets) = self.pstate.absolute_vblank_targets.get_mut(&key)
-            {
-                targets.retain(|&target| {
-                    yserver_core::present_scheduler::msc_is_after(target, sequence)
-                });
-                if targets.is_empty() {
-                    self.pstate.absolute_vblank_targets.remove(&key);
-                }
+            if let Some(key) = crtc_key {
+                self.pstate.shared_wake_armed.remove(&key);
             }
         } else if let Some(key) = crtc_key {
             self.pstate.armed_vblank_targets.remove(&key);
@@ -713,8 +699,8 @@ impl KmsBackend {
         };
         // (4) Always advance the general vblank clock. An untagged relative
         // sequence advances the completion clock only as an idle fallback.
-        // A tagged absolute sequence was explicitly armed for Present work
-        // at this MSC, so it is also a valid completion-clock wake while a
+        // A tagged shared wake was explicitly armed for Present work on this
+        // CRTC, so it is also a valid completion-clock wake while a
         // page flip is active; otherwise the wake observes a stale clock and
         // the completion still waits for the delayed flip it was meant to
         // avoid.
@@ -780,69 +766,37 @@ impl KmsBackend {
         }
     }
 
-    /// Testable seam for the absolute per-target vblank arm (spec
-    /// §msc-due future-target rule): `armer` performs the actual ioctl
-    /// (or a stub in tests), given `(crtc_id, target)`. Unlike
-    /// `arm_idle_vblanks_with`'s single in-flight slot per CRTC, this
-    /// tracks an independent **set** of already-armed target MSCs per
-    /// CRTC in `absolute_vblank_targets` — multiple in-flight
-    /// `CRTC_QUEUE_SEQUENCE`s per CRTC are legal, and a target already in
-    /// the set is skipped (dedup) rather than re-armed.
-    ///
-    /// Arms only the explicitly selected device-qualified CRTC. Callers
-    /// resolve the RANDR CRTC XID through the current live output inventory
-    /// before entering this seam.
-    ///
-    /// Returns the count of targets now **covered** by an in-flight arm
-    /// — newly issued OR already armed — not just newly issued ioctls
-    /// (see the trait doc on `arm_present_absolute_vblank`): the caller
-    /// re-arms every iteration, and if a still-parked, already-armed
-    /// target counted as 0 here, it would collide with the `Ok(0)` /
-    /// `Err` "arm failed, execute immediately" contract and fire early.
-    pub(crate) fn arm_present_absolute_vblank_with<F>(
+    /// Testable seam for the tagged shared Present wake. Arms one relative
+    /// next-vblank sequence for the selected device-qualified CRTC and
+    /// reports an existing slot as covered.
+    pub(crate) fn arm_present_shared_wake_with<F>(
         &mut self,
         crtc_key: CrtcKey,
-        targets: &[u64],
         mut armer: F,
-    ) -> std::io::Result<usize>
+    ) -> std::io::Result<bool>
     where
-        F: FnMut(CrtcKey, u64 /*target*/) -> std::io::Result<bool>,
+        F: FnMut(CrtcKey) -> std::io::Result<bool>,
     {
-        if targets.is_empty() {
-            return Ok(0);
-        }
         // Master loss / VT suspend (`scanout_allowed`) or DPMS off
         // (`kms_outputs_active`): the kernel discarded any queued sequences
         // and a powered-down CRTC rejects new ones with EINVAL, so drop our
         // bookkeeping and skip arming rather than retry every iteration.
         if !self.scanout_allowed() || !self.kms_outputs_active {
             self.clear_all_armed_vblank_targets();
-            return Ok(0);
+            return Ok(false);
         }
         if !self.kernel_vblank_arm_available(crtc_key.device_key) {
-            return Ok(0);
+            return Ok(false);
         }
-        let mut covered = 0;
-        for &target in targets {
-            let already_armed = self
-                .pstate
-                .absolute_vblank_targets
-                .get(&crtc_key)
-                .is_some_and(|set| set.contains(&target));
-            if already_armed {
-                covered += 1;
-                continue;
-            }
-            if armer(crtc_key, target)? {
-                self.pstate
-                    .absolute_vblank_targets
-                    .entry(crtc_key)
-                    .or_default()
-                    .insert(target);
-                covered += 1;
-            }
+        if self.pstate.shared_wake_armed.contains(&crtc_key) {
+            return Ok(true);
         }
-        Ok(covered)
+        if armer(crtc_key)? {
+            self.pstate.shared_wake_armed.insert(crtc_key);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     pub(in crate::kms::render::backend) fn arm_idle_vblanks_ioctl(
@@ -1892,28 +1846,26 @@ impl KmsBackend {
             .is_some_and(|key| self.kernel_vblank_arm_available(key.device_key))
     }
 
-    pub(in crate::kms::render::backend) fn backend_present_arm_present_absolute_vblank(
+    pub(in crate::kms::render::backend) fn backend_present_arm_present_shared_wake(
         &mut self,
         randr_crtc_id: u32,
-        targets: &[u64],
-    ) -> io::Result<usize> {
+    ) -> io::Result<bool> {
         let Some(crtc_key) = self.present_crtc_key(randr_crtc_id) else {
-            return Ok(0);
+            return Ok(false);
         };
         let Some(mut kernel) = self.kernel_vblank_armer(crtc_key) else {
-            return Ok(0);
+            return Ok(false);
         };
-        let result =
-            self.arm_present_absolute_vblank_with(crtc_key, targets, |crtc_key, target| {
-                let crtc_id = u32::from(crtc_key.crtc);
-                kernel.arm(
-                    crtc_key,
-                    false,
-                    target,
-                    absolute_seq_user_data(crtc_id),
-                    crtc_id | crate::drm::page_flip::LEGACY_VBLANK_ABSOLUTE_SIGNAL,
-                )
-            });
+        let result = self.arm_present_shared_wake_with(crtc_key, |crtc_key| {
+            let crtc_id = u32::from(crtc_key.crtc);
+            kernel.arm(
+                crtc_key,
+                true,
+                1,
+                absolute_seq_user_data(crtc_id),
+                crtc_id | crate::drm::page_flip::LEGACY_VBLANK_ABSOLUTE_SIGNAL,
+            )
+        });
         self.finish_kernel_vblank_armer(crtc_key, kernel);
         result
     }

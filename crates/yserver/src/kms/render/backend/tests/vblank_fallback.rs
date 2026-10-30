@@ -148,20 +148,19 @@ fn software_vblanks_stop_while_the_outputs_are_off() {
 }
 
 /// Xorg `ms_queue_vblank`: once the device rejects CRTC_QUEUE_SEQUENCE the
-/// absolute target is queued through WAIT_VBLANK, and its event releases
+/// tagged next-vblank wake is queued through WAIT_VBLANK, and its event releases
 /// the held completion through the sequence-event path.
 #[test]
-fn wait_vblank_fallback_arms_absolute_targets_and_its_event_releases_completion() {
+fn wait_vblank_fallback_arms_shared_wake_and_its_event_releases_completion() {
     let (mut b, second, _) = two_output_fixture();
     let source = recording_source(&b);
     source.set_legacy_vblank(Ok(5));
     let crtc_id = u32::from(second.crtc);
 
     assert!(b.present_absolute_vblank_arm_supported(SECOND_CRTC_XID));
-    let covered = b
-        .arm_present_absolute_vblank(SECOND_CRTC_XID, &[6])
-        .expect("legacy arm succeeds");
-    assert_eq!(covered, 1);
+    let armed =
+        Backend::arm_present_shared_wake(&mut b, SECOND_CRTC_XID).expect("legacy arm succeeds");
+    assert!(armed);
     assert!(
         b.pstate
             .crtc_queue_sequence_unsupported_devices
@@ -172,8 +171,8 @@ fn wait_vblank_fallback_arms_absolute_targets_and_its_event_releases_completion(
         source.legacy_vblank_arms(),
         [(
             1,
-            false,
-            6,
+            true,
+            1,
             crtc_id | crate::drm::page_flip::LEGACY_VBLANK_ABSOLUTE_SIGNAL
         )]
     );
@@ -186,7 +185,7 @@ fn wait_vblank_fallback_arms_absolute_targets_and_its_event_releases_completion(
 
     let clock = b.present_get_completion_clock(SECOND_CRTC_XID);
     assert_eq!((clock.msc, clock.ust), (6, 3_000));
-    assert!(!b.pstate.absolute_vblank_targets.contains_key(&second));
+    assert!(!b.pstate.shared_wake_armed.contains(&second));
 }
 
 #[test]

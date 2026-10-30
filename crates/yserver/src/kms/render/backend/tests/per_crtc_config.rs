@@ -187,6 +187,14 @@ fn output_removal_keeps_owner_state_with_its_output_per_crtc_off() {
     }
     let removed_crtc = crtc(&backend, 0);
     let survivor_crtc = crtc(&backend, 1);
+    let removed_key =
+        crate::kms::render::platform::CrtcKey::for_output(&backend.platform.outputs[0]);
+    let survivor_key =
+        crate::kms::render::platform::CrtcKey::for_output(&backend.platform.outputs[1]);
+    backend
+        .pstate
+        .shared_wake_armed
+        .extend([removed_key, survivor_key]);
     let name = connector(&backend, 0);
     let id = output_id(&mut backend, &name);
 
@@ -202,6 +210,8 @@ fn output_removal_keeps_owner_state_with_its_output_per_crtc_off() {
     );
     assert_eq!(backend.platform.outputs.len(), 1);
     assert_eq!(crtc(&backend, 0), survivor_crtc);
+    assert!(!backend.pstate.shared_wake_armed.contains(&removed_key));
+    assert!(backend.pstate.shared_wake_armed.contains(&survivor_key));
     assert_eq!(backend.pstate.direct.outputs.len(), 1);
     assert_eq!(backend.pstate.direct.outputs[0].eligible_streak, 3);
     assert!(backend.pstate.direct.outputs[0].reentry_blocked_until_composed);
@@ -629,8 +639,8 @@ fn advertised(width: u16, height: u16) -> crate::platform::drm::Mode {
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutations: take the global quiesce for a mode change (both CRTCs are turned
-// off), or drain every scene output instead of the changed one (output 0's
-// in-flight frame is lost).
+// off), drain every scene output instead of the changed one (output 0's
+// in-flight frame is lost), or retain the changed CRTC's shared wake slot.
 fn mode_change_modesets_only_its_crtc_while_the_other_keeps_presenting() {
     let Some((mut fixture, log, route)) = live_two_heads() else {
         return;
@@ -641,6 +651,18 @@ fn mode_change_modesets_only_its_crtc_while_the_other_keeps_presenting() {
         crtc(&fixture.events.backend, 0),
         crtc(&fixture.events.backend, 1),
     );
+    let crtc_key0 = crate::kms::render::platform::CrtcKey::for_output(
+        &fixture.events.backend.platform.outputs[0],
+    );
+    let crtc_key1 = crate::kms::render::platform::CrtcKey::for_output(
+        &fixture.events.backend.platform.outputs[1],
+    );
+    fixture
+        .events
+        .backend
+        .pstate
+        .shared_wake_armed
+        .extend([crtc_key0, crtc_key1]);
     let in_flight = submit_frame(&mut fixture);
     let (flip0, flip1) = (flip_for(&in_flight, crtc0), flip_for(&in_flight, crtc1));
     // CRTC 1's flip completes while the change waits for it; CRTC 0's stays
@@ -671,6 +693,30 @@ fn mode_change_modesets_only_its_crtc_while_the_other_keeps_presenting() {
     );
 
     assert_eq!(log.entries(), vec![("on", crtc1)]);
+    assert!(!backend.pstate.shared_wake_armed.contains(&crtc_key1));
+    assert!(backend.pstate.shared_wake_armed.contains(&crtc_key0));
+    let changed_crtc_randr_id = backend
+        .pstate
+        .randr_id_alloc
+        .entry(&backend.platform.outputs[1].key)
+        .expect("changed CRTC keeps its RandR resource")
+        .ids
+        .crtc_id;
+    let wake_source = backend.platform.devices[0]
+        .test_page_flip_event_source
+        .clone()
+        .expect("fixture records vblank requests");
+    backend
+        .pstate
+        .crtc_queue_sequence_unsupported_devices
+        .insert(crtc_key1.device_key);
+    backend.platform.vblank_fallback.pipes.insert(crtc_key1, 1);
+    wake_source.set_legacy_vblank(Ok(5));
+    assert!(
+        Backend::arm_present_shared_wake(backend, changed_crtc_randr_id)
+            .expect("changed CRTC can arm a fresh wake")
+    );
+    assert_eq!(wake_source.legacy_vblank_arms().len(), 1);
     assert_ne!(backend.pstate.crtc_config_topology_epoch, epoch);
     assert_eq!(
         undelivered(&fixture),

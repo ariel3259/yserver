@@ -26,12 +26,39 @@ fn dispatch_test_sequence(backend: &mut KmsBackend, user_data: u64, time_ns: i64
     backend.on_crtc_sequence_event(device_key, user_data, time_ns, sequence);
 }
 
+fn shared_wake_test_backend() -> (
+    KmsBackend,
+    CrtcKey,
+    u32,
+    std::rc::Rc<crate::kms::render::platform::flip_events::RecordingPageFlipEventSource>,
+) {
+    let mut backend = KmsBackend::for_tests();
+    let key = output_crtc_key(&backend, 0);
+    let randr_crtc_id = 0x5f01;
+    bind_test_randr_crtc(&mut backend, 0, randr_crtc_id);
+    backend.platform.vblank_fallback.pipes.insert(key, 0);
+    let source = backend.platform.devices[0]
+        .test_page_flip_event_source
+        .clone()
+        .expect("fixture records kernel events");
+    source.set_legacy_vblank(Ok(5));
+    (backend, key, randr_crtc_id, source)
+}
+
+fn drain_shared_wake_test_events(backend: &mut KmsBackend, state: &mut ServerState) {
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+
+    let fd = backend.platform.devices[0].device.as_fd().as_raw_fd();
+    Backend::on_page_flip_ready(backend, state, fd);
+}
+
 // ── Idle vblank arming (DRM_CRTC_QUEUE_SEQUENCE) ───────────────────────
 
 #[test]
 fn armed_vblank_targets_starts_empty() {
     let b = crate::kms::render::backend::KmsBackend::for_tests();
     assert!(b.pstate.armed_vblank_targets.is_empty());
+    assert!(b.pstate.shared_wake_armed.is_empty());
     assert!(b.pstate.crtc_queue_sequence_unsupported_devices.is_empty());
 }
 
@@ -40,8 +67,10 @@ fn clear_all_armed_vblank_targets_empties_map() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let h = test_crtc_key(test_device_key(7), 7);
     b.pstate.armed_vblank_targets.insert(h, 0);
+    b.pstate.shared_wake_armed.insert(h);
     b.clear_all_armed_vblank_targets();
     assert!(b.pstate.armed_vblank_targets.is_empty());
+    assert!(b.pstate.shared_wake_armed.is_empty());
 }
 
 #[test]
@@ -57,23 +86,14 @@ fn prune_armed_targets_drops_stale_keeps_live() {
 }
 
 #[test]
-fn prune_armed_targets_drops_stale_absolute_entries_keeps_live() {
+fn prune_armed_targets_drops_stale_shared_wakes_keeps_live() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let live = output_crtc_key(&b, 0);
     let stale = test_crtc_key(live.device_key, 999);
-    b.pstate
-        .absolute_vblank_targets
-        .entry(live)
-        .or_default()
-        .insert(50);
-    b.pstate
-        .absolute_vblank_targets
-        .entry(stale)
-        .or_default()
-        .insert(50);
+    b.pstate.shared_wake_armed.extend([live, stale]);
     b.prune_armed_targets_to_live_outputs();
-    assert!(b.pstate.absolute_vblank_targets.contains_key(&live));
-    assert!(!b.pstate.absolute_vblank_targets.contains_key(&stale));
+    assert!(b.pstate.shared_wake_armed.contains(&live));
+    assert!(!b.pstate.shared_wake_armed.contains(&stale));
 }
 
 #[test]
@@ -126,16 +146,12 @@ fn active_crtc_sequence_advances_general_clock_only() {
 }
 
 #[test]
-fn active_absolute_sequence_advances_completion_clock() {
+fn active_tagged_shared_wake_advances_completion_clock() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_id = u32::from(crtc);
     let crtc_key = output_crtc_key(&b, 0);
-    b.pstate
-        .absolute_vblank_targets
-        .entry(crtc_key)
-        .or_default()
-        .insert(9);
+    b.pstate.shared_wake_armed.insert(crtc_key);
     b.scene.scene_structure_dirty = true;
 
     dispatch_test_sequence(
@@ -149,7 +165,7 @@ fn active_absolute_sequence_advances_completion_clock() {
     assert_eq!(
         b.platform.present_get_completion_clock(crtc_key).msc,
         9,
-        "tagged Present-target sequence must release due completions",
+        "tagged shared wake must release due completions",
     );
 }
 
@@ -342,7 +358,7 @@ fn present_randr_crtc_routes_equal_raw_handles_to_the_owning_device() {
         .insert(primary.device_key);
     assert!(
         b.present_absolute_vblank_arm_supported(primary_xid),
-        "WAIT_VBLANK still arms absolute targets"
+        "WAIT_VBLANK still supports tagged shared wakes"
     );
     b.platform
         .vblank_fallback
@@ -435,15 +451,15 @@ fn vblank_arms_skip_the_ioctl_while_outputs_are_off() {
             Ok(true)
         })
         .unwrap();
-    let absolute = b
-        .arm_present_absolute_vblank_with(primary, &[500], |_, _| {
+    let shared = b
+        .arm_present_shared_wake_with(primary, |_| {
             calls += 1;
             Ok(true)
         })
         .unwrap();
     assert_eq!(
-        (armed, absolute, calls),
-        (0, 0, 0),
+        (armed, shared, calls),
+        (0, false, 0),
         "no ioctl with the outputs off"
     );
 
@@ -585,12 +601,12 @@ fn arm_idle_vblanks_with_scanout_disallowed_clears_and_returns_zero() {
     );
 }
 
-// ── Absolute per-target vblank arm (Task 3, spec §msc-due) ─────────────
+// ── Tagged shared Present wake ─────────────────────────────────────────
 
 #[test]
-fn absolute_vblank_targets_starts_empty() {
+fn shared_wake_slot_starts_empty() {
     let b = crate::kms::render::backend::KmsBackend::for_tests();
-    assert!(b.pstate.absolute_vblank_targets.is_empty());
+    assert!(b.pstate.shared_wake_armed.is_empty());
 }
 
 #[test]
@@ -600,11 +616,7 @@ fn tagged_sequence_event_does_not_clear_relative_slot() {
     let crtc_id = u32::from(crtc);
     let crtc_key = output_crtc_key(&b, 0);
     b.pstate.armed_vblank_targets.insert(crtc_key, 0);
-    b.pstate
-        .absolute_vblank_targets
-        .entry(crtc_key)
-        .or_default()
-        .insert(50);
+    b.pstate.shared_wake_armed.insert(crtc_key);
 
     // Tagged (absolute) event for the same CRTC.
     dispatch_test_sequence(
@@ -618,78 +630,40 @@ fn tagged_sequence_event_does_not_clear_relative_slot() {
         b.pstate.armed_vblank_targets.contains_key(&crtc_key),
         "a tagged event must not spend the untagged relative-1 slot"
     );
+    assert!(
+        !b.pstate.shared_wake_armed.contains(&crtc_key),
+        "the tagged event spends its own shared-wake slot"
+    );
 }
 
 #[test]
-fn untagged_sequence_event_does_not_retire_absolute_targets() {
+fn untagged_sequence_event_does_not_clear_shared_wake() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_id = u32::from(crtc);
     let crtc_key = output_crtc_key(&b, 0);
     b.pstate.armed_vblank_targets.insert(crtc_key, 0);
-    b.pstate
-        .absolute_vblank_targets
-        .entry(crtc_key)
-        .or_default()
-        .insert(50);
+    b.pstate.shared_wake_armed.insert(crtc_key);
 
     // Untagged (relative) event for the same CRTC.
     dispatch_test_sequence(&mut b, u64::from(crtc_id), 1_000_000, 50);
 
-    assert_eq!(
-        b.pstate.absolute_vblank_targets.get(&crtc_key).unwrap(),
-        &std::collections::BTreeSet::from([50u64]),
-        "an untagged event must not retire the absolute per-target set"
+    assert!(
+        b.pstate.shared_wake_armed.contains(&crtc_key),
+        "an untagged event spends only the relative idle slot"
     );
 }
 
 #[test]
-fn tagged_sequence_event_retires_targets_at_or_before_sequence_keeps_later() {
-    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
-    let crtc = b.platform.outputs[0].output.crtc;
-    let crtc_id = u32::from(crtc);
-    let crtc_key = output_crtc_key(&b, 0);
-    b.pstate
-        .absolute_vblank_targets
-        .entry(crtc_key)
-        .or_default()
-        .extend([40u64, 50, 60]);
-
-    dispatch_test_sequence(
-        &mut b,
-        crate::kms::render::backend::ABSOLUTE_SEQ_TAG | u64::from(crtc_id),
-        1_000_000,
-        50,
-    );
-
-    assert_eq!(
-        b.pstate.absolute_vblank_targets.get(&crtc_key).unwrap(),
-        &std::collections::BTreeSet::from([60u64]),
-        "targets <= sequence retire; later targets stay armed"
-    );
-    assert_eq!(
-        b.platform.present_get_ust_msc(crtc_key),
-        (50, 1_000),
-        "the general clock must advance on a TAGGED event too — Task 7's \
-             due rule rests on this"
-    );
-}
-
-#[test]
-fn absolute_seq_user_data_round_trips_through_on_crtc_sequence_event() {
+fn shared_wake_tagged_event_advances_completion_clock_and_clears_slot() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_id = u32::from(crtc);
     let crtc_key = output_crtc_key(&b, 0);
     b.pstate.armed_vblank_targets.insert(crtc_key, 0);
-    b.pstate
-        .absolute_vblank_targets
-        .entry(crtc_key)
-        .or_default()
-        .insert(50);
+    b.pstate.shared_wake_armed.insert(crtc_key);
 
-    // Uses the same producer `arm_present_absolute_vblank` feeds the
-    // ioctl, pinning that producer and consumer agree on the encoding.
+    // Uses the tagged user data that the shared wake feeds to the ioctl.
     dispatch_test_sequence(
         &mut b,
         crate::kms::render::backend::absolute_seq_user_data(crtc_id),
@@ -698,8 +672,8 @@ fn absolute_seq_user_data_round_trips_through_on_crtc_sequence_event() {
     );
 
     assert!(
-        !b.pstate.absolute_vblank_targets.contains_key(&crtc_key),
-        "the target must retire through the real producer encoding"
+        !b.pstate.shared_wake_armed.contains(&crtc_key),
+        "the shared slot must clear through the tagged event"
     );
     assert!(
         b.pstate.armed_vblank_targets.contains_key(&crtc_key),
@@ -708,80 +682,172 @@ fn absolute_seq_user_data_round_trips_through_on_crtc_sequence_event() {
 }
 
 #[test]
-fn clear_all_armed_vblank_targets_clears_absolute_targets_too() {
+fn clear_all_armed_vblank_targets_clears_shared_wake_too() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc_key = output_crtc_key(&b, 0);
     b.pstate.armed_vblank_targets.insert(crtc_key, 0);
-    b.pstate
-        .absolute_vblank_targets
-        .entry(crtc_key)
-        .or_default()
-        .insert(50);
+    b.pstate.shared_wake_armed.insert(crtc_key);
 
     b.clear_all_armed_vblank_targets();
 
     assert!(b.pstate.armed_vblank_targets.is_empty());
-    assert!(b.pstate.absolute_vblank_targets.is_empty());
+    assert!(b.pstate.shared_wake_armed.is_empty());
 }
 
 #[test]
-fn arm_present_absolute_vblank_with_dedups_same_target_one_kernel_call() {
+fn arm_present_shared_wake_with_dedups_one_kernel_call() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc_key = output_crtc_key(&b, 0);
     let mut calls = 0u32;
 
     let covered = b
-        .arm_present_absolute_vblank_with(crtc_key, &[500], |_, _| {
+        .arm_present_shared_wake_with(crtc_key, |_| {
             calls += 1;
             Ok(true)
         })
         .unwrap();
-    assert_eq!(covered, 1);
+    assert!(covered);
     assert_eq!(calls, 1);
 
-    // Re-arming the same target on the same CRTC must not re-issue the
-    // ioctl (real invariant: `calls` stays 1) — but it IS still
-    // covered by the earlier in-flight arm, so the return value must
-    // stay 1, not fall to 0. `Ok(0)`/`Err` mean "arm failed, caller
-    // must execute immediately" (spec §msc-due) — a still-parked,
-    // already-armed target must never read as that.
+    // An existing shared wake covers every future target on this CRTC.
     let covered2 = b
-        .arm_present_absolute_vblank_with(crtc_key, &[500], |_, _| {
+        .arm_present_shared_wake_with(crtc_key, |_| {
             calls += 1;
             Ok(true)
         })
         .unwrap();
-    assert_eq!(covered2, 1, "duplicate target stays covered, not 0");
-    assert_eq!(calls, 1, "duplicate target must not re-arm");
-
-    // A distinct target on the same CRTC still arms (own per-target
-    // set, unlike the relative arm's single in-flight slot).
-    let covered3 = b
-        .arm_present_absolute_vblank_with(crtc_key, &[600], |_, _| {
-            calls += 1;
-            Ok(true)
-        })
-        .unwrap();
-    assert_eq!(covered3, 1);
-    assert_eq!(calls, 2);
+    assert!(covered2, "an existing wake remains covered");
+    assert_eq!(calls, 1, "the slot prevents a second kernel arm");
 }
 
 #[test]
-fn arm_present_absolute_vblank_false_result_is_not_tracked_as_covered() {
+fn arm_present_shared_wake_false_result_is_not_tracked_as_covered() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc_key = output_crtc_key(&b, 0);
     let mut calls = 0;
 
-    let covered = b
-        .arm_present_absolute_vblank_with(crtc_key, &[500], |_, _| {
+    let armed = b
+        .arm_present_shared_wake_with(crtc_key, |_| {
             calls += 1;
             Ok(false)
         })
         .unwrap();
 
     assert_eq!(calls, 1);
-    assert_eq!(covered, 0);
-    assert!(b.pstate.absolute_vblank_targets.is_empty());
+    assert!(!armed);
+    assert!(b.pstate.shared_wake_armed.is_empty());
+}
+
+// Mutation: restore per-target sequence arms so each descending target queues another event.
+#[test]
+fn shared_wake_outstanding_arms_stay_bounded() {
+    let (mut backend, crtc_key, randr_crtc_id, source) = shared_wake_test_backend();
+    let mut state = ServerState::new();
+    const PARKED_WINDOW: u32 = 0x5f10;
+    seed_window(&mut backend, PARKED_WINDOW, None, 0, 0);
+    let crtc = backend.platform.outputs[0].output.crtc;
+    let mut issued = 0usize;
+    let mut delivered = 0usize;
+    let mut max_outstanding = 0usize;
+    let mut parked_targets = Vec::new();
+
+    for (iteration, target) in (1_u64..=140).rev().enumerate() {
+        parked_targets.push(target);
+        Backend::arm_idle_vblanks(&mut backend, randr_crtc_id, &[target])
+            .expect("relative idle arm");
+        assert!(
+            Backend::arm_present_shared_wake(&mut backend, randr_crtc_id)
+                .expect("tagged shared wake")
+        );
+        let outstanding_arms = source.legacy_vblank_arms().len();
+        issued += outstanding_arms.saturating_sub(issued - delivered);
+        let outstanding = issued - delivered;
+        max_outstanding = max_outstanding.max(outstanding);
+        assert!(
+            outstanding <= 2,
+            "outstanding tagged + idle arms: {outstanding}"
+        );
+
+        // A flip is still consumed while the tagged wake occupies its own slot.
+        let frame = u32::try_from(iteration + 10).unwrap();
+        source.queue_flip(crtc, frame);
+        drain_shared_wake_test_events(&mut backend, &mut state);
+        assert_eq!(
+            backend.platform.present_get_ust_msc(crtc_key).0,
+            u64::from(frame)
+        );
+
+        if (iteration + 1) % 64 == 0 {
+            let retiring = source.legacy_vblank_arms().len();
+            source.fire_legacy_vblank_arms(2_000_000 + i64::from(frame), frame + 1);
+            delivered += retiring;
+            drain_shared_wake_test_events(&mut backend, &mut state);
+        }
+    }
+
+    // Destroy the window while future targets remain parked. The queued wake
+    // survives and retires without another per-target arm.
+    Backend::destroy_subwindow(&mut backend, None, PARKED_WINDOW)
+        .expect("destroy the window with parked targets");
+    assert!(!backend.windows.contains_key(&PARKED_WINDOW));
+    parked_targets.clear();
+    let retiring = source.legacy_vblank_arms().len();
+    source.fire_legacy_vblank_arms(4_000_000, 200);
+    delivered += retiring;
+    drain_shared_wake_test_events(&mut backend, &mut state);
+
+    assert_eq!(max_outstanding, 2);
+    assert_eq!(issued - delivered, 0);
+    assert!(parked_targets.is_empty());
+    assert!(backend.pstate.shared_wake_armed.is_empty());
+    assert!(backend.pstate.armed_vblank_targets.is_empty());
+}
+
+// Mutation: never clear the tagged slot when its sequence event is delivered.
+#[test]
+fn shared_wake_rearms_only_after_its_event() {
+    let (mut backend, crtc_key, randr_crtc_id, source) = shared_wake_test_backend();
+    let mut state = ServerState::new();
+
+    assert!(Backend::arm_present_shared_wake(&mut backend, randr_crtc_id).unwrap());
+    assert!(Backend::arm_present_shared_wake(&mut backend, randr_crtc_id).unwrap());
+    assert_eq!(source.legacy_vblank_arms().len(), 1);
+    assert!(backend.pstate.shared_wake_armed.contains(&crtc_key));
+
+    source.fire_legacy_vblank_arms(1_000_000, 6);
+    drain_shared_wake_test_events(&mut backend, &mut state);
+    assert!(!backend.pstate.shared_wake_armed.contains(&crtc_key));
+
+    assert!(Backend::arm_present_shared_wake(&mut backend, randr_crtc_id).unwrap());
+    assert_eq!(source.legacy_vblank_arms().len(), 1);
+    assert!(backend.pstate.shared_wake_armed.contains(&crtc_key));
+}
+
+// Mutation: omit the tagged slot clear on DPMS or VT release.
+#[test]
+fn shared_wake_cleared_by_lifecycle_edges() {
+    use yserver_core::{
+        backend::Backend, core_loop::input_inventory::InputInventory, server::ServerState,
+    };
+
+    let (mut dpms, dpms_crtc, randr_crtc_id, source) = shared_wake_test_backend();
+    dpms.platform.for_tests_accept_output_power_commits();
+    dpms.pstate.shared_wake_armed.insert(dpms_crtc);
+    Backend::set_dpms_power(&mut dpms, 3).expect("DPMS off");
+    assert!(dpms.pstate.shared_wake_armed.is_empty());
+    // The fd-less fixture has no framebuffer for DPMS-on; restore its active
+    // state to exercise the next production arm call after the off edge.
+    dpms.kms_outputs_active = true;
+    assert!(Backend::arm_present_shared_wake(&mut dpms, randr_crtc_id).unwrap());
+    assert_eq!(source.legacy_vblank_arms().len(), 1);
+
+    let mut vt = KmsBackend::for_tests();
+    let vt_crtc = output_crtc_key(&vt, 0);
+    vt.pstate.shared_wake_armed.insert(vt_crtc);
+    let mut state = ServerState::new();
+    Backend::begin_vt_release(&mut vt);
+    Backend::finish_vt_release(&mut vt, &mut state, &InputInventory::new());
+    assert!(vt.pstate.shared_wake_armed.is_empty());
 }
 
 #[test]
@@ -1887,7 +1953,7 @@ fn direct_scanout_refresh_comparison_groups_near_equal_rates_only() {
 }
 
 #[test]
-fn arm_present_absolute_vblank_with_arms_only_selected_crtc() {
+fn arm_present_shared_wake_with_arms_only_selected_crtc() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc0 = output_crtc_key(&b, 0);
     push_test_output(&mut b, 2);
@@ -1898,43 +1964,40 @@ fn arm_present_absolute_vblank_with_arms_only_selected_crtc() {
     b.platform.ust_msc.insert(crtc1, (50, 50_000));
 
     let mut armed_on: Vec<CrtcKey> = Vec::new();
-    let target = u64::from(u32::MAX) + 999;
-    let covered = b
-        .arm_present_absolute_vblank_with(crtc0, &[target], |crtc_key, armed_target| {
+    let armed = b
+        .arm_present_shared_wake_with(crtc0, |crtc_key| {
             armed_on.push(crtc_key);
-            assert_eq!(armed_target, target, "MSC must stay full-width u64");
             Ok(true)
         })
         .unwrap();
 
-    assert_eq!(covered, 1);
+    assert!(armed);
     assert_eq!(
         armed_on,
         vec![crtc0],
         "must arm the selected CRTC even when another domain has a larger counter"
     );
     assert!(
-        !b.pstate.absolute_vblank_targets.contains_key(&crtc1),
+        !b.pstate.shared_wake_armed.contains(&crtc1),
         "the unrelated CRTC must not gain an armed entry"
     );
 }
 
 #[test]
-fn arm_present_absolute_vblank_with_uses_selected_crtc_before_first_sample() {
+fn arm_present_shared_wake_with_uses_selected_crtc_before_first_sample() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let first = output_crtc_key(&b, 0);
     assert!(b.platform.ust_msc.is_empty());
 
     let mut armed_on = Vec::new();
-    let covered = b
-        .arm_present_absolute_vblank_with(first, &[17], |crtc_key, target| {
+    let armed = b
+        .arm_present_shared_wake_with(first, |crtc_key| {
             armed_on.push(crtc_key);
-            assert_eq!(target, 17);
             Ok(true)
         })
         .unwrap();
 
-    assert_eq!(covered, 1);
+    assert!(armed);
     assert_eq!(armed_on, vec![first]);
 }
 
@@ -2166,11 +2229,7 @@ fn zero_device_backend_disables_dri3_and_vblank_arms() {
             .expect("relative arm no-op"),
         0
     );
-    assert_eq!(
-        b.arm_present_absolute_vblank(0, &[1])
-            .expect("absolute arm no-op"),
-        0
-    );
+    assert!(!Backend::arm_present_shared_wake(&mut b, 0).expect("shared wake no-op"));
     assert!(b.present_scanout_blackout());
 }
 
