@@ -31,19 +31,6 @@ fn set_present_client(
     direct.event.client_id = yserver_protocol::x11::ClientId(client_id);
 }
 
-fn submit_output_direct(
-    fixture: &mut super::super::recording_scene::RecordingSceneFixture,
-    direct: &super::super::recording_scene::DirectPresentSetup,
-    output_idx: usize,
-) -> (AtomicCommitRecord, Vec<AtomicCommitRecord>) {
-    let fd = super::super::direct_unflip::fd(fixture);
-    let offset = super::super::direct_unflip::record_count(fixture, fd);
-    let direct_record =
-        super::super::direct_unflip::submit_output_present_via_backend(fixture, direct, output_idx);
-    let records = super::super::direct_unflip::records_since(fixture, fd, offset);
-    (direct_record, records)
-}
-
 fn retire_output_direct(
     fixture: &mut super::super::recording_scene::RecordingSceneFixture,
     direct: &super::super::recording_scene::DirectPresentSetup,
@@ -199,11 +186,13 @@ fn vrr_two_direct_outputs_clear_independently_on_owner_exit() {
         fixture.events.backend.platform.outputs[1].output.crtc,
     ];
 
-    let (record0, _) = submit_output_direct(&mut fixture, &output0, 0);
+    let record0 =
+        super::super::direct_unflip::submit_output_present_via_backend(&mut fixture, &output0, 0);
     assert!(contains_vrr_property(&record0, crtcs[0], 1));
     assert!(!has_vrr_property(&record0, crtcs[1]));
     retire_output_direct(&mut fixture, &output0, &record0, 101);
-    let (record1, _) = submit_output_direct(&mut fixture, &output1, 1);
+    let record1 =
+        super::super::direct_unflip::submit_output_present_via_backend(&mut fixture, &output1, 1);
     assert!(contains_vrr_property(&record1, crtcs[1], 1));
     assert!(!has_vrr_property(&record1, crtcs[0]));
     retire_output_direct(&mut fixture, &output1, &record1, 102);
@@ -274,10 +263,12 @@ fn vrr_incapable_output_never_enables_while_capable_output_does() {
     let crtc0 = fixture.events.backend.platform.outputs[0].output.crtc;
     let crtc1 = fixture.events.backend.platform.outputs[1].output.crtc;
 
-    let (record0, _) = submit_output_direct(&mut fixture, &output0, 0);
+    let record0 =
+        super::super::direct_unflip::submit_output_present_via_backend(&mut fixture, &output0, 0);
     assert!(contains_vrr_property(&record0, crtc0, 1));
     retire_output_direct(&mut fixture, &output0, &record0, 111);
-    let (record1, _) = submit_output_direct(&mut fixture, &output1, 1);
+    let record1 =
+        super::super::direct_unflip::submit_output_present_via_backend(&mut fixture, &output1, 1);
     assert!(!has_vrr_property(&record1, crtc1));
     assert!(!contains_vrr_property(&record1, crtc1, 1));
     retire_output_direct(&mut fixture, &output1, &record1, 112);
@@ -315,7 +306,8 @@ fn vrr_direct_output_does_not_enable_composed_output() {
     let output1 = fixture.install_direct_output_present(1, 20_120, 0);
     let crtc0 = fixture.events.backend.platform.outputs[0].output.crtc;
     let crtc1 = fixture.events.backend.platform.outputs[1].output.crtc;
-    let (direct_record, _) = submit_output_direct(&mut fixture, &output1, 1);
+    let direct_record =
+        super::super::direct_unflip::submit_output_present_via_backend(&mut fixture, &output1, 1);
     assert!(contains_vrr_property(&direct_record, crtc1, 1));
     retire_output_direct(&mut fixture, &output1, &direct_record, 121);
 
@@ -392,10 +384,12 @@ fn vrr_property_delete_is_scoped_to_its_output_client() {
         fixture.events.backend.platform.outputs[1].output.crtc,
     ];
 
-    let (record0, _) = submit_output_direct(&mut fixture, &output0, 0);
+    let record0 =
+        super::super::direct_unflip::submit_output_present_via_backend(&mut fixture, &output0, 0);
     assert!(contains_vrr_property(&record0, crtcs[0], 1));
     retire_output_direct(&mut fixture, &output0, &record0, 131);
-    let (record1, _) = submit_output_direct(&mut fixture, &output1, 1);
+    let record1 =
+        super::super::direct_unflip::submit_output_present_via_backend(&mut fixture, &output1, 1);
     assert!(contains_vrr_property(&record1, crtcs[1], 1));
     retire_output_direct(&mut fixture, &output1, &record1, 132);
     assert!(
@@ -526,21 +520,29 @@ fn vrr_cursor_deadline_is_independent_per_output_crtc() {
     let crtc1 = fixture.scene.events.backend.platform.outputs[1].output.crtc;
     let device_fd = fixture.scene.kms_fd(1);
 
-    let mut output0 = fixture.scene.install_direct_output_present(0, 20_140, 0);
-    output0.candidate.variable_refresh = false;
+    let output0 = fixture.scene.install_direct_output_present(0, 20_140, 0);
     Backend::set_cursor_hidden(&mut fixture.scene.events.backend, false);
     settle_vrr_cursor_output(&mut fixture, &mut delivered, 0);
-    let (direct_record0, _) = submit_output_direct(&mut fixture.scene, &output0, 0);
-    assert!(!contains_vrr_property(&direct_record0, crtc0, 1));
+    let direct_record0 = super::super::direct_unflip::submit_output_present_via_backend(
+        &mut fixture.scene,
+        &output0,
+        0,
+    );
+    assert!(contains_vrr_property(&direct_record0, crtc0, 1));
     retire_output_direct(&mut fixture.scene, &output0, &direct_record0, 140);
     remember_retired_cursor_records(&[direct_record0], &mut delivered);
     cursor_support::drain_unretired_output_events(&mut fixture, &mut delivered, 0);
 
-    let output1 = fixture.scene.install_direct_output_present(1, 20_141, 0);
+    let mut output1 = fixture.scene.install_direct_output_present(1, 20_141, 0);
+    output1.candidate.variable_refresh = false;
     Backend::set_cursor_hidden(&mut fixture.scene.events.backend, false);
     settle_vrr_cursor_output(&mut fixture, &mut delivered, 1);
-    let (direct_record, _) = submit_output_direct(&mut fixture.scene, &output1, 1);
-    assert!(contains_vrr_property(&direct_record, crtc1, 1));
+    let direct_record = super::super::direct_unflip::submit_output_present_via_backend(
+        &mut fixture.scene,
+        &output1,
+        1,
+    );
+    assert!(!contains_vrr_property(&direct_record, crtc1, 1));
     retire_output_direct(&mut fixture.scene, &output1, &direct_record, 142);
     remember_retired_cursor_records(&[direct_record], &mut delivered);
     cursor_support::drain_unretired_output_events(&mut fixture, &mut delivered, 1);
@@ -555,13 +557,14 @@ fn vrr_cursor_deadline_is_independent_per_output_crtc() {
             .is_some()
     );
     assert!(
-        !fixture.scene.events.backend.platform.outputs[0]
+        fixture.scene.events.backend.platform.outputs[0]
             .output
             .vrr_committed
-            .get()
+            .get(),
+        "output 0 owns a committed VRR frame"
     );
     assert!(
-        fixture.scene.events.backend.platform.outputs[1]
+        !fixture.scene.events.backend.platform.outputs[1]
             .output
             .vrr_committed
             .get()
@@ -573,53 +576,127 @@ fn vrr_cursor_deadline_is_independent_per_output_crtc() {
     Backend::warp_pointer_root(
         &mut fixture.scene.events.backend,
         &mut fixture.scene.events.state,
+        x0 + 5,
+        120,
+    );
+    Backend::maybe_composite(&mut fixture.scene.events.backend)
+        .expect("start output 0's independent 33 ms cursor deadline");
+    let initial_cursor_records =
+        super::super::direct_unflip::records_since(&fixture.scene, device_fd, start);
+    assert!(
+        initial_cursor_records.iter().any(|record| {
+            record.kind == AtomicCommitKind::CursorOnly
+                && record.result == ScriptedResult::Ok
+                && record.events.iter().any(|event| event.crtc == crtc1)
+                && super::super::support::accepted_event_id(record).is_some()
+        }),
+        "output 1 commits its cursor while its direct frame still has VRR off"
+    );
+    assert!(
+        initial_cursor_records.iter().all(|record| {
+            record.kind != AtomicCommitKind::CursorOnly
+                || !record.events.iter().any(|event| event.crtc == crtc0)
+        }),
+        "output 0's VRR cursor remains held until its own deadline"
+    );
+    cursor_support::retire_pending_output(&mut fixture.scene.events, &mut delivered, 1, 143);
+    assert_eq!(
+        Backend::next_wakeup(&fixture.scene.events.backend),
+        Some(base + Duration::from_millis(33)),
+        "output 0 starts its own cursor deadline"
+    );
+
+    advance_vrr_cursor_clock(&elapsed_ns, Duration::from_millis(10));
+    output1.candidate.variable_refresh = true;
+    let vrr_enable_record =
+        super::submit_direct_successor(&mut fixture.scene, &mut output1, device_fd);
+    assert!(contains_vrr_property(&vrr_enable_record, crtc1, 1));
+    retire_output_direct(&mut fixture.scene, &output1, &vrr_enable_record, 144);
+    remember_retired_cursor_records(&[vrr_enable_record], &mut delivered);
+    assert!(
+        fixture.scene.events.backend.platform.outputs[1]
+            .output
+            .vrr_committed
+            .get()
+    );
+
+    let cursor_start = super::super::direct_unflip::record_count(&fixture.scene, device_fd);
+    Backend::warp_pointer_root(
+        &mut fixture.scene.events.backend,
+        &mut fixture.scene.events.state,
         x1,
         130,
     );
     Backend::maybe_composite(&mut fixture.scene.events.backend)
-        .expect("hold output 1 cursor motion and submit output 0 cursor work");
-    let records = super::super::direct_unflip::records_since(&fixture.scene, device_fd, start);
-    assert!(
-        records.iter().any(|record| {
-            record.kind == AtomicCommitKind::CursorOnly
-                && record.result == ScriptedResult::Ok
-                && record.events.iter().any(|event| event.crtc == crtc0)
-                && super::super::support::accepted_event_id(record).is_some()
-        }),
-        "output 0's cursor-only commit is not held by output 1's VRR deadline; records={records:?}; next_wakeup={:?}; outputs=({crtc0:?},{crtc1:?})",
-        Backend::next_wakeup(&fixture.scene.events.backend)
-    );
+        .expect("hold output 1 cursor motion without resetting output 0's deadline");
+    let records =
+        super::super::direct_unflip::records_since(&fixture.scene, device_fd, cursor_start);
     assert!(
         records.iter().all(|record| {
             record.kind != AtomicCommitKind::CursorOnly
-                || !record.events.iter().any(|event| event.crtc == crtc1)
+                || super::super::support::accepted_event_id(record).is_none()
         }),
-        "output 1's moved cursor remains held before its deadline"
+        "both output cursor moves remain held before their own deadlines; records={records:?}"
     );
     assert_eq!(
         Backend::next_wakeup(&fixture.scene.events.backend),
         Some(base + Duration::from_millis(33)),
-        "next_wakeup reports output 1's independent 33 ms deadline"
+        "output 1's later motion does not reset output 0's 33 ms deadline"
     );
-    cursor_support::drain_unretired_output_events(&mut fixture, &mut delivered, 0);
 
-    advance_vrr_cursor_clock(&elapsed_ns, Duration::from_millis(32));
+    advance_vrr_cursor_clock(&elapsed_ns, Duration::from_millis(23));
     Backend::maybe_composite(&mut fixture.scene.events.backend)
-        .expect("output 1 remains held one millisecond before its deadline");
+        .expect("service output 0's deadline while output 1 remains held");
+    let output0_deadline_records =
+        super::super::direct_unflip::records_since(&fixture.scene, device_fd, cursor_start)
+            .into_iter()
+            .filter(|record| {
+                record.kind == AtomicCommitKind::CursorOnly
+                    && record.result == ScriptedResult::Ok
+                    && record.events.iter().any(|event| event.crtc == crtc0)
+                    && super::super::support::accepted_event_id(record).is_some()
+            })
+            .collect::<Vec<_>>();
+    assert_eq!(
+        output0_deadline_records.len(),
+        1,
+        "output 0 commits at its original deadline despite output 1 motion"
+    );
     assert!(
-        super::super::direct_unflip::records_since(&fixture.scene, device_fd, start)
+        super::super::direct_unflip::records_since(&fixture.scene, device_fd, cursor_start)
             .iter()
             .all(|record| {
                 record.kind != AtomicCommitKind::CursorOnly
                     || !record.events.iter().any(|event| event.crtc == crtc1)
             }),
-        "output 1 has no cursor-only commit before 33 ms"
+        "output 1 remains held until 33 ms after its own motion; records={:?}; next_wakeup={:?}",
+        super::super::direct_unflip::records_since(&fixture.scene, device_fd, cursor_start),
+        Backend::next_wakeup(&fixture.scene.events.backend)
+    );
+    cursor_support::retire_pending_output(&mut fixture.scene.events, &mut delivered, 0, 145);
+    assert_eq!(
+        Backend::next_wakeup(&fixture.scene.events.backend),
+        Some(base + Duration::from_millis(43)),
+        "output 1 retains its own deadline 33 ms after its later motion"
+    );
+
+    advance_vrr_cursor_clock(&elapsed_ns, Duration::from_millis(9));
+    Backend::maybe_composite(&mut fixture.scene.events.backend)
+        .expect("output 1 remains held one millisecond before its deadline");
+    assert!(
+        super::super::direct_unflip::records_since(&fixture.scene, device_fd, cursor_start)
+            .iter()
+            .all(|record| {
+                record.kind != AtomicCommitKind::CursorOnly
+                    || !record.events.iter().any(|event| event.crtc == crtc1)
+            }),
+        "output 1 has no cursor-only commit before its own 33 ms deadline"
     );
     advance_vrr_cursor_clock(&elapsed_ns, Duration::from_millis(1));
     Backend::maybe_composite(&mut fixture.scene.events.backend)
         .expect("service output 1's deadline");
     let deadline_records =
-        super::super::direct_unflip::records_since(&fixture.scene, device_fd, start)
+        super::super::direct_unflip::records_since(&fixture.scene, device_fd, cursor_start)
             .into_iter()
             .filter(|record| {
                 record.kind == AtomicCommitKind::CursorOnly
@@ -633,11 +710,11 @@ fn vrr_cursor_deadline_is_independent_per_output_crtc() {
         1,
         "output 1's pending cursor position commits once when its own deadline expires"
     );
-    cursor_support::retire_pending_output(&mut fixture.scene.events, &mut delivered, 1, 142);
+    cursor_support::retire_pending_output(&mut fixture.scene.events, &mut delivered, 1, 146);
 
-    let output0_replacement = unmap_output_direct(&mut fixture.scene, &output0, 0, 143);
+    let output0_replacement = unmap_output_direct(&mut fixture.scene, &output0, 0, 147);
     remember_retired_cursor_records(&output0_replacement, &mut delivered);
-    let output1_replacement = unmap_output_direct(&mut fixture.scene, &output1, 1, 145);
+    let output1_replacement = unmap_output_direct(&mut fixture.scene, &output1, 1, 149);
     remember_retired_cursor_records(&output1_replacement, &mut delivered);
     Backend::set_cursor_hidden(&mut fixture.scene.events.backend, true);
     for output_idx in 0..2 {

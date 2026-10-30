@@ -909,40 +909,12 @@ fn present_request_state(
         backend::{PixmapHandle, WindowHandle},
         randr::{RR_ROTATE_0, RandrOutput, RandrState},
         resources::{ROOT_VISUAL, ROOT_WINDOW},
-        server::{ClientState, ServerState},
-        transport::Transport,
+        server::ServerState,
     };
-    use yserver_protocol::x11::{
-        ClientByteOrder, ClientId, CreatePixmapRequest, CreateWindowRequest, ResourceId,
-    };
+    use yserver_protocol::x11::{ClientId, CreatePixmapRequest, CreateWindowRequest, ResourceId};
 
     let mut state = ServerState::new();
-    let (writer, _peer) = Transport::pair().expect("test X11 transport");
-    state.clients.insert(
-        1,
-        ClientState {
-            writer: Arc::new(Mutex::new(writer)),
-            is_local: true,
-            fd_passing: true,
-            internal: false,
-            byte_order: ClientByteOrder::LittleEndian,
-            last_sequence: Arc::new(AtomicU16::new(0)),
-            resource_id_base: 0,
-            resource_id_mask: u32::MAX,
-            event_masks: HashMap::new(),
-            save_set: HashSet::new(),
-            big_requests_enabled: false,
-            xi2_masks: HashMap::new(),
-            xi1_event_classes: HashSet::new(),
-            xi1_window_event_classes: HashMap::new(),
-            outbound: Default::default(),
-            watching_writable: false,
-            write_failed: false,
-            gone: false,
-            focused_window: ROOT_WINDOW,
-            reader_control: None,
-        },
-    );
+    add_present_test_client(&mut state, 1);
     let window = direct.target_xid;
     let pixmap = direct.candidate.src_pixmap_xid;
     let width = direct.candidate.src_width;
@@ -1010,7 +982,7 @@ fn add_present_test_client(state: &mut yserver_core::server::ServerState, client
     use yserver_core::{resources::ROOT_WINDOW, server::ClientState, transport::Transport};
     use yserver_protocol::x11::ClientByteOrder;
 
-    let (writer, _peer) = Transport::pair().expect("second VRR test client transport");
+    let (writer, _peer) = Transport::pair().expect("VRR test client transport");
     state.clients.insert(
         client_id,
         ClientState {
