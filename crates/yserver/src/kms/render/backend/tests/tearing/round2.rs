@@ -290,7 +290,7 @@ fn run_task6_present_and_xtest_motion_keep_cursor_compose_cap_under_run_core_loa
     let refresh_interval = backend
         .pstate
         .tearing
-        .cursor_compose_interval(&backend.platform);
+        .cursor_compose_interval(&backend.platform, &backend.tearing_scope_outputs());
     let (device_stream, event_peer) =
         std::os::unix::net::UnixStream::pair().expect("DRM test socket");
     device_stream
@@ -840,7 +840,7 @@ fn task5_handoff_unflip_starts_cursor_compose_interval() {
     let interval = backend
         .pstate
         .tearing
-        .cursor_compose_interval(&backend.platform);
+        .cursor_compose_interval(&backend.platform, &backend.tearing_scope_outputs());
     let interval_ns = u64::try_from(interval.as_nanos()).unwrap();
     scheduler_time_ns.store(interval_ns / 2, Ordering::SeqCst);
     Backend::warp_pointer_root(&mut backend, &mut state, 121, 100);
@@ -956,7 +956,7 @@ fn task5_client_frame_is_never_deferred_by_cursor_cap() {
     let interval = backend
         .pstate
         .tearing
-        .cursor_compose_interval(&backend.platform);
+        .cursor_compose_interval(&backend.platform, &backend.tearing_scope_outputs());
     let last_compose = std::time::Instant::now() + std::time::Duration::from_secs(30);
     backend.pstate.tearing.last_cursor_compose = Some(last_compose);
     Backend::warp_pointer_root(&mut backend, &mut state, 101, 100);

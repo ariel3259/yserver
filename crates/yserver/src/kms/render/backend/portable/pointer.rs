@@ -629,34 +629,53 @@ impl<P: Platform> XBackend<P> {
                 })
                 .unwrap_or((0, 0, 0, 0));
             let tearing_active = P::tearing_active(self);
+            #[allow(clippy::cast_possible_truncation)]
+            let (cursor_x, cursor_y) = (new_x as i64, new_y as i64);
+            let tearing_intersects_owner = tearing_active
+                && P::tearing_cursor_intersects_owner(
+                    self,
+                    cursor_x,
+                    cursor_y,
+                    i64::from(hot_x),
+                    i64::from(hot_y),
+                    i64::from(cw),
+                    i64::from(ch),
+                );
             if self.effective_cursor_hidden() {
                 // The effective cursor has no visible pixels, so pointer
                 // motion has no cursor sprite to move.
-            } else if tearing_active
-                || matches!(
+            } else {
+                let hardware_cursor = matches!(
                     cursor_mode,
                     crate::kms::render::scene::CursorPlaneMode::Hw
                         | crate::kms::render::scene::CursorPlaneMode::Mixed
-                )
-            {
-                if tearing_active {
-                    // Keep Root tearing motion on the capped scene-wake path.
-                    // The KMS hook also moves an independent Output owner's
-                    // visible hardware cursor.
+                );
+                if tearing_intersects_owner {
+                    // Keep motion on the tearing owner's capped scene-wake
+                    // path; foreign outputs continue through their own cursor
+                    // policy below.
                     P::cursor_motion_during_tearing(self, true);
                 }
-                let mixed = matches!(
-                    cursor_mode,
-                    crate::kms::render::scene::CursorPlaneMode::Mixed
-                );
-                #[allow(clippy::cast_possible_truncation)]
-                let (cx, cy) = (new_x as i32, new_y as i32);
-                P::move_hw_cursor(self, mixed, (cx, cy), (hot_x, hot_y), (cw, ch));
-            } else {
-                // Software cursors need repaint; an all-Hidden cursor also
-                // needs a scene pass so motion back onto an output can be
-                // assigned there again.
-                self.scene.wake_for_damage();
+                if hardware_cursor {
+                    let mixed = matches!(
+                        cursor_mode,
+                        crate::kms::render::scene::CursorPlaneMode::Mixed
+                    );
+                    #[allow(clippy::cast_possible_truncation)]
+                    let (cx, cy) = (new_x as i32, new_y as i32);
+                    P::move_hw_cursor(self, mixed, (cx, cy), (hot_x, hot_y), (cw, ch));
+                } else if tearing_active && !tearing_intersects_owner {
+                    // A software cursor on a composed foreign output remains
+                    // cursor-only work. Retain the owner's deferred wake too:
+                    // a foreign compose can consume this shared dirty bit
+                    // before the tearing output gets its cursor cleanup.
+                    P::cursor_motion_during_tearing(self, true);
+                } else if !tearing_intersects_owner {
+                    // Software cursors need repaint; an all-Hidden cursor
+                    // also needs a scene pass so motion back onto an output
+                    // can be assigned there again.
+                    self.scene.wake_for_damage();
+                }
             }
         }
         let prev = server_state.barrier_bypass;

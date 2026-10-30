@@ -64,7 +64,11 @@ impl Platform for PlatformBackend {
         b.pstate.tearing.is_on()
     }
 
-    fn cursor_intersects_outputs(
+    fn tearing_cursor_suppression_mask(b: &KmsBackend, _output_count: usize) -> Vec<bool> {
+        b.tearing_cursor_suppression_mask()
+    }
+
+    fn tearing_cursor_intersects_owner(
         b: &KmsBackend,
         cursor_x: i64,
         cursor_y: i64,
@@ -73,7 +77,26 @@ impl Platform for PlatformBackend {
         width: i64,
         height: i64,
     ) -> bool {
-        b.platform.outputs.iter().any(|output| {
+        let outputs = b.tearing_scope_outputs();
+        Self::cursor_intersects_outputs(
+            b, &outputs, cursor_x, cursor_y, hot_x, hot_y, width, height,
+        )
+    }
+
+    fn cursor_intersects_outputs(
+        b: &KmsBackend,
+        output_indices: &[usize],
+        cursor_x: i64,
+        cursor_y: i64,
+        hot_x: i64,
+        hot_y: i64,
+        width: i64,
+        height: i64,
+    ) -> bool {
+        output_indices.iter().any(|&output_idx| {
+            let Some(output) = b.platform.outputs.get(output_idx) else {
+                return false;
+            };
             let dx = cursor_x - hot_x - i64::from(output.x);
             let dy = cursor_y - hot_y - i64::from(output.y);
             dx < i64::from(output.width)
@@ -95,7 +118,11 @@ impl Platform for PlatformBackend {
 
         b.scene.wake_for_cursor_damage();
         let now = b.monotonic_now();
-        let interval = b.pstate.tearing.cursor_compose_interval(&b.platform);
+        let outputs = b.tearing_scope_outputs();
+        let interval = b
+            .pstate
+            .tearing
+            .cursor_compose_interval(&b.platform, &outputs);
         match b.pstate.tearing.last_cursor_compose {
             Some(last_compose) if now < last_compose + interval => {
                 b.pstate.tearing.deferred_cursor_wake = Some(last_compose + interval);

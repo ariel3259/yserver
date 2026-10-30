@@ -66,6 +66,13 @@ impl RecordingSceneFixtureGuard {
             .finish_after_normal_drain();
     }
 
+    pub(crate) fn finish(mut self) {
+        self.0
+            .take()
+            .expect("recording scene fixture guard owns its fixture")
+            .finish();
+    }
+
     pub(crate) fn events_mut(&mut self) -> &mut super::support::AtomicEventFixture {
         &mut self
             .0
@@ -136,6 +143,33 @@ impl RecordingSceneFixture {
         Ok(Some(Self {
             events: AtomicEventFixture::from_backend(backend),
             readiness,
+            extra_drawables: Vec::new(),
+        }))
+    }
+
+    /// A copied scene on one output that covers only part of the root. This
+    /// keeps a test candidate in `Output(0)` while the copied render is still
+    /// waiting for GPU readiness and has no accepted CRTC commit.
+    pub(crate) fn with_copied_output_geometry(
+        screen_size: (u16, u16),
+        output_geometry: &[(i32, i32, u16, u16, u32)],
+    ) -> Result<Option<Self>, String> {
+        let Some(mut backend) =
+            build_recording_scene_backend_with_geometry(false, screen_size, output_geometry)?
+        else {
+            return Ok(None);
+        };
+        if output_geometry.len() != 1 {
+            return Err("copied recording scene fixture supports one output".to_owned());
+        }
+        install_copied_route(&mut backend, false)?;
+        let observer = Rc::new(RecordingRenderCompletionReadiness::default());
+        backend
+            .platform
+            .for_tests_set_render_completion_readiness(Rc::clone(&observer));
+        Ok(Some(Self {
+            events: AtomicEventFixture::from_backend(backend),
+            readiness: Some(observer),
             extra_drawables: Vec::new(),
         }))
     }

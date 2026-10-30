@@ -17,19 +17,8 @@ use std::rc::Rc;
 use yserver_core::backend::PresentScanoutCandidate;
 
 impl KmsBackendState {
-    /// Ask every active direct owner to hand its outputs back to the scene.
-    pub(in crate::kms::render::backend) fn request_direct_unflip(&mut self, reason: &'static str) {
-        for scope in self.direct.active_scopes() {
-            self.request_direct_unflip_for(scope, reason);
-        }
-    }
-
-    /// Ask the owner of `scope` to hand its outputs back to the scene.
-    pub(in crate::kms::render::backend) fn request_direct_unflip_for(
-        &mut self,
-        scope: DirectScope,
-        reason: &'static str,
-    ) {
+    /// Record an unflip request after the backend has handled queued-entry fallback.
+    pub(super) fn mark_direct_unflip_for(&mut self, scope: DirectScope, reason: &'static str) {
         let Some(owner) = self.direct.get_mut(scope) else {
             return;
         };
@@ -50,17 +39,20 @@ impl KmsBackendState {
         owner.hold_direct = false;
     }
 
-    /// The active owners whose pending, queued or current frame names `id`
-    /// as its source or fallback target.
-    pub(in crate::kms::render::backend) fn direct_scopes_referencing_drawable(
+    /// The active owners whose pending, queued or current frame names any of
+    /// `ids` as its source or fallback target. Keep aggregation here so both
+    /// backend cancellation and state-only retirement use the same resolver.
+    pub(in crate::kms::render::backend) fn direct_scopes_referencing_drawables(
         &self,
-        id: DrawableId,
+        ids: &[DrawableId],
     ) -> Vec<DirectScope> {
-        self.direct
-            .active_scopes()
-            .into_iter()
-            .filter(|&scope| {
-                self.direct.get(scope).is_some_and(|owner| {
+        let mut scopes = Vec::new();
+        for &id in ids {
+            for scope in self.direct.active_scopes() {
+                if scopes.contains(&scope) {
+                    continue;
+                }
+                let references_id = self.direct.get(scope).is_some_and(|owner| {
                     [
                         owner.pending.as_ref(),
                         owner.queued_successor.as_ref(),
@@ -69,28 +61,13 @@ impl KmsBackendState {
                     .into_iter()
                     .flatten()
                     .any(|frame| frame.source_id == id || frame.fallback_target.backing_id() == id)
-                })
-            })
-            .collect()
-    }
-
-    /// Unflip every owner that holds one of `ids`, and only those.
-    pub(in crate::kms::render::backend) fn request_direct_unflip_referencing(
-        &mut self,
-        ids: &[DrawableId],
-        reason: &'static str,
-    ) {
-        let mut scopes: Vec<DirectScope> = Vec::new();
-        for &id in ids {
-            for scope in self.direct_scopes_referencing_drawable(id) {
-                if !scopes.contains(&scope) {
+                });
+                if references_id {
                     scopes.push(scope);
                 }
             }
         }
-        for scope in scopes {
-            self.request_direct_unflip_for(scope, reason);
-        }
+        scopes
     }
 
     /// Every member of a `Complete` rotation that holds `id`, and `id`.
@@ -112,7 +89,11 @@ impl KmsBackendState {
         self.scanout_m1.remove(id);
         let members = self.complete_rotation_members_with(id);
         if self.server_scanout.retire(id) {
-            self.request_direct_unflip_referencing(&members, "server_source_retired");
+            // Promoted server-owned sources are admitted as Root candidates only, so
+            // this state-only callback cannot reference a queued Output first entry.
+            for scope in self.direct_scopes_referencing_drawables(&members) {
+                self.mark_direct_unflip_for(scope, "server_source_retired");
+            }
         }
     }
 }
@@ -170,7 +151,7 @@ impl KmsBackend {
             .unwrap_or_default();
         let observation = self.pstate.server_scanout.observe(dest_id, source_id);
         if observation.left_complete {
-            self.pstate.request_direct_unflip_referencing(
+            self.request_direct_unflip_referencing(
                 &previous_members,
                 "server_source_rotation_changed",
             );
@@ -274,10 +255,9 @@ impl KmsBackend {
         }
         // Unflip whichever owner shows the source, or the rotation it left.
         if left_complete {
-            self.pstate.request_direct_unflip_referencing(&held, reason);
+            self.request_direct_unflip_referencing(&held, reason);
         } else {
-            self.pstate
-                .request_direct_unflip_referencing(&[source_id], reason);
+            self.request_direct_unflip_referencing(&[source_id], reason);
         }
         self.release_unreferenced_server_scanout();
     }
@@ -379,8 +359,7 @@ impl KmsBackend {
         }
         let wait = self.pstate.direct_source_cpu_waiter;
         wait(self, source_id).inspect_err(|_| {
-            self.pstate
-                .request_direct_unflip_referencing(&[source_id], "server_source_fence_failed");
+            self.request_direct_unflip_referencing(&[source_id], "server_source_fence_failed");
         })
     }
 
@@ -408,7 +387,7 @@ impl KmsBackend {
     ) -> bool {
         !self
             .pstate
-            .direct_scopes_referencing_drawable(id)
+            .direct_scopes_referencing_drawables(&[id])
             .is_empty()
     }
 

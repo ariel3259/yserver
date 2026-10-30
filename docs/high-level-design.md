@@ -217,10 +217,10 @@ monitor can scan out there while the others compose at their own rates,
 with no limit on the number of monitors. A whole-screen window keeps
 grouped direct scanout when all outputs share the primary device and
 their refresh rates are within 0.5%. A Present selecting another
-monitor's CRTC is composed. Tearing requires Root direct scanout (single
-monitor, or a whole-screen window on same-refresh outputs); a fullscreen
-client on one monitor that disables V-Sync is flipped synchronized while
-other monitors are on. yserver advertises
+monitor's CRTC is composed. Tearing has one direct owner at a time and may
+belong to a fullscreen client on one monitor while other monitors are on. A
+second client asking to tear stays direct with synchronized flips until the
+current owner releases tearing. A paused owner keeps tearing. yserver advertises
 `PresentCapabilityAsync`, not `PresentCapabilityAsyncMayTear`.
 
 VRR is off by default. `--vrr` honors `_VARIABLE_REFRESH` (format 32,
@@ -237,9 +237,11 @@ seen on Xorg, is that a system-tray icon such as Steam's can create an
 override-redirect window above the fullscreen game, preventing Muffin
 from unredirecting it and keeping VRR off ([upstream issue
 #12687](https://github.com/linuxmint/cinnamon/issues/12687)). A desktop
-without a compositor, such as i3, is unaffected. VRR with multiple
-monitors enabled is validated in a later change. Color management / HDR
-is a valid future direction but not yet implemented.
+without a compositor, such as i3, is unaffected. VRR is per monitor: each
+capable output uses VRR while its own fullscreen client scans out directly
+and asks for it. Several monitors can use VRR at once; others keep their
+fixed refresh. Color management / HDR is a valid future direction but not
+yet implemented.
 
 ## What's not in this document
 

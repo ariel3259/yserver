@@ -3204,14 +3204,14 @@ fn cursor_image_change_with_pending_ack_on_other_output_keeps_owner() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: let Output candidates reach tearing entry.
+// Mutation: make a Root-only tearing scope or let the second Output take tearing.
 fn output_owner_async_presents_flip_synchronized() {
     let Some((mut fixture, mut delivered, hardware, output1_direct)) =
         held_output_direct_with_two_outputs(
             721,
             1,
-            1,
-            (850, 90),
+            0,
+            (100, 90),
             yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
         )
     else {
@@ -3220,6 +3220,31 @@ fn output_owner_async_presents_flip_synchronized() {
     };
     let crtc1 = fixture.scene.events.backend.platform.outputs[1].output.crtc;
     let crtc0 = fixture.scene.events.backend.platform.outputs[0].output.crtc;
+    let mut async_candidate = output1_direct.candidate;
+    async_candidate.present_id += 1;
+    let mut async_event = output1_direct.event.clone();
+    async_event.present_id = async_candidate.present_id;
+    async_event.serial = u32::try_from(async_candidate.present_id).expect("Present serial fits");
+    Backend::note_present_scanout_candidate(&mut fixture.scene.events.backend, async_candidate);
+    let async_start = record_count(&fixture, hardware.device_fd);
+    assert!(
+        Backend::try_present_direct(
+            &mut fixture.scene.events.backend,
+            async_candidate,
+            async_event,
+        )
+        .expect("the Output(1) tearing owner accepts its async successor")
+    );
+    let async_record = accepted_live_records(&fixture.scene.events.recorders[&hardware.device_fd])
+        .into_iter()
+        .skip(async_start)
+        .find(|record| {
+            record.events.iter().any(|event| event.crtc == crtc1)
+                && accepted_event_id(record).is_some()
+        })
+        .expect("Output(1) async successor has an accepted commit");
+    assert_eq!(async_record.kind, AtomicCommitKind::Async);
+    retire_pending_output(&mut fixture.scene.events, &mut delivered, 1, 40);
     let output1 = &fixture.scene.events.backend.pstate.direct.outputs[1];
     assert!(output1.current.is_some(), "Output(1) owns its direct frame");
     assert_eq!(
@@ -3228,27 +3253,40 @@ fn output_owner_async_presents_flip_synchronized() {
             .as_ref()
             .expect("Output(1) current frame")
             .async_outcome,
-        crate::drm::async_flip::AsyncOutcome::NotRequested,
-        "Output(1) async Present is synchronized"
+        crate::drm::async_flip::AsyncOutcome::Accepted,
+        "Output(1)'s first post-probation Present tears"
     );
-    assert!(!fixture.scene.events.backend.pstate.tearing.is_on());
+    assert!(fixture.scene.events.backend.pstate.tearing.is_on());
+    assert_eq!(
+        fixture.scene.events.backend.tearing_scope_outputs(),
+        [1],
+        "Output(1) is the single tearing owner"
+    );
     assert!(
         fixture
             .scene
             .events
             .backend
             .platform
-            .cursor_plane_visible_for_output(1),
-        "Output(1) hardware cursor remains visible"
+            .cursor_plane_visible_for_output(0),
+        "the composed output keeps its hardware cursor"
+    );
+    assert!(
+        !fixture
+            .scene
+            .events
+            .backend
+            .platform
+            .cursor_plane_visible_for_output(1)
     );
     assert!(
         accepted_live_records(&fixture.scene.events.recorders[&hardware.device_fd])
             .iter()
             .filter(|record| record.events.iter().any(|event| event.crtc == crtc1))
-            .all(|record| !record
+            .any(|record| record
                 .flags
                 .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_ASYNC)),
-        "Output(1) commits carry no async flag"
+        "Output(1) records an async direct commit"
     );
 
     damage_root(&mut fixture);
@@ -3273,6 +3311,12 @@ fn output_owner_async_presents_flip_synchronized() {
     if has_unretired_accepted_event(&fixture.scene.events, &delivered, 0) {
         retire_pending_output(&mut fixture.scene.events, &mut delivered, 0, 42);
     }
+    Backend::set_cursor_hidden(&mut fixture.scene.events.backend, true);
+    Backend::maybe_composite(&mut fixture.scene.events.backend)
+        .expect("detach cursors before the second direct owner enters");
+    for output_idx in 0..2 {
+        drain_unretired_output_events(&mut fixture, &mut delivered, output_idx);
+    }
 
     let mut output0_direct = fixture.scene.install_direct_output_present(
         0,
@@ -3281,7 +3325,6 @@ fn output_owner_async_presents_flip_synchronized() {
     );
     output0_direct.candidate.client_id = 2;
     output0_direct.event.client_id = yserver_protocol::x11::ClientId(2);
-    Backend::set_cursor_hidden(&mut fixture.scene.events.backend, false);
     drain_unretired_output_events(&mut fixture, &mut delivered, 1);
     Backend::note_present_scanout_candidate(
         &mut fixture.scene.events.backend,
@@ -3298,7 +3341,10 @@ fn output_owner_async_presents_flip_synchronized() {
             .expect("another client's Output(0) async Present"),
             attempt + 1
                 == usize::from(crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION),
-            "Output(0) enters after the direct scanout probation"
+            "Output(0) enters after the direct scanout probation: output_state={:?}, pending_scene={}, owner_tearing={:?}",
+            fixture.scene.events.backend.pstate.direct.outputs[0].eligible_streak,
+            fixture.scene.events.backend.scene.has_pending_page_flip(0),
+            fixture.scene.events.backend.pstate.tearing.state,
         );
     }
     let output0_record =
@@ -3317,7 +3363,7 @@ fn output_owner_async_presents_flip_synchronized() {
     );
     retire_pending_output(&mut fixture.scene.events, &mut delivered, 0, 43);
 
-    assert!(!fixture.scene.events.backend.pstate.tearing.is_on());
+    assert!(fixture.scene.events.backend.pstate.tearing.is_on());
     assert!(
         fixture.scene.events.backend.pstate.direct.outputs[0]
             .current
@@ -3329,12 +3375,12 @@ fn output_owner_async_presents_flip_synchronized() {
             .is_some()
     );
     assert!(
-        fixture
+        !fixture
             .scene
             .events
             .backend
             .platform
-            .cursor_plane_visible_for_output(1)
+            .cursor_plane_visible_for_output(0)
     );
     finish_direct_fixture(fixture, &mut delivered);
 }

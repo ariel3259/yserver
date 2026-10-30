@@ -166,6 +166,91 @@ fn a3_tick(
     a3_records_since(fixture, fd, start)
 }
 
+fn a3_queue_first_output_entry(
+    fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixtureGuard,
+    direct: &super::commit_identity::recording_scene::DirectPresentSetup,
+    color: u32,
+) -> (u64, u64) {
+    use yserver_core::backend::Backend;
+
+    fixture
+        .events
+        .backend
+        .for_tests_set_scanout_m1_prober(super::present_scanout::record_scanout_m1_probe);
+    Backend::fill_rectangle(
+        &mut fixture.events.backend,
+        None,
+        direct.candidate.src_host_xid,
+        color,
+        0,
+        0,
+        direct.candidate.src_width,
+        direct.candidate.src_height,
+    )
+    .expect("paint queued first-entry source through Backend");
+    let gate = a3_submit_gamma_commit(fixture, 1);
+    assert!(
+        a3_offer_output_candidate_after_probation(fixture, direct),
+        "busy Output candidate enters the existing successor slot"
+    );
+    let queued = fixture.events.backend.pstate.direct.outputs[1]
+        .queued_successor
+        .as_ref()
+        .expect("first-entry Present is queued behind the CRTC commit");
+    assert!(queued.source_pin != queued.fallback_target_pin);
+    let pins = (queued.source_pin, queued.fallback_target_pin);
+    a3_retire_records(fixture, std::slice::from_ref(&gate));
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .queued_successor
+            .is_some(),
+        "retiring the gate leaves the first-entry Present queued until a scheduler pass"
+    );
+    pins
+}
+
+fn a3_assert_queued_entry_copy_completion(
+    fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixtureGuard,
+    present_id: u64,
+    source_pin: u64,
+    fallback_pin: u64,
+) {
+    use yserver_core::backend::Backend;
+
+    fixture.events.wait_for_submitted_gpu_work();
+    let completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
+    let matching: Vec<_> = completed
+        .iter()
+        .filter(|event| event.present_id == present_id)
+        .collect();
+    assert_eq!(matching.len(), 1, "queued fallback completes exactly once");
+    assert_eq!(
+        matching[0].completion_mode,
+        yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+        "queued fallback completes as Copy"
+    );
+    assert!(
+        !fixture
+            .events
+            .backend
+            .present_source_pins
+            .contains_key(&source_pin)
+    );
+    assert!(
+        !fixture
+            .events
+            .backend
+            .present_source_pins
+            .contains_key(&fallback_pin)
+    );
+    assert!(
+        Backend::drain_completed_present_events(&mut fixture.events.backend)
+            .iter()
+            .all(|event| event.present_id != present_id),
+        "queued fallback never emits a second completion"
+    );
+}
+
 fn a3_retire_records(
     fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixture,
     records: &[crate::drm::atomic::tests_support::AtomicCommitRecord],
@@ -491,6 +576,992 @@ fn a3_visible_root_pixel(
         crate::kms::render::backend::ScanoutReadSelection::PermissiveDump,
     )
     .expect("read the visible scanout buffer")
+}
+
+fn a3_offer_output_candidate_after_probation(
+    fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixtureGuard,
+    direct: &super::commit_identity::recording_scene::DirectPresentSetup,
+) -> bool {
+    use yserver_core::backend::Backend;
+
+    Backend::note_present_scanout_candidate(&mut fixture.events.backend, direct.candidate);
+    let probation = usize::from(crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION);
+    let mut accepted = false;
+    for attempt in 0..probation {
+        accepted = Backend::try_present_direct(
+            &mut fixture.events.backend,
+            direct.candidate,
+            direct.event.clone(),
+        )
+        .expect("Output Present enters through Backend");
+        if accepted {
+            assert_eq!(attempt + 1, probation, "Output enters after probation");
+        }
+    }
+    accepted
+}
+
+fn a3_submit_gamma_commit(
+    fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixtureGuard,
+    output_idx: usize,
+) -> crate::drm::atomic::tests_support::AtomicCommitRecord {
+    use std::os::fd::{AsFd, AsRawFd};
+    use yserver_core::backend::Backend;
+
+    fn handle<H: ::drm::control::ResourceHandle>(value: u32) -> H {
+        ::drm::control::from_u32(value).expect("nonzero gamma property handle")
+    }
+
+    let output = &mut fixture.events.backend.platform.outputs[output_idx].output;
+    output.crtc_gamma_lut_prop = Some(handle(70));
+    output.crtc_degamma_lut_prop = Some(handle(71));
+    output.crtc_ctm_prop = Some(handle(72));
+    if output.plane_in_fence_fd_prop.is_none() {
+        output.plane_in_fence_fd_prop = Some(handle(73));
+    }
+    if output.crtc_out_fence_ptr_prop.is_none() {
+        output.crtc_out_fence_ptr_prop = Some(handle(74));
+    }
+    let crtc_id = u32::from(output.crtc);
+    let crtc_xid = crtc_id;
+    let output_key = fixture.events.backend.platform.outputs[output_idx]
+        .key
+        .clone();
+    fixture
+        .events
+        .backend
+        .pstate
+        .crtc_key_by_id
+        .insert(crtc_xid, output_key);
+    let fd = fixture.events.backend.platform.devices[0]
+        .device
+        .as_fd()
+        .as_raw_fd();
+    let recorder = fixture.events.recorders[&fd].clone();
+    recorder.set_gamma_size_for_tests(4);
+    let before = recorder.records().len();
+    Backend::set_crtc_gamma(
+        &mut fixture.events.backend,
+        crtc_xid,
+        &[0x1111; 4],
+        &[0x2222; 4],
+        &[0x3333; 4],
+    )
+    .expect("set output gamma through Backend");
+    fixture.events.backend.platform.outputs[output_idx]
+        .output
+        .pending_gamma_deadline
+        .set(Some(std::time::Instant::now()));
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("scheduler submits the deferred gamma property commit");
+    let record = recorder
+        .records()
+        .into_iter()
+        .nth(before)
+        .unwrap_or_else(|| {
+            panic!("Backend gamma update submitted a property commit on output {output_idx}")
+        });
+    assert_eq!(
+        record.kind,
+        crate::drm::atomic::AtomicCommitKind::GammaOnly,
+        "gamma update owns its output CRTC until retirement"
+    );
+    assert!(matches!(
+        record.result,
+        crate::drm::atomic::tests_support::ScriptedResult::Ok
+    ));
+    let scene_records: Vec<_> = a3_records_since(fixture, fd, before)
+        .into_iter()
+        .filter(|record| {
+            matches!(
+                record.kind,
+                crate::drm::atomic::AtomicCommitKind::Scene
+                    | crate::drm::atomic::AtomicCommitKind::SceneWithCursor
+            )
+        })
+        .collect();
+    // A property-only Backend tick may also submit an unrelated output's
+    // already-dirty scene. Retire that frame so this helper leaves only the
+    // requested CRTC commit in flight.
+    a3_retire_records(fixture, &scene_records);
+    record
+}
+
+fn a3_submit_composed_scene_commit(
+    fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixtureGuard,
+    output_idx: usize,
+) -> crate::drm::atomic::tests_support::AtomicCommitRecord {
+    use std::os::fd::{AsFd, AsRawFd};
+    use yserver_core::backend::Backend;
+
+    let root = fixture.events.backend.core.window_id;
+    let output = &fixture.events.backend.platform.outputs[output_idx];
+    let crtc = output.output.crtc;
+    let (x, y, width, height) = (
+        i16::try_from(output.x).expect("test output x fits X coordinates"),
+        i16::try_from(output.y).expect("test output y fits X coordinates"),
+        output.width,
+        output.height,
+    );
+    let fd = fixture.events.backend.platform.devices[0]
+        .device
+        .as_fd()
+        .as_raw_fd();
+    let recorder = fixture.events.recorders[&fd].clone();
+    let before = recorder.records().len();
+    Backend::clear_area(
+        &mut fixture.events.backend,
+        None,
+        root,
+        0,
+        None,
+        x,
+        y,
+        width,
+        height,
+        (0, 0),
+    )
+    .expect("damage the composed output through Backend");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        Backend::before_block(&mut fixture.events.backend);
+        Backend::maybe_composite(&mut fixture.events.backend)
+            .expect("schedule composed scene work through Backend");
+        fixture.events.wait_for_submitted_gpu_work();
+        {
+            let events = fixture.events_mut();
+            Backend::on_scanout_render_completion(&mut events.backend, &mut events.state);
+        }
+        if let Some(record) = recorder.records().into_iter().skip(before).find(|record| {
+            matches!(
+                record.kind,
+                crate::drm::atomic::AtomicCommitKind::Scene
+                    | crate::drm::atomic::AtomicCommitKind::SceneWithCursor
+            ) && record.events.len() == 1
+                && record.events[0].crtc == crtc
+                && super::commit_identity::accepted_event_id(record).is_some()
+        }) {
+            assert_eq!(
+                fixture
+                    .events
+                    .backend
+                    .scene
+                    .pending_page_flip_event_id(output_idx),
+                super::commit_identity::accepted_event_id(&record),
+                "the composed output owns its accepted scene flip"
+            );
+            return record;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a Backend damage pass accepts a composed scene commit on Output({output_idx})"
+        );
+    }
+}
+
+fn a3_offer_direct_present(
+    fixture: &mut super::commit_identity::recording_scene::RecordingSceneFixtureGuard,
+    candidate: yserver_core::backend::PresentScanoutCandidate,
+    event: yserver_core::backend::CompletedPresentEvent,
+) -> bool {
+    use yserver_core::backend::Backend;
+
+    Backend::note_present_scanout_candidate(&mut fixture.events.backend, candidate);
+    Backend::try_present_direct(&mut fixture.events.backend, candidate, event)
+        .expect("Output Present enters through Backend")
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: decline instead of queue.
+fn unpaced_output_client_enters_direct_on_first_retirement() {
+    use std::os::fd::{AsFd, AsRawFd};
+    use yserver_core::backend::Backend;
+
+    let Some((fixture, _)) = a3_output_fixture(1, 980) else {
+        eprintln!(
+            "SKIP unpaced_output_client_enters_direct_on_first_retirement: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    for device in &mut fixture.events.backend.platform.devices {
+        device.async_page_flip = true;
+    }
+
+    let tearing = fixture.install_direct_output_present(
+        0,
+        981,
+        yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+    );
+    fixture
+        .events
+        .backend
+        .for_tests_set_scanout_m1_prober(super::present_scanout::record_scanout_m1_probe);
+    let entry_records = a3_admit_output_owner(&mut fixture, &tearing, 0);
+    a3_retire_records(&mut fixture, &entry_records);
+    assert_eq!(
+        Backend::drain_completed_present_events(&mut fixture.events.backend)
+            .iter()
+            .filter(|event| event.present_id == tearing.candidate.present_id)
+            .count(),
+        1,
+        "the entry Present completes once"
+    );
+    let mut tearing_follow_up = tearing.candidate;
+    tearing_follow_up.present_id = 983;
+    let mut tearing_follow_up_event = tearing.event.clone();
+    tearing_follow_up_event.present_id = tearing_follow_up.present_id;
+    tearing_follow_up_event.serial = 983;
+    let fd = fixture.events.backend.platform.devices[0]
+        .device
+        .as_fd()
+        .as_raw_fd();
+    let before_follow_up = fixture.events.recorders[&fd].records().len();
+    Backend::note_present_scanout_candidate(&mut fixture.events.backend, tearing_follow_up);
+    assert!(
+        Backend::try_present_direct(
+            &mut fixture.events.backend,
+            tearing_follow_up,
+            tearing_follow_up_event.clone(),
+        )
+        .expect("follow-up async Present uses the active tearing owner")
+    );
+    let tearing_records = a3_records_since(&fixture, fd, before_follow_up);
+    assert!(
+        tearing_records
+            .iter()
+            .any(|record| record.kind == crate::drm::atomic::AtomicCommitKind::Async),
+        "the other output is already the tearing owner"
+    );
+    a3_retire_records(&mut fixture, &tearing_records);
+    assert_eq!(
+        Backend::drain_completed_present_events(&mut fixture.events.backend)
+            .iter()
+            .filter(|event| event.present_id == tearing_follow_up.present_id)
+            .count(),
+        1,
+        "the tearing owner completes once"
+    );
+    assert_eq!(
+        fixture.events.backend.tearing_scope(),
+        Some(crate::kms::render::backend::DirectScope::Output(0)),
+        "Output(0) retains tearing while Output(1) enters"
+    );
+
+    let direct = fixture.install_direct_output_present(
+        1,
+        982,
+        yserver_core::present_scheduler::PRESENT_OPTION_ASYNC,
+    );
+    let scene_record = a3_submit_composed_scene_commit(&mut fixture, 1);
+    assert!(fixture.events.backend.scene.has_pending_page_flip(1));
+    let fd = fixture.events.backend.platform.devices[0]
+        .device
+        .as_fd()
+        .as_raw_fd();
+    let record_offset = fixture.events.recorders[&fd].records().len();
+    assert!(
+        a3_offer_output_candidate_after_probation(&mut fixture, &direct),
+        "the post-probation Output Present returns accepted direct while its CRTC is busy"
+    );
+    let queued = fixture.events.backend.pstate.direct.outputs[1]
+        .queued_successor
+        .as_ref()
+        .expect("busy first entry occupies the existing successor slot");
+    assert_eq!(queued.candidate.present_id, direct.candidate.present_id);
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .pending
+            .is_none()
+    );
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_none()
+    );
+    assert!(
+        !fixture.events.backend.output_is_direct(1),
+        "a queued first entry does not suppress Output(1) composition"
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .platform
+            .scanout_commit_in_flight_for_output(1),
+        "the composed scene commit is the busy CRTC gate"
+    );
+    assert!(
+        a3_records_since(&fixture, fd, record_offset)
+            .iter()
+            .all(|record| super::commit_identity::accepted_event_id(record).is_none()),
+        "a queued first entry waits for the commit that already owns its CRTC"
+    );
+
+    a3_retire_records(&mut fixture, std::slice::from_ref(&scene_record));
+    let after_retirement = a3_tick(&mut fixture);
+    let owner = &fixture.events.backend.pstate.direct.outputs[1];
+    let pending = owner
+        .pending
+        .as_ref()
+        .expect("queued frame has a direct commit");
+    assert_eq!(pending.candidate.present_id, direct.candidate.present_id);
+    let pending_id = pending
+        .accepted_event_id
+        .expect("queued frame has an accepted commit identity");
+    let output1_crtc = fixture.events.backend.platform.outputs[1].output.crtc;
+    let output1_commits: Vec<_> = after_retirement
+        .iter()
+        .filter(|record| {
+            record.events.len() == 1
+                && record.events[0].crtc == output1_crtc
+                && super::commit_identity::accepted_event_id(record).is_some()
+        })
+        .collect();
+    assert_eq!(
+        output1_commits.len(),
+        1,
+        "the queued frame submits on the first available CRTC retirement without an intervening compose"
+    );
+    assert_eq!(
+        super::commit_identity::accepted_event_id(output1_commits[0]),
+        Some(pending_id),
+        "Output(1)'s only accepted commit is the queued direct frame"
+    );
+    assert_ne!(
+        output1_commits[0].kind,
+        crate::drm::atomic::AtomicCommitKind::Async,
+        "the async requester enters synchronously while Output(0) owns tearing"
+    );
+    fixture.events.wait_for_submitted_gpu_work();
+    fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: dispatch on the CRTC gate only.
+fn queued_entry_waits_for_scene_pending_on_its_output() {
+    use yserver_core::backend::Backend;
+
+    let fixture = super::commit_identity::recording_scene::RecordingSceneFixture::with_copied_output_geometry(
+        (3840, 1080),
+        &[(0, 0, 1920, 1080, 75)],
+    )
+    .expect("cropped one-output copied recording fixture");
+    let Some(fixture) = fixture else {
+        eprintln!(
+            "SKIP queued_entry_waits_for_scene_pending_on_its_output: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    fixture
+        .readiness
+        .as_ref()
+        .expect("copied fixture has a readiness observer")
+        .hold_ready_jobs();
+
+    let root = fixture.events.backend.core.window_id;
+    let (width, height) = (
+        fixture.events.backend.platform.fb_w,
+        fixture.events.backend.platform.fb_h,
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        Backend::before_block(&mut fixture.events.backend);
+        Backend::clear_area(
+            &mut fixture.events.backend,
+            None,
+            root,
+            0,
+            None,
+            0,
+            0,
+            width,
+            height,
+            (0, 0),
+        )
+        .expect("damage the copied scene through Backend");
+        Backend::maybe_composite(&mut fixture.events.backend)
+            .expect("schedule copied scene work through Backend");
+        if !fixture.pending_render_job_ids().is_empty()
+            && fixture.events.backend.scene.has_pending_page_flip(0)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a damaged Backend tick registers copied render work"
+        );
+    }
+    assert!(
+        !fixture.pending_render_job_ids().is_empty(),
+        "the copied renderer has scene work awaiting its real completion"
+    );
+    assert!(fixture.events.backend.scene.has_pending_page_flip(0));
+    let direct = fixture.install_direct_output_present(0, 984, 0);
+    fixture
+        .events
+        .backend
+        .for_tests_set_scanout_m1_prober(super::present_scanout::record_scanout_m1_probe);
+    assert_eq!(
+        fixture.events.backend.scene.pending_page_flip_event_id(0),
+        None,
+        "Output(0) has scene work but no accepted KMS commit"
+    );
+    assert!(
+        !fixture
+            .events
+            .backend
+            .platform
+            .scanout_commit_in_flight_for_output(0),
+        "the CRTC commit gate is free while copied scene rendering is pending"
+    );
+    let fd = fixture.kms_fd(0);
+    let before = fixture.events.recorders[&fd].records().len();
+    assert!(
+        a3_offer_output_candidate_after_probation(&mut fixture, &direct),
+        "post-probation Output Present queues behind scene work"
+    );
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("retry the queued entry during a Backend scheduling pass");
+    let owner = &fixture.events.backend.pstate.direct.outputs[0];
+    assert_eq!(
+        owner
+            .queued_successor
+            .as_ref()
+            .map(|frame| frame.candidate.present_id),
+        Some(direct.candidate.present_id),
+        "scene-pending work keeps the first-entry successor queued"
+    );
+    assert!(owner.pending.is_none() && owner.current.is_none());
+    assert!(
+        a3_records_since(&fixture, fd, before)
+            .iter()
+            .all(|record| super::commit_identity::accepted_event_id(record).is_none()),
+        "no direct commit is accepted while Output(0)'s scene frame awaits render completion"
+    );
+
+    for job_id in fixture.pending_render_job_ids() {
+        fixture
+            .readiness
+            .as_ref()
+            .expect("copied fixture has a readiness gate")
+            .release_ready_job(job_id);
+    }
+    {
+        let events = fixture.events_mut();
+        Backend::on_scanout_render_completion(&mut events.backend, &mut events.state);
+    }
+    let scene_record = a3_records_since(&fixture, fd, before)
+        .into_iter()
+        .find(|record| {
+            record.events.len() == 1
+                && record.events[0].crtc == fixture.events.backend.platform.outputs[0].output.crtc
+                && super::commit_identity::accepted_event_id(record).is_some()
+                && record.kind != crate::drm::atomic::AtomicCommitKind::GammaOnly
+        })
+        .expect("the copied scene output is accepted after render completion");
+    assert_eq!(
+        fixture.events.backend.scene.pending_page_flip_event_id(0),
+        super::commit_identity::accepted_event_id(&scene_record),
+        "the scene owns Output(0)'s accepted flip until retirement"
+    );
+    a3_retire_records(&mut fixture, std::slice::from_ref(&scene_record));
+    let dispatch = a3_tick(&mut fixture);
+    let owner = &fixture.events.backend.pstate.direct.outputs[0];
+    let pending = owner
+        .pending
+        .as_ref()
+        .expect("scene retirement dispatches direct");
+    assert_eq!(pending.candidate.present_id, direct.candidate.present_id);
+    let pending_id = pending
+        .accepted_event_id
+        .expect("queued direct frame accepted after scene retirement");
+    assert!(dispatch.iter().any(|record| {
+        super::commit_identity::accepted_event_id(record) == Some(pending_id)
+            && record.events.len() == 1
+            && record.events[0].crtc == fixture.events.backend.platform.outputs[0].output.crtc
+    }));
+    fixture.events.wait_for_submitted_gpu_work();
+    fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: dispatch on the scene-pending state only, ignoring the CRTC commit gate.
+fn queued_entry_waits_for_cursor_commit_on_its_crtc() {
+    use yserver_core::backend::Backend;
+
+    let Some((fixture, direct)) = a3_output_fixture(1, 985) else {
+        eprintln!(
+            "SKIP queued_entry_waits_for_cursor_commit_on_its_crtc: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    fixture
+        .events
+        .backend
+        .for_tests_set_scanout_m1_prober(super::present_scanout::record_scanout_m1_probe);
+    let gamma_record = a3_submit_gamma_commit(&mut fixture, 1);
+    assert!(!fixture.events.backend.scene.has_pending_page_flip(1));
+    assert!(
+        fixture
+            .events
+            .backend
+            .platform
+            .scanout_commit_in_flight_for_output(1),
+        "the cursor/property commit gate is independently busy"
+    );
+    let fd = fixture.kms_fd(1);
+    let before = fixture.events.recorders[&fd].records().len();
+    assert!(
+        a3_offer_output_candidate_after_probation(&mut fixture, &direct),
+        "post-probation Output Present queues behind a cursor/property commit"
+    );
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("retry the queued entry during a Backend scheduling pass");
+    let owner = &fixture.events.backend.pstate.direct.outputs[1];
+    assert_eq!(
+        owner
+            .queued_successor
+            .as_ref()
+            .map(|frame| frame.candidate.present_id),
+        Some(direct.candidate.present_id),
+        "a cursor/property commit keeps the queued first entry in its slot"
+    );
+    assert!(owner.pending.is_none() && owner.current.is_none());
+    assert!(
+        a3_records_since(&fixture, fd, before)
+            .iter()
+            .all(|record| super::commit_identity::accepted_event_id(record).is_none()),
+        "the scheduler submits no direct frame while the output CRTC is busy"
+    );
+
+    a3_retire_records(&mut fixture, std::slice::from_ref(&gamma_record));
+    let dispatched = a3_tick(&mut fixture);
+    let pending = fixture.events.backend.pstate.direct.outputs[1]
+        .pending
+        .as_ref()
+        .expect("queued entry submits after its CRTC commit retires");
+    let pending_id = pending
+        .accepted_event_id
+        .expect("queued direct frame has an accepted commit identity");
+    assert!(dispatched.iter().any(|record| {
+        super::commit_identity::accepted_event_id(record) == Some(pending_id)
+            && record.events.len() == 1
+            && record.events[0].crtc == fixture.events.backend.platform.outputs[1].output.crtc
+    }));
+    fixture.events.wait_for_submitted_gpu_work();
+    fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: submit the stale queued frame.
+fn newer_present_supersedes_queued_entry() {
+    use yserver_core::backend::Backend;
+
+    let Some((fixture, direct)) = a3_output_fixture(1, 986) else {
+        eprintln!("SKIP newer_present_supersedes_queued_entry: Vulkan fixture unavailable");
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    fixture
+        .events
+        .backend
+        .for_tests_set_scanout_m1_prober(super::present_scanout::record_scanout_m1_probe);
+    let scene_record = a3_submit_composed_scene_commit(&mut fixture, 1);
+    assert!(fixture.events.backend.scene.has_pending_page_flip(1));
+    assert!(
+        a3_offer_output_candidate_after_probation(&mut fixture, &direct),
+        "the first Present queues behind the composed scene commit"
+    );
+    assert_eq!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .queued_successor
+            .as_ref()
+            .map(|frame| frame.candidate.present_id),
+        Some(direct.candidate.present_id),
+        "the first Present occupies the successor slot before scene retirement"
+    );
+
+    a3_retire_records(&mut fixture, std::slice::from_ref(&scene_record));
+    assert_eq!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .queued_successor
+            .as_ref()
+            .map(|frame| frame.candidate.present_id),
+        Some(direct.candidate.present_id),
+        "scene retirement leaves the queued frame for the next scheduling pass"
+    );
+
+    let mut newer = direct.candidate;
+    newer.present_id += 1;
+    let mut newer_event = direct.event.clone();
+    newer_event.present_id = newer.present_id;
+    newer_event.serial = u32::try_from(newer.present_id).expect("test Present id fits serial");
+    newer_event.msc_offset = 123;
+    assert!(
+        a3_offer_direct_present(&mut fixture, newer, newer_event),
+        "the newer Present replaces the queued first entry without an MSC gate"
+    );
+    let owner = &fixture.events.backend.pstate.direct.outputs[1];
+    assert_eq!(
+        owner
+            .queued_successor
+            .as_ref()
+            .map(|frame| frame.candidate.present_id),
+        Some(newer.present_id),
+        "latest wins in the existing successor slot"
+    );
+    let replaced = Backend::drain_completed_present_events(&mut fixture.events.backend);
+    let skipped: Vec<_> = replaced
+        .iter()
+        .filter(|event| {
+            event.present_id == direct.candidate.present_id
+                && event.completion_mode == yserver_protocol::x11::present::COMPLETE_MODE_SKIP
+        })
+        .collect();
+    assert_eq!(
+        skipped.len(),
+        1,
+        "replaced queued Present completes once as Skip"
+    );
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .pending
+            .is_none(),
+        "the newer Present replaces the queued frame instead of bypassing it"
+    );
+
+    let dispatched = a3_tick(&mut fixture);
+    let pending = fixture.events.backend.pstate.direct.outputs[1]
+        .pending
+        .as_ref()
+        .expect("latest queued Present submits when the CRTC retires");
+    assert_eq!(pending.candidate.present_id, newer.present_id);
+    let pending_id = pending
+        .accepted_event_id
+        .expect("latest queued Present has an accepted commit identity");
+    assert!(
+        dispatched.iter().any(|record| {
+            super::commit_identity::accepted_event_id(record) == Some(pending_id)
+        })
+    );
+    let direct_records = dispatched
+        .iter()
+        .filter(|record| super::commit_identity::accepted_event_id(record) == Some(pending_id))
+        .count();
+    assert_eq!(direct_records, 1, "the newest frame is submitted once");
+    a3_retire_records(&mut fixture, &dispatched);
+    let completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
+    assert_eq!(
+        completed
+            .iter()
+            .filter(|event| event.present_id == newer.present_id)
+            .count(),
+        1,
+        "the submitted latest Present completes once"
+    );
+    assert!(!completed.iter().any(|event| {
+        event.present_id == direct.candidate.present_id
+            && event.completion_mode != yserver_protocol::x11::present::COMPLETE_MODE_SKIP
+    }));
+    fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: skip revalidation of a queued first-entry frame.
+fn queued_entry_revalidates_before_submission() {
+    use yserver_core::{backend::Backend, server::ServerState};
+    use yserver_protocol::x11::ResourceId;
+
+    let Some((fixture, direct)) = a3_output_fixture(1, 987) else {
+        eprintln!("SKIP queued_entry_revalidates_before_submission: Vulkan fixture unavailable");
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    fixture
+        .events
+        .backend
+        .for_tests_set_scanout_m1_prober(super::present_scanout::record_scanout_m1_probe);
+    Backend::fill_rectangle(
+        &mut fixture.events.backend,
+        None,
+        direct.candidate.src_host_xid,
+        0x0012_3456,
+        0,
+        0,
+        direct.candidate.src_width,
+        direct.candidate.src_height,
+    )
+    .expect("paint queued Present source through Backend");
+    let gamma_record = a3_submit_gamma_commit(&mut fixture, 1);
+    let fd = fixture.kms_fd(1);
+    let before = fixture.events.recorders[&fd].records().len();
+    assert!(
+        a3_offer_output_candidate_after_probation(&mut fixture, &direct),
+        "the busy first entry is accepted into the successor slot"
+    );
+    let queued = fixture.events.backend.pstate.direct.outputs[1]
+        .queued_successor
+        .as_ref()
+        .expect("first entry is queued behind the gamma commit");
+    let source_pin = queued.source_pin;
+    let target_pin = queued.fallback_target_pin;
+    assert!(
+        fixture
+            .events
+            .backend
+            .present_source_pins
+            .contains_key(&source_pin)
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .present_source_pins
+            .contains_key(&target_pin)
+    );
+
+    let mut state = ServerState::new();
+    let overlay = a3_seed_ordered_window(
+        &mut fixture,
+        &mut state,
+        ResourceId(0x3191),
+        1920,
+        0,
+        1920,
+        1080,
+        false,
+    );
+    Backend::fill_rectangle(
+        &mut fixture.events.backend,
+        None,
+        overlay,
+        0x0001_2345,
+        0,
+        0,
+        1920,
+        1080,
+    )
+    .expect("paint an overlay that invalidates direct eligibility");
+    Backend::map_subwindow(&mut fixture.events.backend, None, overlay)
+        .expect("map overlay through Backend while the Present is queued");
+
+    a3_retire_records(&mut fixture, std::slice::from_ref(&gamma_record));
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("revalidate the queued Present during the Backend scheduling pass");
+    let owner = &fixture.events.backend.pstate.direct.outputs[1];
+    assert!(
+        owner.current.is_none() && owner.pending.is_none() && owner.queued_successor.is_none(),
+        "the mapped overlay sends the queued first entry to Copy and clears direct ownership"
+    );
+    assert!(!fixture.events.backend.output_is_direct(1));
+    let composed = a3_records_since(&fixture, fd, before);
+    assert!(
+        composed.iter().all(|record| {
+            super::commit_identity::accepted_event_id(record).is_none()
+                || record.events[0].crtc != fixture.events.backend.platform.outputs[1].output.crtc
+                || a3_has_scene_commit_for(
+                    std::slice::from_ref(record),
+                    fixture.events.backend.platform.outputs[1].output.crtc,
+                )
+        }),
+        "Output(1) accepts only its composed replacement, never a stale direct frame"
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .present_source_pins
+            .contains_key(&source_pin)
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .present_source_pins
+            .contains_key(&target_pin)
+    );
+
+    a3_retire_records(&mut fixture, &composed);
+    assert!(
+        !fixture.events.backend.scene.has_pending_page_flips(),
+        "composed replacement retirement clears scene acknowledgements"
+    );
+
+    fixture.events.wait_for_submitted_gpu_work();
+    let copied = fixture
+        .events
+        .backend
+        .backing_pixels_for_tests(direct.target_xid)
+        .expect("fallback target remains readable")
+        .2;
+    assert_eq!(
+        &copied[..3],
+        &[0x56, 0x34, 0x12],
+        "Copy fallback writes Present pixels"
+    );
+    let completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
+    let copies: Vec<_> = completed
+        .iter()
+        .filter(|event| {
+            event.present_id == direct.candidate.present_id
+                && event.completion_mode == yserver_protocol::x11::present::COMPLETE_MODE_COPY
+        })
+        .collect();
+    assert_eq!(copies.len(), 1, "the fallback Copy completes exactly once");
+    assert!(
+        !fixture
+            .events
+            .backend
+            .present_source_pins
+            .contains_key(&source_pin)
+    );
+    assert!(
+        !fixture
+            .events
+            .backend
+            .present_source_pins
+            .contains_key(&target_pin)
+    );
+    assert!(
+        Backend::drain_completed_present_events(&mut fixture.events.backend)
+            .iter()
+            .all(|event| event.present_id != direct.candidate.present_id),
+        "Copy fallback does not emit a second completion"
+    );
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: leave the owner set after failure.
+fn queued_entry_submit_failure_falls_back_to_copy() {
+    use std::os::fd::{AsFd, AsRawFd};
+    use yserver_core::backend::Backend;
+
+    let Some((fixture, direct)) = a3_output_fixture(1, 988) else {
+        eprintln!(
+            "SKIP queued_entry_submit_failure_falls_back_to_copy: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    fixture
+        .events
+        .backend
+        .for_tests_set_scanout_m1_prober(super::present_scanout::record_scanout_m1_probe);
+    let gamma_record = a3_submit_gamma_commit(&mut fixture, 1);
+    let fd = fixture.events.backend.platform.devices[0]
+        .device
+        .as_fd()
+        .as_raw_fd();
+    let before = fixture.events.recorders[&fd].records().len();
+    assert!(
+        a3_offer_output_candidate_after_probation(&mut fixture, &direct),
+        "the busy first entry is accepted into the successor slot"
+    );
+    let queued = fixture.events.backend.pstate.direct.outputs[1]
+        .queued_successor
+        .as_ref()
+        .expect("first entry is queued behind the gamma commit");
+    let source_pin = queued.source_pin;
+    let target_pin = queued.fallback_target_pin;
+    a3_retire_records(&mut fixture, std::slice::from_ref(&gamma_record));
+    fixture.events.recorders[&fd]
+        .script_result(Err(std::io::Error::from_raw_os_error(libc::EBUSY)));
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("queued direct submit failure falls back during a Backend pass");
+    let output1_crtc = fixture.events.backend.platform.outputs[1].output.crtc;
+    let records = a3_records_since(&fixture, fd, before);
+    assert!(
+        records.iter().any(|record| {
+            record.events.len() == 1
+                && record.events[0].crtc == output1_crtc
+                && matches!(
+                    record.result,
+                    crate::drm::atomic::tests_support::ScriptedResult::Error {
+                        raw_os_error: Some(error),
+                        ..
+                    } if error == libc::EBUSY
+                )
+        }),
+        "the recording KMS gate rejects the queued direct commit with EBUSY"
+    );
+    let owner = &fixture.events.backend.pstate.direct.outputs[1];
+    assert!(
+        owner.current.is_none()
+            && owner.pending.is_none()
+            && owner.queued_successor.is_none()
+            && !owner.hold_direct
+            && !owner.active(),
+        "submit failure clears the queued-only direct owner"
+    );
+    assert!(!fixture.events.backend.output_is_direct(1));
+    assert!(a3_has_scene_commit_for(&records, output1_crtc));
+    assert!(
+        fixture
+            .events
+            .backend
+            .present_source_pins
+            .contains_key(&source_pin)
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .present_source_pins
+            .contains_key(&target_pin)
+    );
+
+    a3_retire_records(&mut fixture, &records);
+    assert!(
+        !fixture.events.backend.scene.has_pending_page_flips(),
+        "composed replacement retirement clears scene acknowledgements"
+    );
+
+    fixture.events.wait_for_submitted_gpu_work();
+    let completed = Backend::drain_completed_present_events(&mut fixture.events.backend);
+    let copies: Vec<_> = completed
+        .iter()
+        .filter(|event| {
+            event.present_id == direct.candidate.present_id
+                && event.completion_mode == yserver_protocol::x11::present::COMPLETE_MODE_COPY
+        })
+        .collect();
+    assert_eq!(
+        copies.len(),
+        1,
+        "submit-failure Copy completes exactly once"
+    );
+    assert!(
+        !fixture
+            .events
+            .backend
+            .present_source_pins
+            .contains_key(&source_pin)
+    );
+    assert!(
+        !fixture
+            .events
+            .backend
+            .present_source_pins
+            .contains_key(&target_pin)
+    );
+    assert!(
+        Backend::drain_completed_present_events(&mut fixture.events.backend)
+            .iter()
+            .all(|event| event.present_id != direct.candidate.present_id),
+        "submit-failure fallback does not emit a second completion"
+    );
+    fixture.finish_after_normal_drain();
 }
 
 #[test]
@@ -2749,4 +3820,456 @@ fn retained_direct_damage_does_not_block_other_output_cursor_commit() {
     }
     assert!(!fixture.events.backend.platform.any_cursor_plane_visible());
     super::cursor_sprites::support::finish_atomic_fixture(atomic_fixture, &mut delivered);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: leave the queued-only owner set (composition stays suppressed / pins held).
+fn queued_entry_cancelled_by_unflip_cause() {
+    use yserver_core::backend::Backend;
+
+    let Some((fixture, direct)) = a3_output_fixture(1, 1101) else {
+        eprintln!("SKIP queued_entry_cancelled_by_unflip_cause: Vulkan fixture unavailable");
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let (source_pin, fallback_pin) =
+        a3_queue_first_output_entry(&mut fixture, &direct, 0x0012_3456);
+    assert!(
+        fixture
+            .events
+            .backend
+            .present_source_pins
+            .contains_key(&source_pin)
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .present_source_pins
+            .contains_key(&fallback_pin)
+    );
+
+    Backend::unmap_subwindow(&mut fixture.events.backend, None, direct.target_xid)
+        .expect("unmap queued direct window through Backend");
+    let owner = &fixture.events.backend.pstate.direct.outputs[1];
+    assert!(
+        owner.current.is_none()
+            && owner.pending.is_none()
+            && owner.queued_successor.is_none()
+            && !owner.hold_direct
+            && !owner.active(),
+        "unmap cancels queued-only ownership without an unflip commit"
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .present_source_pins
+            .contains_key(&source_pin)
+            && fixture
+                .events
+                .backend
+                .present_source_pins
+                .contains_key(&fallback_pin),
+        "Copy source and target pins stay held until the GPU consumes the fallback"
+    );
+    assert!(!fixture.events.backend.output_is_direct(1));
+
+    let fd = fixture.kms_fd(1);
+    let before = fixture.events.recorders[&fd].records().len();
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("compose Output(1) after queued-entry cancellation");
+    let crtc = fixture.events.backend.platform.outputs[1].output.crtc;
+    let records = a3_records_since(&fixture, fd, before);
+    assert!(
+        a3_has_scene_commit_for(&records, crtc),
+        "the revoked Output composes instead of suppressing scene work"
+    );
+    fixture.events.wait_for_submitted_gpu_work();
+    a3_retire_records(&mut fixture, &records);
+    assert!(!fixture.events.backend.scene.has_pending_page_flips());
+    let copied = fixture
+        .events
+        .backend
+        .backing_pixels_for_tests(direct.target_xid)
+        .expect("queued fallback target remains readable")
+        .2;
+    assert_eq!(&copied[..3], &[0x56, 0x34, 0x12]);
+    a3_assert_queued_entry_copy_completion(
+        &mut fixture,
+        direct.candidate.present_id,
+        source_pin,
+        fallback_pin,
+    );
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: route the global unflip back through KmsBackendState only.
+// A queued server-source-retired case is impossible: promoted server-owned sources are admitted
+// only as Root candidates, while the queued first-entry owner is Output(i).
+fn queued_entry_cancelled_by_global_unflip() {
+    use yserver_core::backend::Backend;
+
+    let Some((fixture, direct)) = a3_output_fixture(1, 1106) else {
+        eprintln!("SKIP queued_entry_cancelled_by_global_unflip: Vulkan fixture unavailable");
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let (source_pin, fallback_pin) =
+        a3_queue_first_output_entry(&mut fixture, &direct, 0x0012_3456);
+    {
+        let events = fixture.events_mut();
+        events
+            .backend
+            .rebuild_randr_state(&mut events.state, None, true);
+    }
+
+    let half = yserver_core::randr::FIXED_ONE / 2;
+    fixture.events.state.randr.outputs[0].current_transform =
+        yserver_core::randr::CrtcTransform::new(
+            [half, 0, 0, 0, half, 0, 0, 0, yserver_core::randr::FIXED_ONE],
+            None,
+            Vec::new(),
+        )
+        .expect("valid scale transform");
+    {
+        let events = fixture.events_mut();
+        Backend::randr_layout_changed(&mut events.backend, &mut events.state);
+    }
+    assert_eq!(fixture.events.backend.platform.output_transforms.len(), 1);
+
+    let owner = &fixture.events.backend.pstate.direct.outputs[1];
+    assert!(
+        owner.current.is_none()
+            && owner.pending.is_none()
+            && owner.queued_successor.is_none()
+            && !owner.hold_direct
+            && !owner.active(),
+        "global transform unflip cancels queued-only Output ownership"
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .present_source_pins
+            .contains_key(&source_pin)
+            && fixture
+                .events
+                .backend
+                .present_source_pins
+                .contains_key(&fallback_pin),
+        "Copy pins stay held until the fallback is consumed"
+    );
+
+    let fd = fixture.kms_fd(1);
+    let before = fixture.events.recorders[&fd].records().len();
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("compose Output(1) after global queued-entry cancellation");
+    fixture.events.wait_for_submitted_gpu_work();
+    let crtc = fixture.events.backend.platform.outputs[1].output.crtc;
+    let records = a3_records_since(&fixture, fd, before);
+    assert!(
+        a3_has_scene_commit_for(&records, crtc),
+        "the revoked Output composes after its Copy fallback"
+    );
+    a3_retire_records(&mut fixture, &records);
+    assert!(!fixture.events.backend.scene.has_pending_page_flips());
+    let copied = fixture
+        .events
+        .backend
+        .backing_pixels_for_tests(direct.target_xid)
+        .expect("queued fallback target remains readable")
+        .2;
+    assert_eq!(&copied[..3], &[0x56, 0x34, 0x12]);
+    a3_assert_queued_entry_copy_completion(
+        &mut fixture,
+        direct.candidate.present_id,
+        source_pin,
+        fallback_pin,
+    );
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: leave the queued-only owner set (composition stays suppressed / pins held).
+fn queued_entry_cancelled_by_output_removal() {
+    use yserver_core::backend::Backend;
+
+    let Some((fixture, direct)) = a3_output_fixture(1, 1102) else {
+        eprintln!("SKIP queued_entry_cancelled_by_output_removal: Vulkan fixture unavailable");
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let (source_pin, fallback_pin) =
+        a3_queue_first_output_entry(&mut fixture, &direct, 0x0012_3456);
+    fixture
+        .events
+        .backend
+        .platform
+        .for_tests_accept_output_power_commits();
+    let (outputs, _) = Backend::randr_outputs_and_modes(&mut fixture.events.backend);
+    let removed = &outputs[1];
+    assert!(
+        Backend::apply_crtc_config(
+            &mut fixture.events.backend,
+            removed.output_id,
+            &removed.name,
+            None,
+            0,
+            0,
+        )
+        .expect("remove Output(1) through the RandR Backend path")
+    );
+    assert_eq!(fixture.events.backend.platform.outputs.len(), 1);
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .active_scopes()
+            .is_empty(),
+        "removing the output clears its queued-only direct owner"
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .present_source_pins
+            .contains_key(&source_pin)
+            && fixture
+                .events
+                .backend
+                .present_source_pins
+                .contains_key(&fallback_pin),
+        "removed output's Copy pins stay held until fallback consumption"
+    );
+    a3_assert_queued_entry_copy_completion(
+        &mut fixture,
+        direct.candidate.present_id,
+        source_pin,
+        fallback_pin,
+    );
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: leave the queued-only owner set (composition stays suppressed / pins held).
+fn queued_entry_cancelled_by_vt_release() {
+    use yserver_core::{backend::Backend, core_loop::input_inventory::InputInventory};
+
+    let Some((fixture, direct)) = a3_output_fixture(1, 1103) else {
+        eprintln!("SKIP queued_entry_cancelled_by_vt_release: Vulkan fixture unavailable");
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let (source_pin, fallback_pin) =
+        a3_queue_first_output_entry(&mut fixture, &direct, 0x0012_3456);
+    fixture
+        .events
+        .backend
+        .platform
+        .for_tests_accept_output_power_commits();
+    super::commit_identity::install_recording_vt_io(&mut fixture);
+    Backend::begin_vt_release(&mut fixture.events.backend);
+    let events = fixture.events_mut();
+    Backend::finish_vt_release(
+        &mut events.backend,
+        &mut events.state,
+        &InputInventory::default(),
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .active_scopes()
+            .is_empty(),
+        "VT release clears queued-only direct ownership"
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .present_source_pins
+            .contains_key(&source_pin)
+            && fixture
+                .events
+                .backend
+                .present_source_pins
+                .contains_key(&fallback_pin),
+        "VT teardown retains Copy pins until fallback consumption"
+    );
+    a3_assert_queued_entry_copy_completion(
+        &mut fixture,
+        direct.candidate.present_id,
+        source_pin,
+        fallback_pin,
+    );
+    fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: leave the queued-only owner set (composition stays suppressed / pins held).
+fn queued_entry_cancelled_by_dpms_off() {
+    use yserver_core::backend::Backend;
+
+    let Some((fixture, direct)) = a3_output_fixture(1, 1104) else {
+        eprintln!("SKIP queued_entry_cancelled_by_dpms_off: Vulkan fixture unavailable");
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let (source_pin, fallback_pin) =
+        a3_queue_first_output_entry(&mut fixture, &direct, 0x0012_3456);
+    fixture
+        .events
+        .backend
+        .platform
+        .for_tests_accept_output_power_commits();
+    Backend::set_dpms_power(&mut fixture.events.backend, 3)
+        .expect("turn outputs off through the DPMS Backend path");
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .active_scopes()
+            .is_empty(),
+        "DPMS off clears queued-only direct ownership"
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .present_source_pins
+            .contains_key(&source_pin)
+            && fixture
+                .events
+                .backend
+                .present_source_pins
+                .contains_key(&fallback_pin),
+        "DPMS teardown retains Copy pins until fallback consumption"
+    );
+    a3_assert_queued_entry_copy_completion(
+        &mut fixture,
+        direct.candidate.present_id,
+        source_pin,
+        fallback_pin,
+    );
+    fixture.finish();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: leave the queued-only owner set (composition stays suppressed / pins held).
+fn queued_entry_cancelled_by_newer_copy_present() {
+    use yserver_core::backend::Backend;
+
+    let Some((fixture, direct)) = a3_output_fixture(1, 1105) else {
+        eprintln!("SKIP queued_entry_cancelled_by_newer_copy_present: Vulkan fixture unavailable");
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    let (source_pin, fallback_pin) =
+        a3_queue_first_output_entry(&mut fixture, &direct, 0x0012_3456);
+    let mut newer = fixture.install_direct_output_present(1, 1106, 0).candidate;
+    newer.dst_window_xid = direct.target_xid;
+    newer.paint_dst_host_xid = direct.target_xid;
+    newer.completion_dst_host_xid = direct.target_xid;
+    newer.valid_region_xid = 0xdead;
+    Backend::fill_rectangle(
+        &mut fixture.events.backend,
+        None,
+        newer.src_host_xid,
+        0x0065_4321,
+        0,
+        0,
+        newer.src_width,
+        newer.src_height,
+    )
+    .expect("paint newer Copy Present source through Backend");
+    let mut newer_event = direct.event.clone();
+    newer_event.present_id = newer.present_id;
+    newer_event.serial = u32::try_from(newer.present_id).expect("test Present id fits serial");
+    newer_event.host_xid = newer.src_host_xid;
+    newer_event.dst_host_xid = newer.paint_dst_host_xid;
+    assert!(
+        !Backend::try_present_direct(&mut fixture.events.backend, newer, newer_event)
+            .expect("newer ineligible Present takes the Copy path through Backend"),
+        "newer Present is not accepted as direct"
+    );
+    Backend::copy_area(
+        &mut fixture.events.backend,
+        None,
+        newer.src_host_xid,
+        newer.paint_dst_host_xid,
+        0,
+        0,
+        0,
+        0,
+        newer.src_width,
+        newer.src_height,
+    )
+    .expect("run newer Present Copy through Backend");
+    Backend::note_present_pixmap(
+        &mut fixture.events.backend,
+        newer.src_pixmap_xid,
+        newer.paint_dst_host_xid,
+    );
+    let owner = &fixture.events.backend.pstate.direct.outputs[1];
+    assert!(
+        owner.current.is_none()
+            && owner.pending.is_none()
+            && owner.queued_successor.is_none()
+            && !owner.hold_direct
+            && !owner.active(),
+        "newer Copy Present cancels the queued-only owner"
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .present_source_pins
+            .contains_key(&source_pin)
+            && fixture
+                .events
+                .backend
+                .present_source_pins
+                .contains_key(&fallback_pin),
+        "queued frame pins remain until its Copy is consumed"
+    );
+    assert!(!fixture.events.backend.output_is_direct(1));
+
+    let fd = fixture.kms_fd(1);
+    let before = fixture.events.recorders[&fd].records().len();
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("compose after newer Copy Present revoked queued ownership");
+    let crtc = fixture.events.backend.platform.outputs[1].output.crtc;
+    let records = a3_records_since(&fixture, fd, before);
+    assert!(a3_has_scene_commit_for(&records, crtc));
+    fixture.events.wait_for_submitted_gpu_work();
+    a3_retire_records(&mut fixture, &records);
+    assert!(!fixture.events.backend.scene.has_pending_page_flips());
+    let copied = fixture
+        .events
+        .backend
+        .backing_pixels_for_tests(direct.target_xid)
+        .expect("newer Copy target remains readable")
+        .2;
+    assert_eq!(&copied[..3], &[0x21, 0x43, 0x65]);
+    a3_assert_queued_entry_copy_completion(
+        &mut fixture,
+        direct.candidate.present_id,
+        source_pin,
+        fallback_pin,
+    );
+    fixture.finish_after_normal_drain();
 }

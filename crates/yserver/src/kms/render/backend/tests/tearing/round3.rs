@@ -106,7 +106,7 @@ fn transparent_cursor_is_hidden_for_direct_scanout_and_define_cursor_handoff() {
     Backend::define_cursor(&mut backend, None, root, opaque.as_raw())
         .expect("define one-pixel cursor");
     assert!(!backend.effective_cursor_hidden());
-    assert!(backend.tearing_cursor_wants_visible());
+    assert!(backend.tearing_cursor_wants_visible_for_outputs(&backend.tearing_scope_outputs()));
     assert!(backend.pstate.direct.root().unflip_requested);
     assert_eq!(
         backend.pstate.direct.root().unflip_reason,
@@ -195,7 +195,7 @@ fn transparent_cursor_is_hidden_for_direct_scanout_and_define_cursor_handoff() {
     );
     assert!(backend.pstate.tearing.deferred_cursor_wake.is_none());
     assert!(!backend.scene.has_pending_page_flips());
-    assert!(!backend.scene.cursor_transition_pending());
+    assert!(!backend.scene.cursor_transition_pending(&[0]));
     assert_eq!(
         backend.scene.cursor_mode(),
         crate::kms::render::scene::CursorPlaneMode::Hidden
@@ -233,7 +233,7 @@ fn transparent_cursor_is_hidden_for_direct_scanout_and_define_cursor_handoff() {
     );
     assert!(!backend.platform.any_cursor_plane_visible());
     assert!(!backend.scene.has_pending_page_flips());
-    assert!(!backend.scene.cursor_transition_pending());
+    assert!(!backend.scene.cursor_transition_pending(&[0]));
     assert_commit_sequence(
         &recorder,
         &[
@@ -331,7 +331,18 @@ fn entry_waits_for_queued_show_on_retire() {
         fixture.scene.events.backend.pstate.tearing.state,
         crate::kms::render::backend::TearingState::Off
     ));
-    assert_eq!(fixture.scene.events.backend.pstate.tearing.probation, 7);
+    assert_eq!(
+        fixture
+            .scene
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .tearing_probation
+            .count,
+        7
+    );
 
     fixture.scene.events.backend.platform.devices[0]
         .cursor
@@ -346,7 +357,7 @@ fn entry_waits_for_queued_show_on_retire() {
             .events
             .backend
             .scene
-            .cursor_transition_pending()
+            .cursor_transition_pending(&[0])
     );
     assert_eq!(
         recorder.records()[before_show].kind,
@@ -368,7 +379,18 @@ fn entry_waits_for_queued_show_on_retire() {
         fixture.scene.events.backend.pstate.tearing.state,
         crate::kms::render::backend::TearingState::Off
     );
-    assert_eq!(fixture.scene.events.backend.pstate.tearing.probation, 8);
+    assert_eq!(
+        fixture
+            .scene
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .tearing_probation
+            .count,
+        8
+    );
     assert_eq!(recorder.records().len(), before_eighth);
     assert!(
         fixture
@@ -376,7 +398,7 @@ fn entry_waits_for_queued_show_on_retire() {
             .events
             .backend
             .scene
-            .cursor_transition_pending()
+            .cursor_transition_pending(&[0])
     );
     assert!(
         !fixture
@@ -395,7 +417,7 @@ fn entry_waits_for_queued_show_on_retire() {
             .events
             .backend
             .scene
-            .cursor_transition_pending()
+            .cursor_transition_pending(&[0])
     );
     assert!(
         fixture
@@ -519,9 +541,24 @@ fn entry_from_held_direct_with_visible_hw_cursor_runs_handoff() {
         600,
     )
     .expect("paint held-direct fallback target from the direct frame");
-    fixture.scene.events.backend.pstate.tearing.probation_owner = Some(target);
-    fixture.scene.events.backend.pstate.tearing.probation =
-        crate::kms::render::backend::TEARING_ENTRY_PROBATION - 1;
+    fixture
+        .scene
+        .events
+        .backend
+        .pstate
+        .direct
+        .root_mut()
+        .tearing_probation
+        .window = Some(target);
+    fixture
+        .scene
+        .events
+        .backend
+        .pstate
+        .direct
+        .root_mut()
+        .tearing_probation
+        .count = crate::kms::render::backend::TEARING_ENTRY_PROBATION - 1;
     let (candidate, event, _) = prepare_direct_present_for_ids_with_storage(
         &mut fixture.scene.events.backend,
         71,
@@ -862,9 +899,24 @@ fn handoff_keeps_newest_copy_not_retained_direct_frame() {
     )
     .expect("paint fallback target from retained direct frame F0");
 
-    fixture.scene.events.backend.pstate.tearing.probation_owner = Some(target);
-    fixture.scene.events.backend.pstate.tearing.probation =
-        crate::kms::render::backend::TEARING_ENTRY_PROBATION - 1;
+    fixture
+        .scene
+        .events
+        .backend
+        .pstate
+        .direct
+        .root_mut()
+        .tearing_probation
+        .window = Some(target);
+    fixture
+        .scene
+        .events
+        .backend
+        .pstate
+        .direct
+        .root_mut()
+        .tearing_probation
+        .count = crate::kms::render::backend::TEARING_ENTRY_PROBATION - 1;
     let (candidate, event, _) = prepare_direct_present_for_ids_with_storage(
         &mut fixture.scene.events.backend,
         81,

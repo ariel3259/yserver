@@ -7,7 +7,7 @@ use crate::kms::render::{
     },
     scene::CursorUploadOutcome,
     store::DrawableId,
-    target::Src,
+    target::{PaintTarget, Src},
 };
 use ash::vk;
 use std::{
@@ -451,7 +451,12 @@ impl KmsBackend {
             .scope_for_output(output_idx)
             .and_then(|scope| self.pstate.direct.get(scope))
             .is_some_and(|owner| {
-                owner.active()
+                // A queued first entry is an admission claim, not hardware
+                // ownership yet. Keep the scene free to compose until the
+                // successor passes both dispatch gates and is submitted.
+                owner.pending.is_some()
+                    || owner.current.is_some()
+                    || (owner.hold_direct && owner.queued_successor.is_some())
                     || owner.unflip_outputs_to_replace.contains(&output_idx)
                     || owner.unflip_awaiting_outputs.contains_key(&output_idx)
             })
@@ -475,7 +480,12 @@ impl KmsBackend {
     }
 
     fn scene_output_ready_for_scheduled_compose(&self, output_idx: usize) -> bool {
-        !self.output_is_direct(output_idx) || self.output_has_degraded_unflip(output_idx)
+        let paced_by_tearing = self
+            .tearing_cursor_compose_deadline(self.monotonic_now())
+            .is_some()
+            && self.tearing_scope_outputs().contains(&output_idx);
+        !paced_by_tearing
+            && (!self.output_is_direct(output_idx) || self.output_has_degraded_unflip(output_idx))
     }
 
     fn scene_output_wants_scheduled_compose(&self, output_idx: usize) -> bool {
@@ -506,18 +516,21 @@ impl KmsBackend {
     }
 
     fn scene_cursor_eligible_outputs(&self) -> Vec<bool> {
+        let pacing_deadline = self.tearing_cursor_compose_deadline(self.monotonic_now());
+        let tearing_outputs = self.tearing_scope_outputs();
         (0..self.platform.outputs.len())
             .map(|output_idx| {
-                !self
-                    .pstate
-                    .direct
-                    .scope_for_output(output_idx)
-                    .and_then(|scope| self.pstate.direct.get(scope))
-                    .is_some_and(|owner| {
-                        owner.pending.is_some()
-                            || owner.queued_successor.is_some()
-                            || owner.unflip_requested
-                    })
+                pacing_deadline.is_none_or(|_| !tearing_outputs.contains(&output_idx))
+                    && !self
+                        .pstate
+                        .direct
+                        .scope_for_output(output_idx)
+                        .and_then(|scope| self.pstate.direct.get(scope))
+                        .is_some_and(|owner| {
+                            owner.pending.is_some()
+                                || owner.queued_successor.is_some()
+                                || owner.unflip_requested
+                        })
             })
             .collect()
     }
@@ -643,7 +656,9 @@ impl KmsBackend {
     }
 
     pub(in crate::kms::render::backend) fn request_direct_unflip(&mut self, reason: &'static str) {
-        self.pstate.request_direct_unflip(reason);
+        for scope in self.pstate.direct.active_scopes() {
+            self.request_direct_unflip_for(scope, reason);
+        }
     }
 
     pub(in crate::kms::render::backend) fn request_direct_unflip_for_outputs(
@@ -676,7 +691,21 @@ impl KmsBackend {
         scope: DirectScope,
         reason: &'static str,
     ) {
-        self.pstate.request_direct_unflip_for(scope, reason);
+        if self.cancel_queued_direct_entry_to_copy(scope).is_some() {
+            return;
+        }
+        self.pstate.mark_direct_unflip_for(scope, reason);
+    }
+
+    /// Route drawable-referencing unflips through queued-entry cancellation.
+    pub(in crate::kms::render::backend) fn request_direct_unflip_referencing(
+        &mut self,
+        ids: &[DrawableId],
+        reason: &'static str,
+    ) {
+        for scope in self.pstate.direct_scopes_referencing_drawables(ids) {
+            self.request_direct_unflip_for(scope, reason);
+        }
     }
 
     pub(in crate::kms::render::backend) fn direct_scopes_referencing_host_drawable(
@@ -753,7 +782,7 @@ impl KmsBackend {
             return;
         }
         let output_indices = self.direct_scope_outputs(scope);
-        let tearing = scope == DirectScope::Root && self.pstate.tearing.is_on();
+        let tearing = self.tearing_scope() == Some(scope);
         if tearing || self.effective_cursor_hidden() {
             // Tearing keeps every cursor plane detached. A hidden effective
             // cursor also must not leave a stale sprite bound over direct scanout.
@@ -909,7 +938,7 @@ impl KmsBackend {
         let mut refreshed_outputs = Vec::new();
         for scope in self.pstate.direct.active_scopes() {
             let scope_outputs = self.direct_scope_outputs(scope);
-            if scope == DirectScope::Root && self.pstate.tearing.is_on() {
+            if self.tearing_scope() == Some(scope) {
                 if let Some(owner) = self.pstate.direct.get_mut(scope) {
                     owner.cursor_bound_all = false;
                 }
@@ -1084,8 +1113,8 @@ impl KmsBackend {
         {
             return;
         }
-        if scope == DirectScope::Root && self.pstate.tearing.is_on() {
-            for output_idx in 0..self.platform.outputs.len() {
+        if self.tearing_scope() == Some(scope) {
+            for output_idx in self.direct_scope_outputs(scope) {
                 self.platform.clear_direct_cursor_retry(output_idx);
             }
             if let Some(owner) = self.pstate.direct.get_mut(scope) {
@@ -1632,15 +1661,6 @@ impl KmsBackend {
         owner_window: Option<u32>,
         fallback_off_reason: &'static str,
     ) {
-        let off_reason = if fallback_off_reason == "property" {
-            fallback_off_reason
-        } else {
-            self.pstate
-                .direct
-                .root()
-                .unflip_last_reason
-                .unwrap_or(fallback_off_reason)
-        };
         for (index, layout) in self.platform.outputs.iter().enumerate() {
             let was_enabled = before.get(index).copied().unwrap_or(false);
             let enabled = layout.output.vrr_committed.get();
@@ -1656,6 +1676,16 @@ impl KmsBackend {
                     );
                 }
             } else {
+                let off_reason = if fallback_off_reason == "property" {
+                    fallback_off_reason
+                } else {
+                    self.pstate
+                        .direct
+                        .scope_for_output(index)
+                        .and_then(|scope| self.pstate.direct.get(scope))
+                        .and_then(|owner| owner.unflip_last_reason)
+                        .unwrap_or(fallback_off_reason)
+                };
                 log::info!(
                     "kms: vrr off output={} crtc={} reason={off_reason}",
                     layout.key.connector_name,
@@ -1746,7 +1776,8 @@ impl KmsBackend {
                 window,
                 crtc_epoch,
                 ..
-            } if window == frame.candidate.dst_window_xid
+            } if self.tearing_scope() == Some(scope)
+                && window == frame.candidate.dst_window_xid
                 && crtc_epoch == frame.candidate.crtc_epoch
         );
         let async_shape = self
@@ -1780,14 +1811,24 @@ impl KmsBackend {
         let Some(owner) = self.pstate.direct.get(scope) else {
             return;
         };
-        if owner.unflip_requested || owner.pending.is_some() {
+        if owner.pending.is_some() {
+            return;
+        }
+        let first_output_entry = matches!(scope, DirectScope::Output(_))
+            && owner.current.is_none()
+            && !owner.hold_direct
+            && owner.queued_successor.is_some();
+        if owner.unflip_requested && !first_output_entry {
             return;
         }
         if let DirectScope::Output(output_idx) = scope
             && owner.queued_successor.is_some()
-            && !self.direct_output_frames_scene_eligible(output_idx)
+            && (self.scene.has_pending_page_flip(output_idx)
+                || (!first_output_entry && !self.direct_output_frames_scene_eligible(output_idx)))
         {
-            self.request_direct_unflip_for(scope, "queued_direct_successor_scene_changed");
+            if !first_output_entry {
+                self.request_direct_unflip_for(scope, "queued_direct_successor_scene_changed");
+            }
             return;
         }
         let direct_outputs = self.direct_scope_outputs(scope);
@@ -1795,6 +1836,24 @@ impl KmsBackend {
             .platform
             .scanout_commit_in_flight_for_outputs(&direct_outputs)
         {
+            return;
+        }
+        if first_output_entry
+            && !self
+                .pstate
+                .direct
+                .get(scope)
+                .and_then(|owner| owner.queued_successor.as_ref())
+                .is_some_and(|frame| self.queued_output_candidate_eligible(frame, scope))
+        {
+            if let Some(frame) = self
+                .pstate
+                .direct
+                .get_mut(scope)
+                .and_then(|owner| owner.queued_successor.take())
+            {
+                self.fallback_queued_direct_entry_to_copy(scope, frame);
+            }
             return;
         }
         let Some(mut successor) = self
@@ -1823,15 +1882,94 @@ impl KmsBackend {
                 log::warn!(
                     "scanout_m2: queued direct successor submit failed after predecessor retirement: {error}"
                 );
-                self.defer_direct_successor_skip(scope, successor);
-                if let Some(direct) = self.pstate.direct.get_mut(scope) {
-                    direct
-                        .completed
-                        .append(&mut direct.deferred_successor_skips);
+                if first_output_entry {
+                    self.fallback_queued_direct_entry_to_copy(scope, successor);
+                } else {
+                    self.defer_direct_successor_skip(scope, successor);
+                    if let Some(direct) = self.pstate.direct.get_mut(scope) {
+                        direct
+                            .completed
+                            .append(&mut direct.deferred_successor_skips);
+                    }
+                    self.request_direct_unflip_for(scope, "queued_direct_successor_submit_failed");
                 }
-                self.request_direct_unflip_for(scope, "queued_direct_successor_submit_failed");
             }
         }
+    }
+
+    fn fallback_queued_direct_entry_to_copy(
+        &mut self,
+        scope: DirectScope,
+        mut frame: DirectPresentFrame,
+    ) -> bool {
+        let candidate = frame.candidate;
+        let target = frame.fallback_target;
+        let copy_result = self.copy_direct_source_to_fallback_target(
+            frame.source_id,
+            candidate,
+            target,
+            "queued direct entry Copy fallback",
+        );
+        let copy_succeeded = copy_result.is_ok();
+        if let Err(error) = copy_result {
+            log::error!(
+                "scanout_m2: queued direct entry Copy fallback failed for present_id={}: {error:?}",
+                candidate.present_id
+            );
+        }
+
+        frame.event.completion_mode = if copy_succeeded {
+            yserver_protocol::x11::present::COMPLETE_MODE_COPY
+        } else {
+            self.note_present_skip();
+            yserver_protocol::x11::present::COMPLETE_MODE_SKIP
+        };
+        frame.event.completion_clock = None;
+        frame.event.emit_idle = true;
+        self.queued_copy_present_pins.insert(
+            candidate.present_id,
+            (frame.source_pin, frame.fallback_target_pin),
+        );
+        <Self as Backend>::enqueue_present_completion(
+            self,
+            frame.event,
+            candidate.completion_dst_host_xid,
+        );
+        if let DirectScope::Output(output_idx) = scope {
+            self.scene.mark_scene_structure_dirty_for_output(output_idx);
+        }
+        if let Some(owner) = self.pstate.direct.get_mut(scope) {
+            owner.hold_direct = false;
+            owner.unflip_requested = false;
+            owner.unflip_reason = None;
+            owner.unflip_last_reason = None;
+            owner.unflip_outputs_to_replace.clear();
+            owner.unflip_awaiting_outputs.clear();
+            owner.unflip_fallback_source = None;
+            owner.unflip_shadow_ready = false;
+            owner.degraded_composed_unflip = false;
+            owner.fresh_composed_unflip = false;
+            owner.reset_eligible_direct_probation();
+        }
+        copy_succeeded
+    }
+
+    fn cancel_queued_direct_entry_to_copy(&mut self, scope: DirectScope) -> Option<bool> {
+        let first_entry = matches!(scope, DirectScope::Output(_))
+            && self.pstate.direct.get(scope).is_some_and(|owner| {
+                owner.current.is_none()
+                    && owner.pending.is_none()
+                    && owner.queued_successor.is_some()
+            });
+        if !first_entry {
+            return None;
+        }
+        let frame = self
+            .pstate
+            .direct
+            .get_mut(scope)
+            .and_then(|owner| owner.queued_successor.take())?;
+        Some(self.fallback_queued_direct_entry_to_copy(scope, frame))
     }
 
     fn release_direct_frame(&mut self, scope: DirectScope, frame: DirectPresentFrame) {
@@ -1860,11 +1998,79 @@ impl KmsBackend {
         self.note_present_skip();
     }
 
+    /// Submit render work for the direct fallback Copy before its storage can
+    /// be replaced by a topology or session transition.
+    fn submit_direct_fallback_copy(&mut self) -> io::Result<()> {
+        self.engine
+            .flush_render_batch(
+                &mut self.store,
+                &mut self.platform.gpu,
+                crate::kms::render::engine::RenderFlushReason::Present,
+            )
+            .map_err(|error| {
+                io::Error::other(format!("scanout M2 lazy render flush: {error:?}"))
+            })?;
+        self.engine
+            .close_open_frame(
+                &mut self.store,
+                &mut self.platform.gpu,
+                crate::kms::render::frame_builder::CloseReason::PresentCompletionSignal,
+            )
+            .map_err(|error| {
+                io::Error::other(format!("scanout M2 lazy fallback frame close: {error:?}"))
+            })?;
+        self.engine
+            .flush_submit_group(
+                &mut self.store,
+                &mut self.platform.gpu,
+                crate::kms::render::submit_group::FlushReason::PresentCompletionSignal,
+            )
+            .map(|_| ())
+            .map_err(|error| io::Error::other(format!("scanout M2 lazy COW submit: {error:?}")))
+    }
+
+    /// Copy a retained direct source into the exact paint target captured for
+    /// that Present. Queued-entry fallback and lazy unflip materialization
+    /// share this operation so their source crop and destination offset cannot
+    /// drift apart.
+    fn copy_direct_source_to_fallback_target(
+        &mut self,
+        source_id: DrawableId,
+        candidate: PresentScanoutCandidate,
+        target: PaintTarget,
+        failure_context: &'static str,
+    ) -> io::Result<()> {
+        self.engine
+            .cow_copy_area(
+                &mut self.store,
+                &mut self.platform.gpu,
+                target.server_backing_dst(),
+                Src::server_internal(source_id),
+                ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D::default(),
+                    extent: ash::vk::Extent2D {
+                        width: u32::from(candidate.src_width),
+                        height: u32::from(candidate.src_height),
+                    },
+                },
+                ash::vk::Offset2D {
+                    x: target.offset().0 + i32::from(candidate.x_off),
+                    y: target.offset().1 + i32::from(candidate.y_off),
+                },
+            )
+            .map_err(|error| io::Error::other(format!("{failure_context}: {error:?}")))
+    }
+
     pub(in crate::kms::render::backend) fn queue_direct_successor(
         &mut self,
         scope: DirectScope,
         frame: DirectPresentFrame,
     ) {
+        let has_predecessor = self
+            .pstate
+            .direct
+            .get(scope)
+            .is_some_and(|owner| owner.pending.is_some() || owner.current.is_some());
         let superseded = self
             .pstate
             .direct
@@ -1874,7 +2080,10 @@ impl KmsBackend {
             self.defer_direct_successor_skip(scope, superseded);
         }
         if let Some(owner) = self.pstate.direct.get_mut(scope) {
-            owner.hold_direct = true;
+            owner.hold_direct = has_predecessor;
+            if !has_predecessor {
+                owner.completed.append(&mut owner.deferred_successor_skips);
+            }
         }
         log::debug!(
             "scanout_m2: queued latest direct successor present_id={}",
@@ -2067,6 +2276,15 @@ impl KmsBackend {
         &mut self,
         scope: DirectScope,
     ) -> io::Result<()> {
+        if let Some(copy_succeeded) = self.cancel_queued_direct_entry_to_copy(scope) {
+            if !copy_succeeded {
+                return Err(io::Error::other(
+                    "scanout M2: queued direct entry fallback Copy failed",
+                ));
+            }
+            self.submit_direct_fallback_copy()?;
+            return Ok(());
+        }
         let owner = self
             .pstate
             .direct
@@ -2116,52 +2334,13 @@ impl KmsBackend {
                 target.backing_id().as_u64(),
             )));
         }
-        self.engine
-            .cow_copy_area(
-                &mut self.store,
-                &mut self.platform.gpu,
-                target.server_backing_dst(),
-                Src::server_internal(source_id),
-                ash::vk::Rect2D {
-                    offset: ash::vk::Offset2D::default(),
-                    extent: ash::vk::Extent2D {
-                        width: u32::from(candidate.src_width),
-                        height: u32::from(candidate.src_height),
-                    },
-                },
-                ash::vk::Offset2D {
-                    x: target.offset().0 + i32::from(candidate.x_off),
-                    y: target.offset().1 + i32::from(candidate.y_off),
-                },
-            )
-            .map_err(|error| {
-                io::Error::other(format!("scanout M2 lazy fallback Copy: {error:?}"))
-            })?;
-        self.engine
-            .flush_render_batch(
-                &mut self.store,
-                &mut self.platform.gpu,
-                crate::kms::render::engine::RenderFlushReason::Present,
-            )
-            .map_err(|error| {
-                io::Error::other(format!("scanout M2 lazy render flush: {error:?}"))
-            })?;
-        self.engine
-            .close_open_frame(
-                &mut self.store,
-                &mut self.platform.gpu,
-                crate::kms::render::frame_builder::CloseReason::PresentCompletionSignal,
-            )
-            .map_err(|error| {
-                io::Error::other(format!("scanout M2 lazy fallback frame close: {error:?}"))
-            })?;
-        self.engine
-            .flush_submit_group(
-                &mut self.store,
-                &mut self.platform.gpu,
-                crate::kms::render::submit_group::FlushReason::PresentCompletionSignal,
-            )
-            .map_err(|error| io::Error::other(format!("scanout M2 lazy COW submit: {error:?}")))?;
+        self.copy_direct_source_to_fallback_target(
+            source_id,
+            candidate,
+            target,
+            "scanout M2 lazy fallback Copy",
+        )?;
+        self.submit_direct_fallback_copy()?;
         if let Some(owner) = self.pstate.direct.get_mut(scope) {
             owner.unflip_shadow_ready = true;
         }
@@ -2309,6 +2488,10 @@ impl KmsBackend {
         use crate::kms::render::scene::{OutputRoute, OutputSink};
 
         let outputs = self.direct_scope_outputs(scope);
+        let tearing_outputs = self.tearing_scope_outputs();
+        let tearing_intersects_scope = outputs
+            .iter()
+            .any(|output_idx| tearing_outputs.contains(output_idx));
         let scope_is_on_primary = match scope {
             DirectScope::Root => self.direct_scanout_topology_eligible(DirectScope::Root),
             DirectScope::Output(output_idx) => {
@@ -2328,7 +2511,7 @@ impl KmsBackend {
         !outputs.is_empty()
             // This handoff needs a fresh scene frame so the newest Present
             // Copy replaces the retained direct frame in the same commit.
-            && (!self.pstate.tearing.is_on() || tearing_cursor_handoff)
+            && (!tearing_intersects_scope || tearing_cursor_handoff)
             && scope_is_on_primary
             && !self.platform.scanout_commit_in_flight_for_outputs(&outputs)
             && outputs.iter().all(|&output_idx| {
@@ -3713,16 +3896,18 @@ impl KmsBackend {
         if !self.pstate.tearing.is_on() || self.effective_cursor_hidden() {
             return false;
         }
+        let Some(scope) = self.tearing_scope() else {
+            return false;
+        };
+        let outputs = self.direct_scope_outputs(scope);
+        let owner = self.pstate.direct.get(scope);
         matches!(
-            self.scene.cursor_mode(),
+            self.scene.cursor_mode_for_outputs(&outputs),
             crate::kms::render::scene::CursorPlaneMode::Sw
-        ) || (self.pstate.direct.root().unflip_reason == Some("tearing_cursor_handoff")
-            && !self
-                .pstate
-                .direct
-                .root()
-                .unflip_outputs_to_replace
-                .is_empty())
+        ) || owner.is_some_and(|owner| {
+            owner.unflip_reason == Some("tearing_cursor_handoff")
+                && !owner.unflip_outputs_to_replace.is_empty()
+        })
     }
 
     /// Earliest time a cursor-only software-scene wake may be composed while
@@ -3731,33 +3916,36 @@ impl KmsBackend {
         &self,
         now: std::time::Instant,
     ) -> Option<std::time::Instant> {
+        let outputs = self.tearing_scope_outputs();
         if !self.tearing_cursor_compose_cap_applies()
             || !self.scene.cursor_only_wake_pending()
-            || self.store.has_pending_presentation_damage()
-            || self.scene.owes_repaint()
+            || outputs.iter().any(|&output_idx| {
+                self.scene
+                    .output_has_pending_compose(output_idx, &self.store)
+            })
         {
             return None;
         }
 
         let last_compose = self.pstate.tearing.last_cursor_compose?;
-        let deadline = last_compose + self.pstate.tearing.cursor_compose_interval(&self.platform);
+        let deadline = last_compose
+            + self
+                .pstate
+                .tearing
+                .cursor_compose_interval(&self.platform, &outputs);
         (now < deadline).then_some(deadline)
     }
 
     pub(super) fn scene_wants_compose(&self) -> bool {
-        let cursor_compose_blocked = self
-            .tearing_cursor_compose_deadline(self.monotonic_now())
-            .is_some();
         let now = self.monotonic_now();
         let live_direct_vrr_wanted = self.live_direct_vrr_wanted_by_output();
         let cursor_eligible_outputs = self.scene_cursor_eligible_outputs();
-        (self.scene_has_ready_scheduled_output() && !cursor_compose_blocked)
-            || (!cursor_compose_blocked
-                && self.platform.has_eligible_atomic_cursor_move_for_outputs(
-                    now,
-                    &live_direct_vrr_wanted,
-                    &cursor_eligible_outputs,
-                ))
+        self.scene_has_ready_scheduled_output()
+            || self.platform.has_eligible_atomic_cursor_move_for_outputs(
+                now,
+                &live_direct_vrr_wanted,
+                &cursor_eligible_outputs,
+            )
     }
 
     #[cfg(test)]
@@ -4004,10 +4192,13 @@ impl KmsBackend {
     }
 
     fn prepare_tearing_scene_pass(&mut self) {
+        let tearing_outputs = self.tearing_scope_outputs();
         if std::mem::take(&mut self.platform.scene_cursor_hide_failed)
             && self.pstate.tearing.is_on()
             && !self.pstate.tearing.hide_failed_logged
-            && self.platform.any_cursor_plane_visible()
+            && tearing_outputs
+                .iter()
+                .any(|&idx| self.platform.cursor_plane_visible_for_output(idx))
         {
             log::warn!("kms: tearing cursor-plane hide failed; keeping composed flips on vsync");
             self.pstate.tearing.hide_failed_logged = true;
@@ -4021,10 +4212,13 @@ impl KmsBackend {
             return;
         }
         self.request_tearing_cursor_handoff();
-        if self.platform.any_cursor_plane_visible() {
+        if tearing_outputs
+            .iter()
+            .any(|&idx| self.platform.cursor_plane_visible_for_output(idx))
+        {
             return;
         }
-        for output_idx in 0..self.platform.outputs.len() {
+        for output_idx in tearing_outputs {
             let Some(shape) = self.platform.scene_async_shape(output_idx) else {
                 continue;
             };
@@ -4259,7 +4453,14 @@ impl KmsBackend {
         self.prepare_tearing_scene_pass();
         let active_scopes = self.pstate.direct.active_scopes();
         for &scope in &active_scopes {
+            let queued_first_entry = self.pstate.direct.get(scope).is_some_and(|owner| {
+                owner.pending.is_none()
+                    && owner.current.is_none()
+                    && !owner.hold_direct
+                    && owner.queued_successor.is_some()
+            });
             if let DirectScope::Output(output_idx) = scope
+                && !queued_first_entry
                 && !self.direct_output_frames_scene_eligible(output_idx)
             {
                 self.request_direct_unflip_for(scope, "composite_tick_output_scene_changed");
@@ -4273,9 +4474,28 @@ impl KmsBackend {
         if !active_scopes.is_empty() {
             use crate::kms::render::scene::CursorPlaneMode;
             if self.platform.any_output_transformed() {
-                self.request_direct_unflip("composite_tick_crtc_transform");
+                for &scope in &active_scopes {
+                    let queued_first_entry = self.pstate.direct.get(scope).is_some_and(|owner| {
+                        owner.pending.is_none()
+                            && owner.current.is_none()
+                            && !owner.hold_direct
+                            && owner.queued_successor.is_some()
+                    });
+                    if !queued_first_entry {
+                        self.request_direct_unflip_for(scope, "composite_tick_crtc_transform");
+                    }
+                }
             } else {
                 for &scope in &active_scopes {
+                    let queued_first_entry = self.pstate.direct.get(scope).is_some_and(|owner| {
+                        owner.pending.is_none()
+                            && owner.current.is_none()
+                            && !owner.hold_direct
+                            && owner.queued_successor.is_some()
+                    });
+                    if queued_first_entry {
+                        continue;
+                    }
                     let outputs = self.direct_scope_outputs(scope);
                     let cursor_mode = self.scene.cursor_mode_for_outputs(&outputs);
                     let root_overlay_empty = self.direct_root_overlay_empty_for_outputs(&outputs);
@@ -4332,9 +4552,16 @@ impl KmsBackend {
                     };
                     match submitted {
                         Ok(true) => {
-                            self.pstate
-                                .tearing
-                                .note_composed_submit(self.monotonic_now());
+                            let tearing_outputs = self.tearing_scope_outputs();
+                            let unflip_outputs = self.direct_scope_outputs(scope);
+                            if unflip_outputs
+                                .iter()
+                                .any(|output_idx| tearing_outputs.contains(output_idx))
+                            {
+                                self.pstate
+                                    .tearing
+                                    .note_composed_submit(self.monotonic_now());
+                            }
                         }
                         Ok(false) => {}
                         Err(error) => {
@@ -4378,14 +4605,7 @@ impl KmsBackend {
             return Ok(());
         }
         let vrr_before = self.vrr_committed_snapshot();
-        let composed_outputs = if self
-            .tearing_cursor_compose_deadline(self.monotonic_now())
-            .is_some()
-        {
-            None
-        } else {
-            self.compose_tick(&skip_outputs)
-        };
+        let composed_outputs = self.compose_tick(&skip_outputs);
         self.log_vrr_committed_changes(&vrr_before, None, "inherited");
         // `scene.tick` drains already-signalled copied completions itself,
         // without entering backend_scanout_on_scanout_render_completion.
@@ -4408,10 +4628,12 @@ impl KmsBackend {
                 }
             }
         }
-        if composed_outputs
-            .as_ref()
-            .is_some_and(|outputs| !outputs.is_empty())
-        {
+        let tearing_outputs = self.tearing_scope_outputs();
+        if composed_outputs.as_ref().is_some_and(|outputs| {
+            outputs
+                .iter()
+                .any(|output_idx| tearing_outputs.contains(output_idx))
+        }) {
             self.pstate
                 .tearing
                 .note_composed_submit(self.monotonic_now());
