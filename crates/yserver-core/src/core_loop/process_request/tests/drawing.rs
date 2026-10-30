@@ -153,6 +153,95 @@ fn query_font_invalid_fontable_returns_bad_font() {
     assert_eq!(&bytes[4..8], &0xdead_beefu32.to_le_bytes(), "bad font id");
 }
 
+fn run_request(
+    state: &mut ServerState,
+    backend: &mut RecordingBackend,
+    opcode: u8,
+    seq: u16,
+    body: &[u8],
+) {
+    process_request(
+        state,
+        backend,
+        ClientId(1),
+        SequenceNumber(seq),
+        RequestHeader {
+            opcode,
+            data: 0,
+            length_units: u32::try_from(body.len() / 4 + 1).unwrap(),
+        },
+        body,
+        None,
+    )
+    .expect("process_request");
+}
+
+/// Xorg: a GC created without GCFont holds the server default font
+/// (`dix/gc.c:507`), so QueryFont on its GContext answers with that font
+/// (`dixLookupFontable`) instead of BadFont.
+#[test]
+fn query_font_on_a_fontless_gc_answers_with_the_default_font() {
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    let mut backend = RecordingBackend::new();
+    crate::core_loop::process_request::install_default_font(&mut state, &mut backend)
+        .expect("default font");
+    // CreateGC(gc, drawable, value-mask = foreground | background).
+    let gc = 0x0010_0001u32;
+    let mut body = Vec::new();
+    for word in [gc, crate::resources::ROOT_WINDOW.0, 0xc, 0, 0x00ff_ffff] {
+        body.extend_from_slice(&word.to_le_bytes());
+    }
+    run_request(&mut state, &mut backend, 55, 1, &body);
+    run_request(&mut state, &mut backend, 47, 2, &gc.to_le_bytes());
+    let via_gc = read_all_available(&mut peer);
+    run_request(
+        &mut state,
+        &mut backend,
+        47,
+        3,
+        &crate::resources::DEFAULT_FONT.0.to_le_bytes(),
+    );
+    let via_font = read_all_available(&mut peer);
+    assert_eq!(via_gc[0], 1, "a reply, not an error: {via_gc:02x?}");
+    assert_eq!(via_gc[4..], via_font[4..], "same font as the default");
+    assert!(
+        u16::from_le_bytes([via_gc[46], via_gc[47]]) > 0,
+        "the default font carries properties"
+    );
+}
+
+/// CloseFont of the server-owned default font answers Success (as Xorg
+/// does) and leaves it in place for every GC that holds it.
+#[test]
+fn close_font_of_the_default_font_keeps_it() {
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    let mut backend = RecordingBackend::new();
+    crate::core_loop::process_request::install_default_font(&mut state, &mut backend)
+        .expect("default font");
+    run_request(
+        &mut state,
+        &mut backend,
+        46,
+        1,
+        &crate::resources::DEFAULT_FONT.0.to_le_bytes(),
+    );
+    assert!(read_all_available(&mut peer).is_empty(), "no error");
+    assert!(
+        state
+            .resources
+            .font(crate::resources::DEFAULT_FONT)
+            .is_some()
+    );
+    assert!(
+        !backend
+            .calls()
+            .iter()
+            .any(|c| matches!(c, crate::backend::recording::RecordedCall::CloseFont(_)))
+    );
+}
+
 #[test]
 fn query_text_extents_invalid_fontable_returns_bad_font() {
     let mut state = ServerState::new();

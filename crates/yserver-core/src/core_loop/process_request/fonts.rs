@@ -306,62 +306,90 @@ pub(super) fn handle_open_font(
             },
         )
     });
-    {
-        // Properties read from the font file (BDF/PCF) arrive as
-        // named (String, value) pairs — convert to wire (atom, CARD32)
-        // pairs here where the atom table lives. String values are
-        // themselves atoms (BDF ATOM-typed properties).
-        if !metrics.named_properties.is_empty() {
-            let named = std::mem::take(&mut metrics.named_properties);
-            let mut out: Vec<u8> = Vec::with_capacity(named.len() * 8 + 8);
-            let mut has_font_prop = false;
-            for (name, value) in &named {
-                if name == "FONT" {
-                    has_font_prop = true;
-                }
-                let name_atom = state.atoms.intern(name, false).0;
-                let v: u32 = match value {
-                    x11::FontPropValue::Card(c) => *c,
-                    #[allow(clippy::cast_sign_loss)]
-                    x11::FontPropValue::Int(i) => *i as u32,
-                    x11::FontPropValue::Str(s) => state.atoms.intern(s, false).0,
-                };
-                out.extend_from_slice(&name_atom.to_le_bytes());
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            // libX11's XCreateFontSet resolves non-XLFD base names
-            // exclusively through the FONT property (omGeneric.c) —
-            // always present on Xorg fonts; append if the file's
-            // property list lacked it.
-            if !has_font_prop {
-                let name_atom = state.atoms.intern("FONT", false).0;
-                let value_atom = state.atoms.intern(&request.name, false).0;
-                out.extend_from_slice(&name_atom.to_le_bytes());
-                out.extend_from_slice(&value_atom.to_le_bytes());
-            }
-            metrics.properties = out;
-        }
-        // Backends that don't proxy to a real X server (KMS) can't
-        // populate font properties from upstream and return an empty
-        // properties vec. Synthesize the standard XLFD-derived
-        // properties (FOUNDRY, FAMILY_NAME, WEIGHT_NAME, ..., FONT)
-        // so apps that interrogate them — fvwm3 menu rendering,
-        // Xt/Athena widgets — don't silently skip text drawing.
-        if metrics.properties.is_empty() {
-            metrics.properties = synthesize_font_properties(&mut state.atoms, &request.name);
-            log::debug!(
-                "OpenFont {:?}: synthesized {} property bytes ({} props), {} char_infos",
-                request.name,
-                metrics.properties.len(),
-                metrics.properties.len() / 8,
-                metrics.char_infos.len(),
-            );
-        }
-        state
-            .resources
-            .install_font(client_id, request.font, request.name, host_handle, metrics);
-    }
+    finish_font_properties(state, &request.name, &mut metrics);
+    state
+        .resources
+        .install_font(client_id, request.font, request.name, host_handle, metrics);
     Ok(RequestOutcome::Handled)
+}
+
+/// Open the server's default font, "fixed", as [`DEFAULT_FONT`] through the
+/// same backend path `OpenFont` takes (Xorg `SetDefaultFont("fixed")`,
+/// `dix/main.c:226`). Xorg treats a failure as fatal; so do the callers.
+///
+/// [`DEFAULT_FONT`]: crate::resources::DEFAULT_FONT
+pub fn install_default_font(state: &mut ServerState, backend: &mut dyn Backend) -> io::Result<()> {
+    const NAME: &str = "fixed";
+    let (host_handle, mut metrics) = backend.open_font(None, NAME).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("could not open default font {NAME:?}: {err}"),
+        )
+    })?;
+    finish_font_properties(state, NAME, &mut metrics);
+    state.resources.install_font(
+        crate::resources::SERVER_OWNER,
+        crate::resources::DEFAULT_FONT,
+        NAME.to_string(),
+        host_handle,
+        metrics,
+    );
+    Ok(())
+}
+
+/// Turn the font's properties into wire (atom, CARD32) pairs, synthesizing
+/// them from the name when the backend supplied none.
+fn finish_font_properties(state: &mut ServerState, name: &str, metrics: &mut x11::FontMetrics) {
+    // Properties read from the font file (BDF/PCF) arrive as
+    // named (String, value) pairs — convert to wire (atom, CARD32)
+    // pairs here where the atom table lives. String values are
+    // themselves atoms (BDF ATOM-typed properties).
+    if !metrics.named_properties.is_empty() {
+        let named = std::mem::take(&mut metrics.named_properties);
+        let mut out: Vec<u8> = Vec::with_capacity(named.len() * 8 + 8);
+        let mut has_font_prop = false;
+        for (prop, value) in &named {
+            if prop == "FONT" {
+                has_font_prop = true;
+            }
+            let name_atom = state.atoms.intern(prop, false).0;
+            let v: u32 = match value {
+                x11::FontPropValue::Card(c) => *c,
+                #[allow(clippy::cast_sign_loss)]
+                x11::FontPropValue::Int(i) => *i as u32,
+                x11::FontPropValue::Str(s) => state.atoms.intern(s, false).0,
+            };
+            out.extend_from_slice(&name_atom.to_le_bytes());
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        // libX11's XCreateFontSet resolves non-XLFD base names
+        // exclusively through the FONT property (omGeneric.c) —
+        // always present on Xorg fonts; append if the file's
+        // property list lacked it.
+        if !has_font_prop {
+            let name_atom = state.atoms.intern("FONT", false).0;
+            let value_atom = state.atoms.intern(name, false).0;
+            out.extend_from_slice(&name_atom.to_le_bytes());
+            out.extend_from_slice(&value_atom.to_le_bytes());
+        }
+        metrics.properties = out;
+    }
+    // Backends that don't proxy to a real X server (KMS) can't
+    // populate font properties from upstream and return an empty
+    // properties vec. Synthesize the standard XLFD-derived
+    // properties (FOUNDRY, FAMILY_NAME, WEIGHT_NAME, ..., FONT)
+    // so apps that interrogate them — fvwm3 menu rendering,
+    // Xt/Athena widgets — don't silently skip text drawing.
+    if metrics.properties.is_empty() {
+        metrics.properties = synthesize_font_properties(&mut state.atoms, name);
+        log::debug!(
+            "OpenFont {:?}: synthesized {} property bytes ({} props), {} char_infos",
+            name,
+            metrics.properties.len(),
+            metrics.properties.len() / 8,
+            metrics.char_infos.len(),
+        );
+    }
 }
 
 /// Build a `FontProp` byte sequence (8 bytes per property: name atom +
@@ -434,7 +462,14 @@ pub(super) fn handle_close_font(
     sequence: SequenceNumber,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    if let Some(font) = x11::free_resource_id(body) {
+    // The server's own fonts are not the client's to close: Xorg answers
+    // Success too, but GCs hold the font by refcount there, not by id.
+    if let Some(font) = x11::free_resource_id(body)
+        && state
+            .resources
+            .font(font)
+            .is_none_or(|f| f.owner != crate::resources::SERVER_OWNER)
+    {
         let removed = state.resources.close_font(font);
         if let Some(removed) = removed {
             let _ = backend.close_font(origin, removed.host_xid.as_raw());

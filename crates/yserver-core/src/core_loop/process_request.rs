@@ -105,6 +105,7 @@ use crate::core_loop::process_request::{
 pub(crate) use dri3::complete_dri3_export;
 pub use dri3::{Dri3ExportOp, PendingDri3Export};
 pub(crate) use focus_pointer::*;
+pub use fonts::install_default_font;
 pub(crate) use grabs::*;
 pub use present_ext::*;
 pub(crate) use props::*;

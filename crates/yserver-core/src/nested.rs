@@ -406,6 +406,7 @@ pub fn run(display: u16, width: u16, height: u16) -> io::Result<()> {
     // push host visual / colormap xids into the resource table so that
     // CreateWindow forwarding can translate our visual ids to host ones.
     crate::backend::install_backend_root_bindings(&mut state, &backend);
+    crate::core_loop::process_request::install_default_font(&mut state, &mut backend)?;
 
     let (poll, sender, rx) = crate::core_loop::sender::channel()?;
     let allocator = crate::core_loop::poll_tokens::ClientIdAllocator::new();

@@ -26,6 +26,7 @@ mod backing_lifetime;
 mod basics;
 mod border;
 mod border_protocol;
+mod core_text;
 mod depth_alpha;
 mod frame_builder;
 mod glyphs;
@@ -120,6 +121,9 @@ impl ProtoFixture {
         if let Some(v) = backend.argb_visual_xid() {
             state.resources.set_visual_host_xid(ARGB_VISUAL, v);
         }
+        let mut backend = backend;
+        yserver_core::core_loop::process_request::install_default_font(&mut state, &mut backend)
+            .ok()?;
 
         let (a, b) = UnixStream::pair().ok()?;
         state.clients.insert(1, Self::client_state(a));

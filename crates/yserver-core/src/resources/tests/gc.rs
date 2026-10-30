@@ -492,3 +492,46 @@ fn resolve_draw_state_font_resolves_handle() {
     let f = state.font.expect("font handle");
     assert_eq!(f.as_raw(), 0x4242);
 }
+
+fn install_default_font(table: &mut ResourceTable, host_xid: u32) {
+    table.install_font(
+        SERVER_OWNER,
+        DEFAULT_FONT,
+        "fixed".to_string(),
+        crate::backend::FontHandle::from_raw_for_test(host_xid),
+        FontMetrics {
+            font_ascent: 11,
+            font_descent: 2,
+            ..FontMetrics::default()
+        },
+    );
+}
+
+/// Xorg `CreateGC` (`dix/gc.c:507`): without GCFont the GC starts with the
+/// server default font, which a GContext then resolves to as a FONTABLE.
+#[test]
+fn create_gc_without_font_gets_the_default_font() {
+    let mut t = ResourceTable::new();
+    install_default_font(&mut t, 0x4141);
+    install_dummy_gc(&mut t, 0x500);
+    assert_eq!(t.gc(ResourceId(0x500)).unwrap().font, Some(DEFAULT_FONT));
+    let font = t.fontable(ResourceId(0x500)).expect("GContext resolves");
+    assert_eq!((font.id, font.metrics.font_ascent), (DEFAULT_FONT, 11));
+    let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
+    assert_eq!(state.font.map(|f| f.as_raw()), Some(0x4141));
+}
+
+#[test]
+fn create_gc_with_font_uses_the_given_font() {
+    let mut t = ResourceTable::new();
+    install_default_font(&mut t, 0x4141);
+    install_font_with_host_xid(&mut t, 0x700, 0x4242);
+    let mut req = empty_create_gc_request(ResourceId(0x500), ROOT_WINDOW);
+    req.font = Some(ResourceId(0x700));
+    t.create_gc(ClientId(1), req);
+    assert_eq!(
+        t.gc(ResourceId(0x500)).unwrap().font,
+        Some(ResourceId(0x700))
+    );
+    assert_eq!(t.fontable(ResourceId(0x500)).unwrap().id, ResourceId(0x700));
+}

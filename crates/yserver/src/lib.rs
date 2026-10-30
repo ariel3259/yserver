@@ -769,6 +769,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // saved press timestamps.
     crate::clock::init(state.start_instant);
     install_backend_root_bindings(&mut state, &backend);
+    yserver_core::core_loop::process_request::install_default_font(&mut state, &mut backend)?;
 
     let socket_dir = PathBuf::from("/tmp/.X11-unix");
     fs::create_dir_all(&socket_dir).map_err(|e| {

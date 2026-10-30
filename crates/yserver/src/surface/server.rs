@@ -274,6 +274,7 @@ fn serve(
     let mut state = topology.into_server_state();
     crate::clock::init(state.start_instant);
     install_backend_root_bindings(&mut state, &backend);
+    yserver_core::core_loop::process_request::install_default_font(&mut state, &mut backend)?;
     setup(&mut state, &mut backend)?;
 
     let socket_dir = PathBuf::from("/tmp/.X11-unix");

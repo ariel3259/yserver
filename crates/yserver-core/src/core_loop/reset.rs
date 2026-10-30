@@ -27,13 +27,14 @@ use crate::{
         process_disconnect::{
             HostPixmapFrees, destroy_zombie_resources_reporting, process_disconnect_reporting,
         },
+        process_request::install_default_font,
         run::{
             DeferredRequest, FairRequestQueue, LoopTelemetry, PendingBackendRequests,
             cancel_all_pending_backend_requests,
         },
         setup_thread::{self, SetupRegistry},
     },
-    resources::ROOT_WINDOW,
+    resources::{DEFAULT_FONT, ROOT_WINDOW},
     server::ServerState,
 };
 
@@ -447,10 +448,20 @@ pub(crate) fn reset_generation(
     for info in inventory.devices_by_source() {
         fresh.xi_register_source(info);
     }
+    // The old generation's default font goes with it; step 7 reopens it.
+    if let Some(font) = state.resources.close_font(DEFAULT_FONT) {
+        let _ = backend.close_font(None, font.host_xid.as_raw());
+    }
     *state = fresh;
 
     // -- 7. Re-attach the backend to the new state. -----------------
     install_backend_root_bindings(state, backend);
+    // Fatal at startup as in Xorg, so the boundary refuses rather than
+    // serving a generation whose GCs have no font.
+    if let Err(err) = install_default_font(state, backend) {
+        log::error!("reset: refusing to install {generation:?} -- {err}. Terminating.");
+        return None;
+    }
     // The fresh state carries identity transforms, as Xorg's reset does.
     backend.randr_layout_changed(state);
     if let Some(rootless) = rootless {
@@ -541,7 +552,7 @@ mod tests {
             setup_thread,
         },
         randr::{RandrMode, RandrOutput},
-        resources::ROOT_WINDOW,
+        resources::{DEFAULT_FONT, ROOT_WINDOW},
         server::{ClientState, GlxContext, GlxDrawable, GlxDrawableKind, ServerState},
     };
 
@@ -1225,6 +1236,49 @@ mod tests {
             "install_backend_root_bindings must have re-run against the \
              fresh state"
         );
+    }
+
+    /// Xorg reopens the default font each generation (`dix/main.c:226`):
+    /// the old one is closed on the backend, the new state has its own.
+    #[test]
+    fn reset_generation_reopens_the_default_font() {
+        let mut state = ServerState::new();
+        let mut backend = backend_with_topology();
+        crate::core_loop::process_request::install_default_font(&mut state, &mut backend)
+            .expect("default font");
+        let old = state
+            .resources
+            .font(DEFAULT_FONT)
+            .expect("installed")
+            .host_xid
+            .as_raw();
+        let generations = GenerationCounter::new();
+        let registry = setup_thread::make_registry();
+        let inventory = InputInventory::new();
+        let mut locals = Locals::new();
+        let p = poll();
+
+        reset_generation(
+            &mut state,
+            &mut backend,
+            p.registry(),
+            &generations,
+            &registry,
+            &inventory,
+            locals.borrow(),
+        )
+        .expect("reset proceeds");
+
+        assert!(
+            backend
+                .calls()
+                .iter()
+                .any(|c| matches!(c, RecordedCall::CloseFont(xid) if *xid == old)),
+            "the old generation's default font must be closed"
+        );
+        let font = state.resources.font(DEFAULT_FONT).expect("reopened");
+        assert_eq!(font.name, "fixed");
+        assert_ne!(font.host_xid.as_raw(), old);
     }
 
     /// Reset replays the live physical touchpad onto its registry-allocated

@@ -3,7 +3,7 @@ use crate::{
         ArcMode, CapStyle, ClipState, DrawState, FillRule, FillState, FillStyle, FontHandle,
         GcFunction, JoinStyle, LineStyle, SubwindowMode,
     },
-    resources::ResourceTable,
+    resources::{DEFAULT_FONT, ResourceTable},
 };
 use yserver_protocol::x11::{
     ClientId, ClipRectangles, CreateGcRequest, GcChange, ResourceId, SetClipRectanglesRequest,
@@ -34,6 +34,11 @@ impl ResourceTable {
             .and_then(|p| p.host_xid);
         gc.clip_pixmap = clip_pixmap;
         gc.clip_pixmap_host_xid = clip_pixmap_host_xid;
+        // Xorg `CreateGC` (`dix/gc.c:507`): the default font unless GCFont is given.
+        gc.font = self
+            .fonts
+            .contains_key(&DEFAULT_FONT.0)
+            .then_some(DEFAULT_FONT);
         Self::apply_gc_change(
             &mut gc,
             GcChangeView {
@@ -706,8 +711,8 @@ struct GcChangeView {
 
 impl Gc {
     /// Construct a GC with all-default attributes for the given id /
-    /// drawable / owner. Used by the `change_gc` and
-    /// `set_clip_rectangles` paths when the GC has not been seen before.
+    /// drawable / owner, before [`ResourceTable::create_gc`] gives it the
+    /// default font and the request's values.
     pub(super) fn with_defaults(id: ResourceId, drawable: ResourceId, owner: ClientId) -> Self {
         Self {
             id,

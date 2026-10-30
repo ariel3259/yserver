@@ -1571,9 +1571,9 @@ impl<P: Platform> XBackend<P> {
         _origin: Option<OriginContext>,
         state: &DrawState,
     ) -> io::Result<()> {
-        if let Some(font) = state.font {
-            self.core.current_font = Some(font.as_raw());
-        }
+        // Always the GC's own font: keeping the last one would draw a
+        // fontless GC's text in whatever font another GC left behind.
+        self.core.current_font = state.font.map(|font| font.as_raw());
         self.core.current_function = state.function;
         self.core.current_plane_mask = state.plane_mask;
         self.core.current_foreground = state.foreground;
