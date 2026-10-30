@@ -1732,6 +1732,245 @@ fn vrr_off_mode_still_clears_inherited() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: read Root's unflip reason for every output.
+fn vrr_off_log_names_the_output_owner_reason() {
+    use crate::kms::render::backend::DirectScope;
+
+    super::recording_scene::init_tearing_test_logger();
+    let Some(fixture) = super::recording_scene::RecordingSceneFixture::with_route(
+        2,
+        super::recording_scene::P1SceneRoute::Shared,
+    )
+    .expect("two-output VRR logging fixture") else {
+        eprintln!("SKIP vrr_off_log_names_the_output_owner_reason: Vulkan fixture unavailable");
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    fixture.events.backend.pstate.vrr_mode = crate::launch::VrrMode::Property;
+    for layout in &mut fixture.events.backend.platform.outputs {
+        layout.output.crtc_vrr_enabled_prop = Some(handle(VRR_PROP_ID));
+        layout.output.connector_vrr_capable = true;
+    }
+
+    let direct = fixture.install_direct_output_present(1, 18_201, 0);
+    let fd = super::direct_unflip::fd(&fixture);
+    let output0_crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let output1_crtc = fixture.events.backend.platform.outputs[1].output.crtc;
+    let output_name = fixture.events.backend.platform.outputs[1]
+        .key
+        .connector_name
+        .clone();
+    let direct_record =
+        super::direct_unflip::submit_output_present_via_backend(&mut fixture, &direct, 1);
+    let direct_id = super::support::accepted_event_id(&direct_record)
+        .expect("Output(1) direct commit has an accepted event ID");
+    assert!(contains_vrr_property(&direct_record, output1_crtc, 1));
+    assert!(!has_vrr_property(&direct_record, output0_crtc));
+    assert!(
+        fixture.events.backend.platform.outputs[1]
+            .output
+            .vrr_committed
+            .get(),
+        "the accepted Output(1) direct commit records VRR on"
+    );
+    assert_eq!(
+        fixture.events.backend.pstate.direct.scope_for_output(1),
+        Some(DirectScope::Output(1)),
+        "the direct frame is owned by Output(1)"
+    );
+    super::atomic_events::complete_recorded_attempt(
+        &mut fixture,
+        fd,
+        &direct_record,
+        direct_id,
+        92,
+    );
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[direct.candidate.present_id],
+        &[],
+    );
+
+    super::recording_scene::clear_vrr_test_logs();
+    Backend::destroy_subwindow(&mut fixture.events.backend, None, direct.target_xid)
+        .expect("destroy Output(1)'s direct window through Backend");
+    assert_eq!(
+        fixture.events.backend.pstate.direct.outputs[1].unflip_last_reason,
+        Some("destroy_direct_frame_drawable"),
+        "the affected owner records the window-destroy reason"
+    );
+    let replacement_start = super::direct_unflip::record_count(&fixture, fd);
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("submit Output(1)'s composed replacement through Backend");
+    let replacements = super::direct_unflip::records_since(&fixture, fd, replacement_start);
+    let replacement = replacements
+        .iter()
+        .find(|record| {
+            super::support::accepted_event_id(record).is_some()
+                && record.events.iter().any(|event| event.crtc == output1_crtc)
+        })
+        .expect("an accepted composed replacement reaches Output(1)");
+    assert!(
+        contains_vrr_property(replacement, output1_crtc, 0),
+        "the composed replacement clears Output(1)'s committed VRR property"
+    );
+    assert!(
+        !fixture.events.backend.platform.outputs[1]
+            .output
+            .vrr_committed
+            .get(),
+        "the accepted replacement records VRR off for Output(1)"
+    );
+    let output_owner_reason = fixture.events.backend.pstate.direct.outputs[1]
+        .unflip_last_reason
+        .expect("Output(1) retains its latest unflip reason through replacement submission");
+    let expected_output_reason = format!(
+        "kms: vrr off output={output_name} crtc={} reason={output_owner_reason}",
+        u32::from(output1_crtc)
+    );
+    let logs = super::recording_scene::vrr_test_logs();
+    assert!(
+        logs.lines().any(|line| line == expected_output_reason),
+        "Output(1)'s VRR-off line uses its owner reason; logs={logs:?}"
+    );
+    for (offset, record) in replacements.iter().enumerate() {
+        let Some(event_id) = super::support::accepted_event_id(record) else {
+            continue;
+        };
+        super::atomic_events::complete_recorded_attempt(
+            &mut fixture,
+            fd,
+            record,
+            event_id,
+            93 + u32::try_from(offset).expect("replacement index fits"),
+        );
+    }
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[],
+        &[direct.candidate.present_id],
+    );
+    assert!(
+        fixture.events.backend.pstate.direct.outputs[1]
+            .current
+            .is_none(),
+        "Output(1)'s direct frame retires after its accepted replacement"
+    );
+    fixture.finish_after_normal_drain();
+
+    let Some((fixture, direct)) = direct_fixture(18_202, 0) else {
+        eprintln!(
+            "SKIP vrr_off_log_names_the_output_owner_reason: Root Vulkan fixture unavailable"
+        );
+        return;
+    };
+    let mut fixture = fixture.cleanup_guard();
+    set_vrr_capable(&mut fixture);
+    fixture.events.backend.pstate.vrr_mode = crate::launch::VrrMode::Property;
+    let fd = super::direct_unflip::fd(&fixture);
+    let crtc = fixture.events.backend.platform.outputs[0].output.crtc;
+    let output_name = fixture.events.backend.platform.outputs[0]
+        .key
+        .connector_name
+        .clone();
+    let direct_record = accepted_direct_record(&mut fixture, &direct, fd);
+    let direct_id = super::support::accepted_event_id(&direct_record)
+        .expect("Root direct commit has an accepted event ID");
+    assert!(contains_vrr_property(&direct_record, crtc, 1));
+    super::direct_unflip::complete_direct_initial(&mut fixture, &direct_record, direct_id, fd);
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[direct.candidate.present_id],
+        &[],
+    );
+    assert_eq!(
+        fixture.events.backend.pstate.direct.scope_for_output(0),
+        Some(DirectScope::Root),
+        "the single output is owned by Root"
+    );
+
+    super::recording_scene::clear_vrr_test_logs();
+    Backend::destroy_subwindow(&mut fixture.events.backend, None, direct.target_xid)
+        .expect("destroy Root's direct window through Backend");
+    assert_eq!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .unflip_last_reason,
+        Some("destroy_direct_frame_drawable"),
+        "Root records the window-destroy reason"
+    );
+    let replacement_start = super::direct_unflip::record_count(&fixture, fd);
+    Backend::maybe_composite(&mut fixture.events.backend)
+        .expect("submit Root's composed replacement through Backend");
+    let replacements = super::direct_unflip::records_since(&fixture, fd, replacement_start);
+    let replacement = replacements
+        .iter()
+        .find(|record| {
+            super::support::accepted_event_id(record).is_some()
+                && record.events.iter().any(|event| event.crtc == crtc)
+        })
+        .expect("an accepted composed replacement reaches the Root output");
+    assert!(contains_vrr_property(replacement, crtc, 0));
+    assert!(
+        !fixture.events.backend.platform.outputs[0]
+            .output
+            .vrr_committed
+            .get(),
+        "the accepted Root replacement records VRR off"
+    );
+    let root_owner_reason = fixture
+        .events
+        .backend
+        .pstate
+        .direct
+        .root()
+        .unflip_last_reason
+        .expect("Root retains its latest unflip reason through replacement submission");
+    let expected_root_reason = format!(
+        "kms: vrr off output={output_name} crtc={} reason={root_owner_reason}",
+        u32::from(crtc)
+    );
+    let logs = super::recording_scene::vrr_test_logs();
+    assert!(
+        logs.lines().any(|line| line == expected_root_reason),
+        "the Root-owned output keeps Root's unflip reason; logs={logs:?}"
+    );
+    for (offset, record) in replacements.iter().enumerate() {
+        let Some(event_id) = super::support::accepted_event_id(record) else {
+            continue;
+        };
+        super::atomic_events::complete_recorded_attempt(
+            &mut fixture,
+            fd,
+            record,
+            event_id,
+            94 + u32::try_from(offset).expect("replacement index fits"),
+        );
+    }
+    super::direct_unflip::drain_present_notifications(
+        &mut fixture,
+        &[],
+        &[direct.candidate.present_id],
+    );
+    assert!(
+        fixture
+            .events
+            .backend
+            .pstate
+            .direct
+            .root()
+            .current
+            .is_none()
+    );
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
 // Mutation: restore the CARDINAL type check or the `== 1` check; INTEGER/1 and CARDINAL/2 must enable VRR.
 fn vrr_property_mode_reads_like_xorg() {
     let Some((fixture, mut direct)) =

@@ -1661,15 +1661,6 @@ impl KmsBackend {
         owner_window: Option<u32>,
         fallback_off_reason: &'static str,
     ) {
-        let off_reason = if fallback_off_reason == "property" {
-            fallback_off_reason
-        } else {
-            self.pstate
-                .direct
-                .root()
-                .unflip_last_reason
-                .unwrap_or(fallback_off_reason)
-        };
         for (index, layout) in self.platform.outputs.iter().enumerate() {
             let was_enabled = before.get(index).copied().unwrap_or(false);
             let enabled = layout.output.vrr_committed.get();
@@ -1685,6 +1676,16 @@ impl KmsBackend {
                     );
                 }
             } else {
+                let off_reason = if fallback_off_reason == "property" {
+                    fallback_off_reason
+                } else {
+                    self.pstate
+                        .direct
+                        .scope_for_output(index)
+                        .and_then(|scope| self.pstate.direct.get(scope))
+                        .and_then(|owner| owner.unflip_last_reason)
+                        .unwrap_or(fallback_off_reason)
+                };
                 log::info!(
                     "kms: vrr off output={} crtc={} reason={off_reason}",
                     layout.key.connector_name,
