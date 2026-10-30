@@ -289,8 +289,10 @@ scanout when all outputs share the primary device and refresh rates within
 0.5%. Tearing has one direct owner at a time and may belong to a fullscreen
 client on one monitor while other monitors are on. A second client asking to
 tear stays direct with synchronized flips until the current owner releases
-tearing. A paused owner keeps tearing. VRR with multiple monitors enabled is
-validated in a later change.
+tearing. A paused owner keeps tearing. VRR is per monitor: each output with a
+capable connector uses VRR while its own fullscreen client scans out directly
+and asks for it, so several monitors can use VRR at once; others keep their
+fixed refresh.
 
 It picks the lowest free display, mints a per-session
 MIT-MAGIC-COOKIE-1 (a server copy plus an entry in `~/.Xauthority`),

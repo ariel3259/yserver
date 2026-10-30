@@ -36,6 +36,9 @@ use yserver_core::backend::{Backend, ModeSpec};
 
 const VRR_PROP_ID: u32 = 90;
 
+#[path = "vrr_per_output.rs"]
+mod per_output;
+
 type PropertySignature = (String, String, u64);
 type CommitSignature = (
     AtomicCommitKind,
@@ -1003,9 +1006,66 @@ fn present_request_state(
     state
 }
 
+fn add_present_test_client(state: &mut yserver_core::server::ServerState, client_id: u32) {
+    use yserver_core::{resources::ROOT_WINDOW, server::ClientState, transport::Transport};
+    use yserver_protocol::x11::ClientByteOrder;
+
+    let (writer, _peer) = Transport::pair().expect("second VRR test client transport");
+    state.clients.insert(
+        client_id,
+        ClientState {
+            writer: Arc::new(Mutex::new(writer)),
+            is_local: true,
+            fd_passing: true,
+            internal: false,
+            byte_order: ClientByteOrder::LittleEndian,
+            last_sequence: Arc::new(AtomicU16::new(0)),
+            resource_id_base: 0,
+            resource_id_mask: u32::MAX,
+            event_masks: HashMap::new(),
+            save_set: HashSet::new(),
+            big_requests_enabled: false,
+            xi2_masks: HashMap::new(),
+            xi1_event_classes: HashSet::new(),
+            xi1_window_event_classes: HashMap::new(),
+            outbound: Default::default(),
+            watching_writable: false,
+            write_failed: false,
+            gone: false,
+            focused_window: ROOT_WINDOW,
+            reader_control: None,
+        },
+    );
+    assert!(state.clients.contains_key(&client_id));
+}
+
 fn request_vrr_property(
     state: &mut yserver_core::server::ServerState,
     backend: &mut KmsBackend,
+    window: u32,
+    property: u32,
+    property_type: u32,
+    format: u8,
+    items: &[u32],
+    sequence: u16,
+) {
+    request_vrr_property_for_client(
+        state,
+        backend,
+        1,
+        window,
+        property,
+        property_type,
+        format,
+        items,
+        sequence,
+    );
+}
+
+fn request_vrr_property_for_client(
+    state: &mut yserver_core::server::ServerState,
+    backend: &mut KmsBackend,
+    client_id: u32,
     window: u32,
     property: u32,
     property_type: u32,
@@ -1033,7 +1093,7 @@ fn request_vrr_property(
     yserver_core::core_loop::process_request::process_request(
         state,
         backend,
-        ClientId(1),
+        ClientId(client_id),
         SequenceNumber(sequence),
         RequestHeader {
             opcode: 18,
@@ -1053,6 +1113,17 @@ fn delete_vrr_property(
     property: u32,
     sequence: u16,
 ) {
+    delete_vrr_property_for_client(state, backend, 1, window, property, sequence);
+}
+
+fn delete_vrr_property_for_client(
+    state: &mut yserver_core::server::ServerState,
+    backend: &mut KmsBackend,
+    client_id: u32,
+    window: u32,
+    property: u32,
+    sequence: u16,
+) {
     use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
 
     let mut body = Vec::with_capacity(8);
@@ -1061,7 +1132,7 @@ fn delete_vrr_property(
     yserver_core::core_loop::process_request::process_request(
         state,
         backend,
-        ClientId(1),
+        ClientId(client_id),
         SequenceNumber(sequence),
         RequestHeader {
             opcode: 19,
@@ -1239,11 +1310,20 @@ fn finish_property_direct_scanout(
 }
 
 fn add_property_window(state: &mut yserver_core::server::ServerState, window: u32, host_xid: u32) {
+    add_property_window_for_client(state, 1, window, host_xid);
+}
+
+fn add_property_window_for_client(
+    state: &mut yserver_core::server::ServerState,
+    client_id: u32,
+    window: u32,
+    host_xid: u32,
+) {
     use yserver_core::resources::ROOT_WINDOW;
     use yserver_protocol::x11::{ClientId, CreateWindowRequest, ResourceId};
 
     state.resources.create_window(
-        ClientId(1),
+        ClientId(client_id),
         CreateWindowRequest {
             depth: 24,
             window: ResourceId(window),

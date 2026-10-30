@@ -237,9 +237,11 @@ seen on Xorg, is that a system-tray icon such as Steam's can create an
 override-redirect window above the fullscreen game, preventing Muffin
 from unredirecting it and keeping VRR off ([upstream issue
 #12687](https://github.com/linuxmint/cinnamon/issues/12687)). A desktop
-without a compositor, such as i3, is unaffected. VRR with multiple
-monitors enabled is validated in a later change. Color management / HDR
-is a valid future direction but not yet implemented.
+without a compositor, such as i3, is unaffected. VRR is per monitor: each
+capable output uses VRR while its own fullscreen client scans out directly
+and asks for it. Several monitors can use VRR at once; others keep their
+fixed refresh. Color management / HDR is a valid future direction but not
+yet implemented.
 
 ## What's not in this document
 
