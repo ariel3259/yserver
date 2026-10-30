@@ -3304,73 +3304,60 @@ pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dy
                 by_domain
                     .entry((crtc_id, crtc_epoch))
                     .or_default()
-                    .push((pid, eff.wrapping_sub(1)));
+                    .push((pid, eff));
             }
         }
-        for ((crtc_id, _crtc_epoch), future_parked) in by_domain {
-            let due_clock =
-                crate::core_loop::process_request::present_completion_due_clock_for_domain(
-                    state,
-                    crtc_id,
-                    _crtc_epoch,
-                    None,
-                );
+        for ((crtc_id, crtc_epoch), future_parked) in by_domain {
             let result = if backend.present_absolute_vblank_arm_supported(crtc_id) {
                 backend.arm_present_shared_wake(crtc_id)
             } else {
                 Ok(false)
             };
-            match result {
+            let covered = match result {
                 Ok(true) => {
                     log::debug!(
                         "PRESENT-DBG: arm_present_shared_wake crtc=0x{crtc_id:x} pending={} -> armed",
                         future_parked.len()
                     );
+                    true
                 }
                 Ok(false) => {
                     log::debug!(
                         "PRESENT-DBG: arm_present_shared_wake crtc=0x{crtc_id:x} pending={} -> unavailable",
                         future_parked.len()
                     );
-                    let ids: Vec<u64> = future_parked
-                        .iter()
-                        .filter_map(|&(pid, target)| {
-                            crate::present_scheduler::msc_is_after(
-                                target,
-                                due_clock.msc.wrapping_add(1),
-                            )
-                            .then_some(pid)
-                        })
-                        .collect();
-                    crate::core_loop::process_request::execute_parked_present_ids(
-                        state,
-                        backend,
-                        &ids,
-                        "idle_fallback",
-                    );
+                    false
                 }
                 Err(error) => {
                     log::warn!(
                         "PRESENT-DBG: arm_present_shared_wake crtc=0x{crtc_id:x} pending={} -> ERR {error}",
                         future_parked.len()
                     );
-                    let ids: Vec<u64> = future_parked
-                        .iter()
-                        .filter_map(|&(pid, target)| {
-                            crate::present_scheduler::msc_is_after(
-                                target,
-                                due_clock.msc.wrapping_add(1),
-                            )
-                            .then_some(pid)
-                        })
-                        .collect();
-                    crate::core_loop::process_request::execute_parked_present_ids(
-                        state,
-                        backend,
-                        &ids,
-                        "idle_fallback",
-                    );
+                    false
                 }
+            };
+            if !covered {
+                // Preserve the old fallback's general-clock eligibility.
+                // The completion clock above decides whether a wake is
+                // needed; it must not make an in-flight-flip next-MSC entry
+                // look distant (or hide a distant entry) when arming fails.
+                let general_msc = crate::core_loop::process_request::cached_present_crtc_clock(
+                    state, crtc_id, crtc_epoch,
+                )
+                .msc;
+                let ids: Vec<u64> = future_parked
+                    .iter()
+                    .filter_map(|&(pid, target)| {
+                        crate::present_scheduler::msc_is_after(target, general_msc.wrapping_add(1))
+                            .then_some(pid)
+                    })
+                    .collect();
+                crate::core_loop::process_request::execute_parked_present_ids(
+                    state,
+                    backend,
+                    &ids,
+                    "idle_fallback",
+                );
             }
         }
     }

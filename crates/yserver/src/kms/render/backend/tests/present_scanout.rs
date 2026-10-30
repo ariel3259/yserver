@@ -738,21 +738,38 @@ fn arm_present_shared_wake_false_result_is_not_tracked_as_covered() {
     assert!(b.pstate.shared_wake_armed.is_empty());
 }
 
-// Mutation: restore per-target sequence arms so each descending target queues another event.
+// Mutation: restore per-target arms or omit Backend's cursor-only flip submission.
 #[test]
 fn shared_wake_outstanding_arms_stay_bounded() {
     let (mut backend, crtc_key, randr_crtc_id, source) = shared_wake_test_backend();
     let mut state = ServerState::new();
-    const PARKED_WINDOW: u32 = 0x5f10;
-    seed_window(&mut backend, PARKED_WINDOW, None, 0, 0);
+    const DESTROYED_WINDOW: u32 = 0x5f10;
+    let destroyed_window_id = seed_window(&mut backend, DESTROYED_WINDOW, None, 0, 0);
     let crtc = backend.platform.outputs[0].output.crtc;
+    let recorder = atomic_cursor_recording_sink(&mut backend);
+    let position = backend.platform.for_tests_seed_atomic_cursor_position(
+        0,
+        atomic_cursor_raw(0x9501),
+        atomic_cursor_raw(0x9502),
+        atomic_cursor_raw(0x9503),
+        40,
+        50,
+        0,
+        0,
+    );
+    backend.scene.scene_structure_dirty = false;
+    backend.scene.test_set_flip_in_flight(false);
+    for drawable in backend.store.armed_damaged_ids() {
+        if let Some(snapshot) = backend.store.peek_presentation_damage(drawable) {
+            backend.store.ack_presentation_damage(snapshot);
+        }
+    }
     let mut issued = 0usize;
     let mut delivered = 0usize;
     let mut max_outstanding = 0usize;
-    let mut parked_targets = Vec::new();
+    let mut flip_submitted = false;
 
     for (iteration, target) in (1_u64..=140).rev().enumerate() {
-        parked_targets.push(target);
         Backend::arm_idle_vblanks(&mut backend, randr_crtc_id, &[target])
             .expect("relative idle arm");
         assert!(
@@ -768,29 +785,71 @@ fn shared_wake_outstanding_arms_stay_bounded() {
             "outstanding tagged + idle arms: {outstanding}"
         );
 
-        // A flip is still consumed while the tagged wake occupies its own slot.
-        let frame = u32::try_from(iteration + 10).unwrap();
-        source.queue_flip(crtc, frame);
-        drain_shared_wake_test_events(&mut backend, &mut state);
-        assert_eq!(
-            backend.platform.present_get_ust_msc(crtc_key).0,
-            u64::from(frame)
-        );
+        if !flip_submitted {
+            Backend::maybe_composite(&mut backend)
+                .expect("submit cursor-only flip while the shared wake is outstanding");
+            let record = recorder
+                .records()
+                .into_iter()
+                .find(|record| record.kind == crate::drm::atomic::AtomicCommitKind::CursorOnly)
+                .expect("Backend submitted a cursor-only atomic flip");
+            assert_eq!(
+                record.result,
+                crate::drm::atomic::tests_support::ScriptedResult::Ok
+            );
+            assert!(
+                record
+                    .flags
+                    .contains(::drm::control::AtomicCommitFlags::PAGE_FLIP_EVENT)
+            );
+            assert!(record.events.iter().any(|event| event.crtc == crtc));
+            assert!(
+                backend
+                    .platform
+                    .for_tests_atomic_cursor_commit_is_in_flight(
+                        position.device_key,
+                        position.crtc
+                    ),
+                "the accepted page-flip commit is in flight with the Present wake armed"
+            );
+
+            // Deliver the driver event only after Backend has submitted the
+            // commit above; this retires that actual flip through the normal
+            // page-flip event path.
+            let frame = 10;
+            source.queue_flip(crtc, frame);
+            drain_shared_wake_test_events(&mut backend, &mut state);
+            assert_eq!(
+                backend.platform.present_get_ust_msc(crtc_key).0,
+                u64::from(frame)
+            );
+            assert!(
+                !backend
+                    .platform
+                    .for_tests_atomic_cursor_commit_is_in_flight(
+                        position.device_key,
+                        position.crtc
+                    ),
+            );
+            flip_submitted = true;
+        }
 
         if (iteration + 1) % 64 == 0 {
             let retiring = source.legacy_vblank_arms().len();
-            source.fire_legacy_vblank_arms(2_000_000 + i64::from(frame), frame + 1);
+            let sequence = u32::try_from(iteration + 11).unwrap();
+            source.fire_legacy_vblank_arms(2_000_000 + i64::from(sequence), sequence);
             delivered += retiring;
             drain_shared_wake_test_events(&mut backend, &mut state);
         }
     }
 
-    // Destroy the window while future targets remain parked. The queued wake
-    // survives and retires without another per-target arm.
-    Backend::destroy_subwindow(&mut backend, None, PARKED_WINDOW)
-        .expect("destroy the window with parked targets");
-    assert!(!backend.windows.contains_key(&PARKED_WINDOW));
-    parked_targets.clear();
+    // Destroy the real backend window while the final shared wake remains
+    // queued. Core-side Present cancellation with a parked target is covered
+    // through the DestroyWindow request in the yserver-core regression.
+    Backend::destroy_subwindow(&mut backend, None, DESTROYED_WINDOW)
+        .expect("destroy the backend window through Backend");
+    assert!(!backend.windows.contains_key(&DESTROYED_WINDOW));
+    assert!(backend.store.get(destroyed_window_id).is_none());
     let retiring = source.legacy_vblank_arms().len();
     source.fire_legacy_vblank_arms(4_000_000, 200);
     delivered += retiring;
@@ -798,7 +857,7 @@ fn shared_wake_outstanding_arms_stay_bounded() {
 
     assert_eq!(max_outstanding, 2);
     assert_eq!(issued - delivered, 0);
-    assert!(parked_targets.is_empty());
+    assert!(flip_submitted);
     assert!(backend.pstate.shared_wake_armed.is_empty());
     assert!(backend.pstate.armed_vblank_targets.is_empty());
 }

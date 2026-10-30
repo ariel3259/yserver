@@ -228,14 +228,13 @@ fn dispatch_present_body(
     .unwrap();
 }
 
-fn dispatch_future_present_pixmap(
+fn future_present_pixmap_request(
     state: &mut ServerState,
-    backend: &mut RecordingBackend,
     window: u32,
     pixmap: u32,
     present_id: u32,
     target_msc: u64,
-) {
+) -> Vec<u8> {
     if state.resources.window(ResourceId(window)).is_none() {
         create_present_test_window(state, window, 0, 0, 32, 32);
         let target = state
@@ -263,6 +262,18 @@ fn dispatch_future_present_pixmap(
     let mut body = pixmap_body(window, pixmap);
     body[8..12].copy_from_slice(&present_id.to_le_bytes());
     body[44..52].copy_from_slice(&target_msc.to_le_bytes());
+    body
+}
+
+fn dispatch_future_present_pixmap(
+    state: &mut ServerState,
+    backend: &mut RecordingBackend,
+    window: u32,
+    pixmap: u32,
+    present_id: u32,
+    target_msc: u64,
+) {
+    let body = future_present_pixmap_request(state, window, pixmap, present_id, target_msc);
     dispatch_present_body(
         state,
         backend,
@@ -4495,17 +4506,19 @@ fn shared_wake_held_presents_past_target_arm_nothing() {
     );
 }
 
-// Mutation: restore per-target arming or stop re-arming after the first wake.
+// Mutation: restore per-target arming, stop re-arming after the first wake, or skip DestroyWindow cleanup.
 #[test]
 fn shared_wake_future_targets_make_one_call_per_domain_per_iteration() {
     use yserver_protocol::x11::present as x11present;
 
     const FIRST_WINDOW: u32 = 0x0001_5201;
     const SECOND_WINDOW: u32 = 0x0001_5202;
+    const DESTROYED_WINDOW: u32 = 0x0001_5203;
     const FIRST_EVENT: u32 = 0x0010_5201;
     const SECOND_EVENT: u32 = 0x0010_5202;
-    const COUNT_PER_WINDOW: u64 = 66;
-    const FIRST_ID: u64 = 1;
+    const COUNT_PER_WINDOW: u64 = 130;
+    const FIRST_ID: u32 = 1;
+    const SECOND_ID: u32 = 1001;
     const CLOCK: u64 = u64::MAX - 32;
     let tick_msc = |step: u64| {
         if step <= 32 {
@@ -4521,7 +4534,8 @@ fn shared_wake_future_targets_make_one_call_per_domain_per_iteration() {
         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .expect("bound completion round-trip waits");
     let mut backend = RecordingBackend::new();
-    backend.present_crtc_clock_epoch_by_crtc.insert(11, 1);
+    backend.present_ust_msc = (CLOCK, 1_000);
+    backend.present_flip_in_flight = true;
     backend.present_absolute_vblank_arm_supported = true;
     state.present_event_selections.extend([
         (
@@ -4542,71 +4556,180 @@ fn shared_wake_future_targets_make_one_call_per_domain_per_iteration() {
         ),
     ]);
 
+    let mut requests = Vec::with_capacity((COUNT_PER_WINDOW * 2 + 3) as usize);
+    let mut sequence = 1_u16;
     for step in 1..=COUNT_PER_WINDOW {
         let target = tick_msc(step);
-        for (window, present_id) in [
-            (FIRST_WINDOW, FIRST_ID + (step - 1) * 2),
-            (SECOND_WINDOW, FIRST_ID + (step - 1) * 2 + 1),
+        for (window, pixmap, present_id) in [
+            (
+                FIRST_WINDOW,
+                0x0040_5200 + step as u32,
+                FIRST_ID + step as u32 - 1,
+            ),
+            (
+                SECOND_WINDOW,
+                0x0041_5200 + step as u32,
+                SECOND_ID + step as u32 - 1,
+            ),
         ] {
-            let mut pending = due_pending_complete(
-                window,
-                present_id,
-                target,
-                x11present::COMPLETE_MODE_COPY,
-                false,
-            );
-            pending.event.crtc_id = 11;
-            pending.event.crtc_epoch = 1;
-            pending.event.serial = present_id as u32;
-            state.present_pending_complete.push(pending);
+            let body =
+                future_present_pixmap_request(&mut state, window, pixmap, present_id, target);
+            requests.push((
+                SequenceNumber(sequence),
+                RequestHeader {
+                    opcode: 145,
+                    data: x11present::PIXMAP,
+                    length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+                },
+                body,
+            ));
+            sequence = sequence.checked_add(1).expect("test sequence fits");
         }
     }
+    let destroyed_body = future_present_pixmap_request(
+        &mut state,
+        DESTROYED_WINDOW,
+        0x0042_5201,
+        0x5201,
+        tick_msc(COUNT_PER_WINDOW),
+    );
+    requests.push((
+        SequenceNumber(sequence),
+        RequestHeader {
+            opcode: 145,
+            data: x11present::PIXMAP,
+            length_units: u32::try_from(1 + destroyed_body.len() / 4).unwrap(),
+        },
+        destroyed_body,
+    ));
+    sequence = sequence.checked_add(1).expect("test sequence fits");
+    requests.push((
+        SequenceNumber(sequence),
+        RequestHeader {
+            opcode: 4,
+            data: 0,
+            length_units: 2,
+        },
+        DESTROYED_WINDOW.to_le_bytes().to_vec(),
+    ));
+    sequence = sequence.checked_add(1).expect("test sequence fits");
+    requests.push((
+        SequenceNumber(sequence),
+        RequestHeader {
+            opcode: 43,
+            data: 0,
+            length_units: 1,
+        },
+        Vec::new(),
+    ));
 
-    seed_present_domain_clock(&mut state, 11, 1, CLOCK, 1_000);
-    crate::core_loop::run::arm_present_idle_vblanks(&mut state, &mut backend);
-    assert_eq!(backend.armed_shared_wake_crtcs, [11]);
-
-    let mut observed = Vec::new();
-    for step in 1..=COUNT_PER_WINDOW {
-        let msc = tick_msc(step);
-        let sample = crate::backend::PresentClockSample {
-            msc,
-            ust: 1_000 + step,
-            source: crate::backend::PresentClockSource::IdleSequence,
-        };
-        seed_present_domain_clock(&mut state, 11, 1, sample.msc, sample.ust);
-        let wire = run_core_present_wait_drain(
-            &mut state,
-            &mut backend,
-            &mut first_peer,
-            u16::try_from(step).unwrap(),
-        );
-        for event in wire.chunks_exact(40) {
-            assert_eq!(u64::from_le_bytes(event[32..40].try_into().unwrap()), msc);
-            observed.push(u32::from_le_bytes(event[20..24].try_into().unwrap()));
-        }
-        assert_eq!(
-            state.present_pending_complete.len(),
-            ((COUNT_PER_WINDOW - step) * 2) as usize,
-            "after step={step}, msc={msc}"
-        );
-        assert_eq!(
-            backend.armed_shared_wake_crtcs.len(),
-            (step.min(COUNT_PER_WINDOW - 1) + 1) as usize,
-            "one shared wake request for this CRTC while future work remains"
-        );
-    }
-
-    let expected: Vec<u32> = (FIRST_ID..FIRST_ID + COUNT_PER_WINDOW * 2)
-        .map(|id| id as u32)
-        .collect();
-    assert_eq!(observed, expected);
-    assert!(state.present_pending_complete.is_empty());
+    seed_present_clock(&mut state, CLOCK, 1_000);
+    let wire =
+        run_core_present_requests_and_wait(&mut state, &mut backend, &mut first_peer, requests);
+    assert!(
+        wire.is_empty(),
+        "future requests and DestroyWindow emit no completion"
+    );
+    assert_eq!(
+        state.present_pending_exec.len(),
+        (COUNT_PER_WINDOW * 2) as usize
+    );
+    assert!(
+        state
+            .present_pending_exec
+            .values()
+            .all(|entry| { entry.pending.request.window() != DESTROYED_WINDOW })
+    );
+    assert_eq!(state.present_pending_complete.len(), 0);
+    let shared_crtc = *backend
+        .armed_shared_wake_crtcs
+        .first()
+        .expect("future Present targets request a shared wake");
+    seed_present_domain_clock(&mut state, shared_crtc, 0, CLOCK, 1_000);
     assert!(
         backend
             .armed_shared_wake_crtcs
             .iter()
-            .all(|&crtc| crtc == 11)
+            .all(|&crtc| crtc == shared_crtc)
+    );
+
+    let mut observed_by_window = std::collections::BTreeMap::<u32, Vec<(u32, u64)>>::new();
+    for step in 1..=COUNT_PER_WINDOW {
+        let msc = tick_msc(step);
+        let ust = 1_000 + step;
+        backend
+            .present_ust_msc_by_crtc
+            .insert(shared_crtc, (msc, ust));
+        seed_present_domain_clock(&mut state, shared_crtc, 0, msc, ust);
+        let calls_before = backend.armed_shared_wake_crtcs.len();
+        let first_wire =
+            run_core_present_wait_drain(&mut state, &mut backend, &mut first_peer, sequence);
+        sequence = sequence.checked_add(1).expect("test sequence fits");
+        assert!(
+            first_wire.is_empty(),
+            "copies enqueue completion events for the next drain"
+        );
+        let expect_wake = step < COUNT_PER_WINDOW;
+        assert_eq!(
+            backend.armed_shared_wake_crtcs.len() - calls_before,
+            usize::from(expect_wake),
+            "one shared wake for this CRTC while any future work remains at target {step}"
+        );
+        backend.completed_present_events_to_drain.extend(
+            std::mem::take(&mut backend.enqueued_present_completions)
+                .into_iter()
+                .map(|(event, _)| event),
+        );
+
+        let calls_before = backend.armed_shared_wake_crtcs.len();
+        let wire = run_core_present_wait_drain(&mut state, &mut backend, &mut first_peer, sequence);
+        sequence = sequence.checked_add(1).expect("test sequence fits");
+        assert_eq!(
+            backend.armed_shared_wake_crtcs.len() - calls_before,
+            usize::from(expect_wake),
+            "one shared wake for this CRTC while any future work remains during completion drain"
+        );
+        assert_eq!(wire.len(), 80, "both windows complete at target {step}");
+        for event in wire.chunks_exact(40) {
+            assert_eq!(u64::from_le_bytes(event[32..40].try_into().unwrap()), msc);
+            let window = u32::from_le_bytes(event[16..20].try_into().unwrap());
+            let present_id = u32::from_le_bytes(event[20..24].try_into().unwrap());
+            observed_by_window
+                .entry(window)
+                .or_default()
+                .push((present_id, msc));
+        }
+        assert_eq!(
+            state.present_pending_complete.len(),
+            0,
+            "all due completions drain at step={step}, msc={msc}"
+        );
+        assert_eq!(
+            state.present_pending_exec.len(),
+            ((COUNT_PER_WINDOW - step) * 2) as usize
+        );
+    }
+
+    for (window, first_id) in [(FIRST_WINDOW, FIRST_ID), (SECOND_WINDOW, SECOND_ID)] {
+        let observed = observed_by_window
+            .remove(&window)
+            .expect("each Present window emitted completions");
+        let expected = (0..COUNT_PER_WINDOW)
+            .map(|offset| (first_id + offset as u32, tick_msc(offset + 1)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            observed, expected,
+            "window 0x{window:x} completion order and MSC"
+        );
+    }
+    assert!(observed_by_window.is_empty());
+    assert!(state.present_pending_complete.is_empty());
+    assert!(state.present_pending_exec.is_empty());
+    assert!(
+        backend
+            .armed_shared_wake_crtcs
+            .iter()
+            .all(|&crtc| crtc == shared_crtc)
     );
 }
 
@@ -4627,15 +4750,17 @@ fn shared_wake_no_usable_clock_counts_as_ahead() {
     assert_eq!(backend.armed_shared_wake_crtcs, [11]);
 }
 
-// Mutation: report a shared wake on false or error, causing distant Presents to stay parked.
+// Mutation: use the completion clock for failure fallback (or report covered on failure).
 #[test]
 fn shared_wake_failure_executes_parked_entries_immediately() {
     use crate::backend::recording::RecordedCall;
 
     const FAR_ID: u64 = 1;
     const NEXT_ID: u64 = 2;
+    const DISTANT_ID: u64 = 3;
     const FAR_PIXMAP: u32 = 0x0040_5301;
     const NEXT_PIXMAP: u32 = 0x0040_5302;
+    const DISTANT_PIXMAP: u32 = 0x0040_5303;
 
     for result in [Some(Ok(false)), Some(Err(std::io::ErrorKind::Other))] {
         let mut state = ServerState::new();
@@ -4662,6 +4787,28 @@ fn shared_wake_failure_executes_parked_entries_immediately() {
             NEXT_ID as u32,
             101,
         );
+        dispatch_future_present_pixmap(
+            &mut state,
+            &mut backend,
+            0x1533,
+            DISTANT_PIXMAP,
+            DISTANT_ID as u32,
+            102,
+        );
+        let parked = state
+            .present_pending_exec
+            .values()
+            .next()
+            .expect("future Present is parked");
+        state
+            .present_crtc_clocks
+            .get_mut(&(parked.pending.crtc_id, parked.pending.crtc_epoch))
+            .expect("Present's general clock was cached at arrival")
+            .completion = crate::backend::PresentClockSample {
+            msc: 90,
+            ust: 900,
+            source: crate::backend::PresentClockSource::PageFlip,
+        };
 
         crate::core_loop::run::arm_present_idle_vblanks(&mut state, &mut backend);
 
@@ -4672,6 +4819,16 @@ fn shared_wake_failure_executes_parked_entries_immediately() {
                 ..
             }
         )));
+        assert!(
+            backend.calls().iter().any(|call| matches!(
+                call,
+                RecordedCall::CopyArea {
+                    src_host_xid: DISTANT_PIXMAP,
+                    ..
+                }
+            )),
+            "general MSC 100 makes target 102 distant despite completion MSC 90"
+        );
         assert!(!backend.calls().iter().any(|call| matches!(
             call,
             RecordedCall::CopyArea {
@@ -4680,6 +4837,7 @@ fn shared_wake_failure_executes_parked_entries_immediately() {
             }
         )));
         assert!(!state.present_pending_exec.contains_key(&FAR_ID));
+        assert!(!state.present_pending_exec.contains_key(&DISTANT_ID));
         assert!(state.present_pending_exec.contains_key(&NEXT_ID));
     }
 }
