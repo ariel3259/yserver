@@ -62,6 +62,27 @@ impl OutputPowerExecutor for PowerLog {
     }
 }
 
+struct RejectModeset;
+
+impl OutputPowerExecutor for RejectModeset {
+    fn disable(&self, _device: &crate::drm::Device, _output: &Output) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn enable(
+        &self,
+        _device: &crate::drm::Device,
+        _output: &Output,
+        _framebuffer: ::drm::control::framebuffer::Handle,
+    ) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(libc::EIO))
+    }
+
+    fn disable_device(&self, _device: &crate::drm::Device) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 const MODE_800: ModeSpec = ModeSpec {
     width: 800,
     height: 600,
@@ -191,10 +212,16 @@ fn output_removal_keeps_owner_state_with_its_output_per_crtc_off() {
         crate::kms::render::platform::CrtcKey::for_output(&backend.platform.outputs[0]);
     let survivor_key =
         crate::kms::render::platform::CrtcKey::for_output(&backend.platform.outputs[1]);
-    backend
-        .pstate
-        .shared_wake_armed
-        .extend([removed_key, survivor_key]);
+    super::seed_vblank_arm_watch(
+        &mut backend,
+        removed_key,
+        super::SHARED_WAKE_VBLANK_ARM_SLOT,
+    );
+    super::seed_vblank_arm_watch(
+        &mut backend,
+        survivor_key,
+        super::SHARED_WAKE_VBLANK_ARM_SLOT,
+    );
     let name = connector(&backend, 0);
     let id = output_id(&mut backend, &name);
 
@@ -210,8 +237,16 @@ fn output_removal_keeps_owner_state_with_its_output_per_crtc_off() {
     );
     assert_eq!(backend.platform.outputs.len(), 1);
     assert_eq!(crtc(&backend, 0), survivor_crtc);
-    assert!(!backend.pstate.shared_wake_armed.contains(&removed_key));
-    assert!(backend.pstate.shared_wake_armed.contains(&survivor_key));
+    assert!(!super::vblank_arm_is_watched(
+        &backend,
+        removed_key,
+        super::SHARED_WAKE_VBLANK_ARM_SLOT
+    ));
+    assert!(super::vblank_arm_is_watched(
+        &backend,
+        survivor_key,
+        super::SHARED_WAKE_VBLANK_ARM_SLOT
+    ));
     assert_eq!(backend.pstate.direct.outputs.len(), 1);
     assert_eq!(backend.pstate.direct.outputs[0].eligible_streak, 3);
     assert!(backend.pstate.direct.outputs[0].reentry_blocked_until_composed);
@@ -707,12 +742,16 @@ fn mode_change_modesets_only_its_crtc_while_the_other_keeps_presenting() {
     let crtc_key1 = crate::kms::render::platform::CrtcKey::for_output(
         &fixture.events.backend.platform.outputs[1],
     );
-    fixture
-        .events
-        .backend
-        .pstate
-        .shared_wake_armed
-        .extend([crtc_key0, crtc_key1]);
+    super::seed_vblank_arm_watch(
+        &mut fixture.events.backend,
+        crtc_key0,
+        super::SHARED_WAKE_VBLANK_ARM_SLOT,
+    );
+    super::seed_vblank_arm_watch(
+        &mut fixture.events.backend,
+        crtc_key1,
+        super::SHARED_WAKE_VBLANK_ARM_SLOT,
+    );
     let in_flight = submit_frame(&mut fixture);
     let (flip0, flip1) = (flip_for(&in_flight, crtc0), flip_for(&in_flight, crtc1));
     // CRTC 1's flip completes while the change waits for it; CRTC 0's stays
@@ -743,8 +782,16 @@ fn mode_change_modesets_only_its_crtc_while_the_other_keeps_presenting() {
     );
 
     assert_eq!(log.entries(), vec![("on", crtc1)]);
-    assert!(!backend.pstate.shared_wake_armed.contains(&crtc_key1));
-    assert!(backend.pstate.shared_wake_armed.contains(&crtc_key0));
+    assert!(!super::vblank_arm_is_watched(
+        backend,
+        crtc_key1,
+        super::SHARED_WAKE_VBLANK_ARM_SLOT
+    ));
+    assert!(super::vblank_arm_is_watched(
+        backend,
+        crtc_key0,
+        super::SHARED_WAKE_VBLANK_ARM_SLOT
+    ));
     let changed_crtc_randr_id = backend
         .pstate
         .randr_id_alloc
@@ -793,6 +840,80 @@ fn mode_change_modesets_only_its_crtc_while_the_other_keeps_presenting() {
     flip_for(&next, crtc1);
     retire_all(&mut fixture, &next, 3, None);
     fixture.adopt_drawables(0x6b00..0x6b03);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: clear the arm slots before a modeset that is rejected.
+fn rejected_mode_change_preserves_arm_slots_and_watch_deadlines() {
+    let Some((mut fixture, _log, _route)) = live_two_heads() else {
+        return;
+    };
+    let backend = &mut fixture.events.backend;
+    let key = crate::kms::render::platform::CrtcKey::for_output(&backend.platform.outputs[1]);
+    let crtc_id = Backend::randr_outputs_and_modes(backend).0[1].crtc_id;
+    let source = backend.platform.devices[0]
+        .test_page_flip_event_source
+        .clone()
+        .expect("fixture records vblank requests");
+    source.set_legacy_vblank(Ok(5));
+    backend
+        .pstate
+        .crtc_queue_sequence_unsupported_devices
+        .insert(key.device_key);
+    backend.platform.vblank_fallback.pipes.insert(key, 1);
+    let now = install_fake_clock(backend);
+
+    assert!(Backend::arm_present_shared_wake(backend, crtc_id).expect("arm shared wake"));
+    assert_eq!(
+        Backend::arm_idle_vblanks(backend, crtc_id, &[9]).expect("arm idle slot"),
+        1
+    );
+    let watches_before = backend.platform.vblank_fallback.kernel_arm_watch.clone();
+    let arms_before = source.legacy_vblank_arms().len();
+    assert_eq!(watches_before.len(), 2, "both independent slots are armed");
+
+    let output_key = backend.platform.outputs[1].key.clone();
+    let mut discovered = clone_test_drm_output(&backend.platform.outputs[1].output);
+    discovered.picked.vrefresh = 75;
+    let mut alternate = advertised(800, 600);
+    alternate.vrefresh = 75;
+    discovered.modes.push(alternate);
+    backend.pstate.crtc_config_discovery_override = Some(discovered);
+    backend
+        .platform
+        .for_tests_set_output_power_executor(Rc::new(RejectModeset));
+    let connector_name = connector(backend, 1);
+    let output_id = output_id(backend, &connector_name);
+    let error = Backend::apply_crtc_config(
+        backend,
+        output_id,
+        &connector_name,
+        Some(ModeSpec {
+            width: 800,
+            height: 600,
+            vrefresh: 75,
+        }),
+        800,
+        0,
+    )
+    .expect_err("recording power executor rejects the modeset");
+    assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    assert_eq!(backend.platform.outputs[1].key, output_key);
+    assert_eq!(backend.platform.outputs[1].output.picked.vrefresh, 60);
+
+    now.set(now.get() + Duration::from_secs(2));
+    assert!(Backend::arm_present_shared_wake(backend, crtc_id).expect("existing wake covers"));
+    assert_eq!(
+        Backend::arm_idle_vblanks(backend, crtc_id, &[9]).expect("existing idle slot covers"),
+        0
+    );
+    assert_eq!(source.legacy_vblank_arms().len(), arms_before);
+    assert_eq!(
+        backend.platform.vblank_fallback.kernel_arm_watch, watches_before,
+        "a refused modeset preserves each outstanding slot's original deadline"
+    );
     fixture.finish_after_normal_drain();
 }
 
@@ -1013,16 +1134,17 @@ fn disable_and_enable_returns_to_the_kernel_clock() {
         Backend::arm_present_shared_wake(backend, crtc_id)
             .expect("re-enabled CRTC arms the kernel wake")
     );
-    assert!(backend.pstate.shared_wake_armed.contains(&key));
+    assert!(super::vblank_arm_is_watched(
+        backend,
+        key,
+        super::SHARED_WAKE_VBLANK_ARM_SLOT
+    ));
     assert!(
         backend
             .platform
             .vblank_fallback
             .kernel_arm_watch
-            .contains_key(&(
-                key,
-                crate::kms::render::platform::vblank_fallback::VblankArmSlot::SharedWake,
-            ))
+            .contains_key(&(key, super::SHARED_WAKE_VBLANK_ARM_SLOT,))
     );
     assert!(!backend.platform.vblank_fallback.software.contains_key(&key));
     fixture.adopt_drawables(0x6b00..0x6b03);

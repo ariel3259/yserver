@@ -607,10 +607,6 @@ impl KmsBackend {
     /// never arrive once DRM master is released or the CRTC is disabled, so
     /// any surviving entry would permanently stall the per-CRTC arm cycle.
     pub(crate) fn clear_all_armed_vblank_targets(&mut self) {
-        if !self.pstate.armed_vblank_targets.is_empty() {
-            self.pstate.armed_vblank_targets.clear();
-        }
-        self.pstate.shared_wake_armed.clear();
         self.platform.vblank_fallback.software.clear();
         self.platform.vblank_fallback.kernel_arm_watch.clear();
     }
@@ -629,12 +625,6 @@ impl KmsBackend {
             .iter()
             .map(CrtcKey::for_output)
             .collect();
-        self.pstate
-            .armed_vblank_targets
-            .retain(|key, _| live.contains(key));
-        self.pstate
-            .shared_wake_armed
-            .retain(|key| live.contains(key));
         self.platform
             .vblank_fallback
             .kernel_arm_watch
@@ -678,14 +668,12 @@ impl KmsBackend {
         let crtc_key = crtc_handle.map(|crtc| CrtcKey::new(device_key, crtc));
         if tagged {
             if let Some(key) = crtc_key {
-                self.pstate.shared_wake_armed.remove(&key);
                 self.platform.vblank_fallback.kernel_arm_watch.remove(&(
                     key,
                     crate::kms::render::platform::vblank_fallback::VblankArmSlot::SharedWake,
                 ));
             }
         } else if let Some(key) = crtc_key {
-            self.pstate.armed_vblank_targets.remove(&key);
             self.platform.vblank_fallback.kernel_arm_watch.remove(&(
                 key,
                 crate::kms::render::platform::vblank_fallback::VblankArmSlot::Idle,
@@ -777,18 +765,20 @@ impl KmsBackend {
                 self.platform.arm_software_vblank(crtc_key, now),
             ));
         }
-        if self.pstate.armed_vblank_targets.contains_key(&crtc_key) {
+        let slot = crate::kms::render::platform::vblank_fallback::VblankArmSlot::Idle;
+        if self
+            .platform
+            .vblank_fallback
+            .kernel_arm_watch
+            .contains_key(&(crtc_key, slot))
+        {
             return Ok(0);
         }
         if armer(crtc_key)? {
-            self.pstate.armed_vblank_targets.insert(crtc_key, 0);
-            self.platform.vblank_fallback.kernel_arm_watch.insert(
-                (
-                    crtc_key,
-                    crate::kms::render::platform::vblank_fallback::VblankArmSlot::Idle,
-                ),
-                (self.pstate.monotonic_clock)(),
-            );
+            self.platform
+                .vblank_fallback
+                .kernel_arm_watch
+                .insert((crtc_key, slot), (self.pstate.monotonic_clock)());
             Ok(1)
         } else {
             Ok(0)
@@ -826,18 +816,20 @@ impl KmsBackend {
         if !self.kernel_vblank_arm_available(crtc_key) {
             return Ok(false);
         }
-        if self.pstate.shared_wake_armed.contains(&crtc_key) {
+        let slot = crate::kms::render::platform::vblank_fallback::VblankArmSlot::SharedWake;
+        if self
+            .platform
+            .vblank_fallback
+            .kernel_arm_watch
+            .contains_key(&(crtc_key, slot))
+        {
             return Ok(true);
         }
         if armer(crtc_key)? {
-            self.pstate.shared_wake_armed.insert(crtc_key);
-            self.platform.vblank_fallback.kernel_arm_watch.insert(
-                (
-                    crtc_key,
-                    crate::kms::render::platform::vblank_fallback::VblankArmSlot::SharedWake,
-                ),
-                (self.pstate.monotonic_clock)(),
-            );
+            self.platform
+                .vblank_fallback
+                .kernel_arm_watch
+                .insert((crtc_key, slot), (self.pstate.monotonic_clock)());
             Ok(true)
         } else {
             Ok(false)

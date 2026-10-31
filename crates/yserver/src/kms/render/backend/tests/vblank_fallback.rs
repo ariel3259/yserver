@@ -436,11 +436,17 @@ fn frozen_kernel_sequence_does_not_touch_the_clock() {
         b.platform.completion_clocks[&second],
         before_completion_sample
     );
-    assert!(!b.pstate.shared_wake_armed.contains(&second));
-    assert!(!b.platform.vblank_fallback.kernel_arm_watch.contains_key(&(
+    assert!(!super::vblank_arm_is_watched(
+        &b,
         second,
-        crate::kms::render::platform::vblank_fallback::VblankArmSlot::SharedWake,
-    )));
+        super::SHARED_WAKE_VBLANK_ARM_SLOT
+    ));
+    assert!(
+        !b.platform
+            .vblank_fallback
+            .kernel_arm_watch
+            .contains_key(&(second, super::SHARED_WAKE_VBLANK_ARM_SLOT,))
+    );
 }
 
 #[test]
@@ -466,10 +472,7 @@ fn slow_but_firing_arm_is_not_frozen() {
 
     assert!(!b.platform.vblank_fallback.frozen.contains_key(&second));
     assert_eq!(
-        b.platform.vblank_fallback.kernel_arm_watch[&(
-            second,
-            crate::kms::render::platform::vblank_fallback::VblankArmSlot::SharedWake
-        )],
+        b.platform.vblank_fallback.kernel_arm_watch[&(second, super::SHARED_WAKE_VBLANK_ARM_SLOT)],
         second_arm
     );
 }
@@ -491,10 +494,12 @@ fn event_unread_at_deadline_is_not_frozen() {
     assert!(!b.platform.vblank_fallback.frozen.contains_key(&second));
     let fd = b.platform.devices[0].device.as_fd().as_raw_fd();
     Backend::on_page_flip_ready(&mut b, &mut yserver_core::server::ServerState::new(), fd);
-    assert!(!b.platform.vblank_fallback.kernel_arm_watch.contains_key(&(
-        second,
-        crate::kms::render::platform::vblank_fallback::VblankArmSlot::SharedWake,
-    )));
+    assert!(
+        !b.platform
+            .vblank_fallback
+            .kernel_arm_watch
+            .contains_key(&(second, super::SHARED_WAKE_VBLANK_ARM_SLOT,))
+    );
 }
 
 #[test]
@@ -578,7 +583,6 @@ fn dpms_off_vt_away_and_own_modeset_end_the_observation() {
     dpms.platform.for_tests_accept_output_power_commits();
     arm_recorded_kernel_wake(&mut dpms, second);
     Backend::set_dpms_power(&mut dpms, 3).expect("DPMS off");
-    assert!(dpms.pstate.shared_wake_armed.is_empty());
     assert!(dpms.platform.vblank_fallback.kernel_arm_watch.is_empty());
     now.set(now.get() + Duration::from_secs(2));
     dpms.poll_deferred_input(&mut ServerState::new());
@@ -969,9 +973,8 @@ fn run_frozen_core_present_requests(
     );
     assert!(
         b.platform.vblank_fallback.frozen.contains_key(&second),
-        "silent arm must freeze through run_core: watches={:?}, shared={:?}, pending_exec={}",
+        "silent arm must freeze through run_core: watches={:?}, pending_exec={}",
         b.platform.vblank_fallback.kernel_arm_watch,
-        b.pstate.shared_wake_armed,
         state.present_pending_exec.len()
     );
     let frozen = b.platform.vblank_fallback.frozen[&second];
@@ -1186,12 +1189,22 @@ fn other_slots_event_keeps_the_surviving_watch() {
     source.queue_sequence_for_tests(u64::from(u32::from(second.crtc)), 2_000, 6);
     drain_kernel_events(&mut b);
 
-    assert!(!b.pstate.armed_vblank_targets.contains_key(&second));
-    assert!(b.pstate.shared_wake_armed.contains(&second));
-    assert!(b.platform.vblank_fallback.kernel_arm_watch.contains_key(&(
+    assert!(!super::vblank_arm_is_watched(
+        &b,
         second,
-        crate::kms::render::platform::vblank_fallback::VblankArmSlot::SharedWake
-    )));
+        super::IDLE_VBLANK_ARM_SLOT
+    ));
+    assert!(super::vblank_arm_is_watched(
+        &b,
+        second,
+        super::SHARED_WAKE_VBLANK_ARM_SLOT
+    ));
+    assert!(
+        b.platform
+            .vblank_fallback
+            .kernel_arm_watch
+            .contains_key(&(second, super::SHARED_WAKE_VBLANK_ARM_SLOT))
+    );
     now.set(now.get() + KmsBackend::FROZEN_VBLANK_WINDOW);
     assert!(b.next_wakeup().is_some_and(|wake| wake <= now.get()));
     b.poll_deferred_input(&mut yserver_core::server::ServerState::new());
@@ -1323,7 +1336,11 @@ fn wait_vblank_fallback_arms_shared_wake_and_its_event_releases_completion() {
 
     let clock = b.present_get_completion_clock(SECOND_CRTC_XID);
     assert_eq!((clock.msc, clock.ust), (6, 3_000));
-    assert!(!b.pstate.shared_wake_armed.contains(&second));
+    assert!(!super::vblank_arm_is_watched(
+        &b,
+        second,
+        super::SHARED_WAKE_VBLANK_ARM_SLOT
+    ));
 }
 
 #[test]
@@ -1344,7 +1361,11 @@ fn wait_vblank_fallback_arms_the_relative_idle_vblank() {
     source.fire_legacy_vblank_arms(4_000_000, 6);
     drain_kernel_events(&mut b);
     assert_eq!(b.present_get_completion_clock(SECOND_CRTC_XID).msc, 6);
-    assert!(!b.pstate.armed_vblank_targets.contains_key(&second));
+    assert!(!super::vblank_arm_is_watched(
+        &b,
+        second,
+        super::IDLE_VBLANK_ARM_SLOT
+    ));
 }
 
 #[test]

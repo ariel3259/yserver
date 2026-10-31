@@ -3601,6 +3601,65 @@ fn future_target_present_produces_no_copy_until_due() {
     assert!(state.present_pending_exec.is_empty());
 }
 
+#[test]
+// Mutation: treat an unsupported wake capability as a failed supported arm and execute the target early.
+fn unsupported_wake_keeps_flip_driven_present_paced() {
+    const PRESENT_ID: u64 = 508;
+    const WINDOW_HOST_XID: u32 = 0x0040_0701;
+    const PIXMAP_HOST_XID: u32 = 0x0040_0702;
+    const TARGET_MSC: u64 = 120;
+
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new();
+    backend.present_ust_msc = (100, 0x1000);
+    backend.present_flip_in_flight = true;
+    backend.present_display_idle = false;
+    backend.present_absolute_vblank_arm_supported = false;
+    seed_present_clock(&mut state, 100, 0x1000);
+    state.present_pending_exec.insert(
+        PRESENT_ID,
+        present_pending_entry_with(
+            PRESENT_ID,
+            WINDOW_HOST_XID,
+            PIXMAP_HOST_XID,
+            Some(TARGET_MSC),
+            true,
+        ),
+    );
+
+    crate::core_loop::run::run_iteration_tail(&mut state, &mut backend);
+
+    assert!(
+        backend
+            .calls()
+            .iter()
+            .all(|call| !matches!(call, RecordedCall::CopyArea { .. })),
+        "unsupported wake capability alone must not copy a future target while the flip advances"
+    );
+    assert!(
+        state.present_pending_exec.contains_key(&PRESENT_ID),
+        "the Present remains parked until the advancing flip clock reaches MSC 120"
+    );
+
+    backend.present_ust_msc = (TARGET_MSC, 0x2000);
+    backend.present_flip_in_flight = false;
+    seed_present_clock(&mut state, TARGET_MSC, 0x2000);
+    crate::core_loop::run::run_iteration_tail(&mut state, &mut backend);
+
+    assert!(
+        backend.calls().iter().any(|call| matches!(
+            call,
+            RecordedCall::CopyArea {
+                src_host_xid: PIXMAP_HOST_XID,
+                dst_host_xid: WINDOW_HOST_XID,
+                ..
+            }
+        )),
+        "the parked Present copies when the general MSC reaches its target"
+    );
+    assert!(state.present_pending_exec.is_empty());
+}
+
 /// Review fix (test addition b): the due-pass must RE-PARK an
 /// immediate-target entry when `flip_in_flight` is STILL true at
 /// drain time — the previously-covered vector only pinned the park

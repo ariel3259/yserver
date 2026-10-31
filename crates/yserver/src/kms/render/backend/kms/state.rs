@@ -1395,29 +1395,6 @@ pub struct KmsBackendState {
     pub(in crate::kms::render::backend) vt_resume_executor:
         std::rc::Rc<dyn super::session::VtResumeExecutor>,
 
-    /// Per-CRTC armed absolute MSC for idle vblank pacing. Keyed by the
-    /// stable `crtc::Handle`; presence means "a `DRM_CRTC_SEQUENCE` is
-    /// queued on this CRTC and we are waiting for it" (value `0` is the
-    /// relative-next-vblank sentinel this spike uses). A per-CRTC map
-    /// rather than a single bool so arming CRTC A can't suppress arming
-    /// CRTC B (the dual-monitor permanent-stall class).
-    ///
-    /// **Invariant (load-bearing):** every code path that drops or
-    /// completes an armed sequence MUST clear the matching entry —
-    /// `on_crtc_sequence_event` (unconditional clear-arm before
-    /// validating), `!scanout_allowed()` in `arm_idle_vblanks_with`,
-    /// `run_suspend` / DPMS-off (master loss drops queued sequences), and
-    /// output removal (`prune_armed_targets_to_live_outputs`). A stuck
-    /// entry = a permanent ~0 fps stall on that CRTC.
-    pub(crate) armed_vblank_targets: std::collections::HashMap<CrtcKey, u64>,
-
-    /// One outstanding tagged next-vblank wake per CRTC for parked
-    /// Present work. It is independent of the untagged idle-vblank slot:
-    /// the tagged arm stays completion-eligible while a flip is active.
-    /// `on_crtc_sequence_event` clears it before validating a tagged event;
-    /// lifecycle clears and output pruning retire it alongside the idle slot.
-    pub(crate) shared_wake_armed: HashSet<CrtcKey>,
-
     /// Latches true the first time `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` returns
     /// EOPNOTSUPP/ENOTTY (pre-4.14 kernels lack the ioctl). Once set we stop
     /// attempting sequence arms and use WAIT_VBLANK where available; when

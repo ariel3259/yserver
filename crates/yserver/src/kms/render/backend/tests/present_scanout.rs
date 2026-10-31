@@ -57,8 +57,7 @@ fn drain_shared_wake_test_events(backend: &mut KmsBackend, state: &mut ServerSta
 #[test]
 fn armed_vblank_targets_starts_empty() {
     let b = crate::kms::render::backend::KmsBackend::for_tests();
-    assert!(b.pstate.armed_vblank_targets.is_empty());
-    assert!(b.pstate.shared_wake_armed.is_empty());
+    assert!(b.platform.vblank_fallback.kernel_arm_watch.is_empty());
     assert!(b.pstate.crtc_queue_sequence_unsupported_devices.is_empty());
 }
 
@@ -66,11 +65,10 @@ fn armed_vblank_targets_starts_empty() {
 fn clear_all_armed_vblank_targets_empties_map() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let h = test_crtc_key(test_device_key(7), 7);
-    b.pstate.armed_vblank_targets.insert(h, 0);
-    b.pstate.shared_wake_armed.insert(h);
+    super::seed_vblank_arm_watch(&mut b, h, super::IDLE_VBLANK_ARM_SLOT);
+    super::seed_vblank_arm_watch(&mut b, h, super::SHARED_WAKE_VBLANK_ARM_SLOT);
     b.clear_all_armed_vblank_targets();
-    assert!(b.pstate.armed_vblank_targets.is_empty());
-    assert!(b.pstate.shared_wake_armed.is_empty());
+    assert!(b.platform.vblank_fallback.kernel_arm_watch.is_empty());
 }
 
 #[test]
@@ -78,11 +76,19 @@ fn prune_armed_targets_drops_stale_keeps_live() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let live = output_crtc_key(&b, 0);
     let stale = test_crtc_key(live.device_key, 999);
-    b.pstate.armed_vblank_targets.insert(live, 0);
-    b.pstate.armed_vblank_targets.insert(stale, 0);
+    super::seed_vblank_arm_watch(&mut b, live, super::IDLE_VBLANK_ARM_SLOT);
+    super::seed_vblank_arm_watch(&mut b, stale, super::IDLE_VBLANK_ARM_SLOT);
     b.prune_armed_targets_to_live_outputs();
-    assert!(b.pstate.armed_vblank_targets.contains_key(&live));
-    assert!(!b.pstate.armed_vblank_targets.contains_key(&stale));
+    assert!(super::vblank_arm_is_watched(
+        &b,
+        live,
+        super::IDLE_VBLANK_ARM_SLOT
+    ));
+    assert!(!super::vblank_arm_is_watched(
+        &b,
+        stale,
+        super::IDLE_VBLANK_ARM_SLOT
+    ));
 }
 
 #[test]
@@ -90,10 +96,19 @@ fn prune_armed_targets_drops_stale_shared_wakes_keeps_live() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let live = output_crtc_key(&b, 0);
     let stale = test_crtc_key(live.device_key, 999);
-    b.pstate.shared_wake_armed.extend([live, stale]);
+    super::seed_vblank_arm_watch(&mut b, live, super::SHARED_WAKE_VBLANK_ARM_SLOT);
+    super::seed_vblank_arm_watch(&mut b, stale, super::SHARED_WAKE_VBLANK_ARM_SLOT);
     b.prune_armed_targets_to_live_outputs();
-    assert!(b.pstate.shared_wake_armed.contains(&live));
-    assert!(!b.pstate.shared_wake_armed.contains(&stale));
+    assert!(super::vblank_arm_is_watched(
+        &b,
+        live,
+        super::SHARED_WAKE_VBLANK_ARM_SLOT
+    ));
+    assert!(!super::vblank_arm_is_watched(
+        &b,
+        stale,
+        super::SHARED_WAKE_VBLANK_ARM_SLOT
+    ));
 }
 
 #[test]
@@ -101,7 +116,7 @@ fn on_crtc_sequence_event_happy_path_records_msc_and_clears_arm() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_key = output_crtc_key(&b, 0);
-    b.pstate.armed_vblank_targets.insert(crtc_key, 0);
+    super::seed_vblank_arm_watch(&mut b, crtc_key, super::IDLE_VBLANK_ARM_SLOT);
 
     dispatch_test_sequence(
         &mut b,
@@ -111,7 +126,7 @@ fn on_crtc_sequence_event_happy_path_records_msc_and_clears_arm() {
     );
 
     assert!(
-        b.pstate.armed_vblank_targets.is_empty(),
+        b.platform.vblank_fallback.kernel_arm_watch.is_empty(),
         "arm must be cleared"
     );
     // ust_msc stores microseconds; primary output is index 0.
@@ -132,7 +147,7 @@ fn active_crtc_sequence_advances_general_clock_only() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_key = output_crtc_key(&b, 0);
-    b.pstate.armed_vblank_targets.insert(crtc_key, 0);
+    super::seed_vblank_arm_watch(&mut b, crtc_key, super::IDLE_VBLANK_ARM_SLOT);
     b.scene.scene_structure_dirty = true;
 
     dispatch_test_sequence(&mut b, u64::from(u32::from(crtc)), 2_000_000, 9);
@@ -151,7 +166,7 @@ fn active_tagged_shared_wake_advances_completion_clock() {
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_id = u32::from(crtc);
     let crtc_key = output_crtc_key(&b, 0);
-    b.pstate.shared_wake_armed.insert(crtc_key);
+    super::seed_vblank_arm_watch(&mut b, crtc_key, super::SHARED_WAKE_VBLANK_ARM_SLOT);
     b.scene.scene_structure_dirty = true;
 
     dispatch_test_sequence(
@@ -218,12 +233,12 @@ fn on_crtc_sequence_event_negative_time_clears_arm_and_drops() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_key = output_crtc_key(&b, 0);
-    b.pstate.armed_vblank_targets.insert(crtc_key, 0);
+    super::seed_vblank_arm_watch(&mut b, crtc_key, super::IDLE_VBLANK_ARM_SLOT);
 
     dispatch_test_sequence(&mut b, u64::from(u32::from(crtc)), -1, 7);
 
     assert!(
-        b.pstate.armed_vblank_targets.is_empty(),
+        b.platform.vblank_fallback.kernel_arm_watch.is_empty(),
         "arm cleared even on drop"
     );
     assert_eq!(
@@ -238,12 +253,12 @@ fn on_crtc_sequence_event_stale_crtc_clears_arm_and_drops() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let device_key = b.platform.outputs[0].key.device_key;
     let stale = test_crtc_key(device_key, 999);
-    b.pstate.armed_vblank_targets.insert(stale, 0);
+    super::seed_vblank_arm_watch(&mut b, stale, super::IDLE_VBLANK_ARM_SLOT);
 
     dispatch_test_sequence(&mut b, 999, 1_000_000, 5);
 
     assert!(
-        b.pstate.armed_vblank_targets.is_empty(),
+        b.platform.vblank_fallback.kernel_arm_watch.is_empty(),
         "stale arm cleared so the CRTC can't strand"
     );
     assert_eq!(b.platform.present_get_ust_msc(stale), (0, 0));
@@ -254,13 +269,13 @@ fn on_crtc_sequence_event_from_wrong_device_does_not_advance_clock() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_key = output_crtc_key(&b, 0);
-    b.pstate.armed_vblank_targets.insert(crtc_key, 0);
+    super::seed_vblank_arm_watch(&mut b, crtc_key, super::IDLE_VBLANK_ARM_SLOT);
     let wrong_device = test_device_key(99);
 
     b.on_crtc_sequence_event(wrong_device, u64::from(u32::from(crtc)), 1_000_000, 5);
 
     assert!(
-        b.pstate.armed_vblank_targets.contains_key(&crtc_key),
+        super::vblank_arm_is_watched(&b, crtc_key, super::IDLE_VBLANK_ARM_SLOT),
         "an equal raw CRTC on another DRM device must not spend this device's arm"
     );
     assert_eq!(
@@ -281,16 +296,16 @@ fn same_raw_crtc_on_two_devices_keeps_present_state_independent() {
     assert_eq!(primary.crtc, secondary.crtc);
     assert_ne!(primary.device_key, secondary.device_key);
 
-    b.pstate.armed_vblank_targets.insert(primary, 0);
-    b.pstate.armed_vblank_targets.insert(secondary, 0);
+    super::seed_vblank_arm_watch(&mut b, primary, super::IDLE_VBLANK_ARM_SLOT);
+    super::seed_vblank_arm_watch(&mut b, secondary, super::IDLE_VBLANK_ARM_SLOT);
     b.on_crtc_sequence_event(secondary.device_key, u64::from(raw_crtc), 3_000_000, 17);
 
     assert!(
-        b.pstate.armed_vblank_targets.contains_key(&primary),
+        super::vblank_arm_is_watched(&b, primary, super::IDLE_VBLANK_ARM_SLOT),
         "the event must not retire the equal raw CRTC on the primary card"
     );
     assert!(
-        !b.pstate.armed_vblank_targets.contains_key(&secondary),
+        !super::vblank_arm_is_watched(&b, secondary, super::IDLE_VBLANK_ARM_SLOT),
         "the event retires only the device-qualified secondary arm"
     );
     assert_eq!(b.platform.ust_msc.get(&secondary), Some(&(17, 3_000)));
@@ -350,8 +365,16 @@ fn present_randr_crtc_routes_equal_raw_handles_to_the_owning_device() {
     })
     .expect("arm selected secondary domain");
     assert_eq!(armed_on, vec![secondary]);
-    assert!(!b.pstate.armed_vblank_targets.contains_key(&primary));
-    assert!(b.pstate.armed_vblank_targets.contains_key(&secondary));
+    assert!(!super::vblank_arm_is_watched(
+        &b,
+        primary,
+        super::IDLE_VBLANK_ARM_SLOT
+    ));
+    assert!(super::vblank_arm_is_watched(
+        &b,
+        secondary,
+        super::IDLE_VBLANK_ARM_SLOT
+    ));
 
     b.pstate
         .crtc_queue_sequence_unsupported_devices
@@ -487,7 +510,7 @@ fn arm_idle_vblanks_with_empty_targets_is_noop() {
         .unwrap();
     assert_eq!(armed, 0);
     assert_eq!(calls, 0);
-    assert!(b.pstate.armed_vblank_targets.is_empty());
+    assert!(b.platform.vblank_fallback.kernel_arm_watch.is_empty());
 }
 
 #[test]
@@ -504,7 +527,11 @@ fn arm_idle_vblanks_with_arms_primary_once_then_dedups() {
         .unwrap();
     assert_eq!(armed, 1);
     assert_eq!(calls, 1);
-    assert!(b.pstate.armed_vblank_targets.contains_key(&primary));
+    assert!(super::vblank_arm_is_watched(
+        &b,
+        primary,
+        super::IDLE_VBLANK_ARM_SLOT
+    ));
 
     // Already armed → no second ioctl while the sequence is in flight.
     let armed2 = b
@@ -542,7 +569,11 @@ fn arm_idle_vblanks_without_kernel_vblank_arms_only_a_software_vblank() {
 
     assert_eq!(armed, 1, "the software vblank covers the wait");
     assert!(attempted.is_empty(), "no kernel arm on that device");
-    assert!(!b.pstate.armed_vblank_targets.contains_key(&primary));
+    assert!(!super::vblank_arm_is_watched(
+        &b,
+        primary,
+        super::IDLE_VBLANK_ARM_SLOT
+    ));
     assert!(b.platform.vblank_fallback.software.contains_key(&primary));
     assert!(!b.platform.vblank_fallback.software.contains_key(&secondary));
 
@@ -554,7 +585,11 @@ fn arm_idle_vblanks_without_kernel_vblank_arms_only_a_software_vblank() {
         .unwrap();
     assert_eq!(secondary_armed, 1);
     assert_eq!(attempted, vec![secondary]);
-    assert!(b.pstate.armed_vblank_targets.contains_key(&secondary));
+    assert!(super::vblank_arm_is_watched(
+        &b,
+        secondary,
+        super::IDLE_VBLANK_ARM_SLOT
+    ));
 }
 
 #[test]
@@ -575,15 +610,23 @@ fn arm_idle_vblanks_transient_error_does_not_cross_domains() {
 
     assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
     assert_eq!(attempted, vec![primary]);
-    assert!(!b.pstate.armed_vblank_targets.contains_key(&primary));
-    assert!(!b.pstate.armed_vblank_targets.contains_key(&secondary));
+    assert!(!super::vblank_arm_is_watched(
+        &b,
+        primary,
+        super::IDLE_VBLANK_ARM_SLOT
+    ));
+    assert!(!super::vblank_arm_is_watched(
+        &b,
+        secondary,
+        super::IDLE_VBLANK_ARM_SLOT
+    ));
 }
 
 #[test]
 fn arm_idle_vblanks_with_scanout_disallowed_clears_and_returns_zero() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let primary = output_crtc_key(&b, 0);
-    b.pstate.armed_vblank_targets.insert(primary, 0);
+    super::seed_vblank_arm_watch(&mut b, primary, super::IDLE_VBLANK_ARM_SLOT);
     b.pstate.vt_state = crate::vt::state::VtState::Suspended;
 
     let mut calls = 0u32;
@@ -596,7 +639,7 @@ fn arm_idle_vblanks_with_scanout_disallowed_clears_and_returns_zero() {
     assert_eq!(armed, 0);
     assert_eq!(calls, 0, "no arming without DRM master");
     assert!(
-        b.pstate.armed_vblank_targets.is_empty(),
+        b.platform.vblank_fallback.kernel_arm_watch.is_empty(),
         "master loss drops queued sequences → clear bookkeeping"
     );
 }
@@ -606,7 +649,7 @@ fn arm_idle_vblanks_with_scanout_disallowed_clears_and_returns_zero() {
 #[test]
 fn shared_wake_slot_starts_empty() {
     let b = crate::kms::render::backend::KmsBackend::for_tests();
-    assert!(b.pstate.shared_wake_armed.is_empty());
+    assert!(b.platform.vblank_fallback.kernel_arm_watch.is_empty());
 }
 
 #[test]
@@ -615,8 +658,8 @@ fn tagged_sequence_event_does_not_clear_relative_slot() {
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_id = u32::from(crtc);
     let crtc_key = output_crtc_key(&b, 0);
-    b.pstate.armed_vblank_targets.insert(crtc_key, 0);
-    b.pstate.shared_wake_armed.insert(crtc_key);
+    super::seed_vblank_arm_watch(&mut b, crtc_key, super::IDLE_VBLANK_ARM_SLOT);
+    super::seed_vblank_arm_watch(&mut b, crtc_key, super::SHARED_WAKE_VBLANK_ARM_SLOT);
 
     // Tagged (absolute) event for the same CRTC.
     dispatch_test_sequence(
@@ -627,11 +670,11 @@ fn tagged_sequence_event_does_not_clear_relative_slot() {
     );
 
     assert!(
-        b.pstate.armed_vblank_targets.contains_key(&crtc_key),
+        super::vblank_arm_is_watched(&b, crtc_key, super::IDLE_VBLANK_ARM_SLOT),
         "a tagged event must not spend the untagged relative-1 slot"
     );
     assert!(
-        !b.pstate.shared_wake_armed.contains(&crtc_key),
+        !super::vblank_arm_is_watched(&b, crtc_key, super::SHARED_WAKE_VBLANK_ARM_SLOT),
         "the tagged event spends its own shared-wake slot"
     );
 }
@@ -642,14 +685,14 @@ fn untagged_sequence_event_does_not_clear_shared_wake() {
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_id = u32::from(crtc);
     let crtc_key = output_crtc_key(&b, 0);
-    b.pstate.armed_vblank_targets.insert(crtc_key, 0);
-    b.pstate.shared_wake_armed.insert(crtc_key);
+    super::seed_vblank_arm_watch(&mut b, crtc_key, super::IDLE_VBLANK_ARM_SLOT);
+    super::seed_vblank_arm_watch(&mut b, crtc_key, super::SHARED_WAKE_VBLANK_ARM_SLOT);
 
     // Untagged (relative) event for the same CRTC.
     dispatch_test_sequence(&mut b, u64::from(crtc_id), 1_000_000, 50);
 
     assert!(
-        b.pstate.shared_wake_armed.contains(&crtc_key),
+        super::vblank_arm_is_watched(&b, crtc_key, super::SHARED_WAKE_VBLANK_ARM_SLOT),
         "an untagged event spends only the relative idle slot"
     );
 }
@@ -660,8 +703,8 @@ fn shared_wake_tagged_event_advances_completion_clock_and_clears_slot() {
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_id = u32::from(crtc);
     let crtc_key = output_crtc_key(&b, 0);
-    b.pstate.armed_vblank_targets.insert(crtc_key, 0);
-    b.pstate.shared_wake_armed.insert(crtc_key);
+    super::seed_vblank_arm_watch(&mut b, crtc_key, super::IDLE_VBLANK_ARM_SLOT);
+    super::seed_vblank_arm_watch(&mut b, crtc_key, super::SHARED_WAKE_VBLANK_ARM_SLOT);
 
     // Uses the tagged user data that the shared wake feeds to the ioctl.
     dispatch_test_sequence(
@@ -672,11 +715,11 @@ fn shared_wake_tagged_event_advances_completion_clock_and_clears_slot() {
     );
 
     assert!(
-        !b.pstate.shared_wake_armed.contains(&crtc_key),
+        !super::vblank_arm_is_watched(&b, crtc_key, super::SHARED_WAKE_VBLANK_ARM_SLOT),
         "the shared slot must clear through the tagged event"
     );
     assert!(
-        b.pstate.armed_vblank_targets.contains_key(&crtc_key),
+        super::vblank_arm_is_watched(&b, crtc_key, super::IDLE_VBLANK_ARM_SLOT),
         "and must not touch the relative slot"
     );
 }
@@ -685,13 +728,12 @@ fn shared_wake_tagged_event_advances_completion_clock_and_clears_slot() {
 fn clear_all_armed_vblank_targets_clears_shared_wake_too() {
     let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc_key = output_crtc_key(&b, 0);
-    b.pstate.armed_vblank_targets.insert(crtc_key, 0);
-    b.pstate.shared_wake_armed.insert(crtc_key);
+    super::seed_vblank_arm_watch(&mut b, crtc_key, super::IDLE_VBLANK_ARM_SLOT);
+    super::seed_vblank_arm_watch(&mut b, crtc_key, super::SHARED_WAKE_VBLANK_ARM_SLOT);
 
     b.clear_all_armed_vblank_targets();
 
-    assert!(b.pstate.armed_vblank_targets.is_empty());
-    assert!(b.pstate.shared_wake_armed.is_empty());
+    assert!(b.platform.vblank_fallback.kernel_arm_watch.is_empty());
 }
 
 #[test]
@@ -735,7 +777,7 @@ fn arm_present_shared_wake_false_result_is_not_tracked_as_covered() {
 
     assert_eq!(calls, 1);
     assert!(!armed);
-    assert!(b.pstate.shared_wake_armed.is_empty());
+    assert!(b.platform.vblank_fallback.kernel_arm_watch.is_empty());
 }
 
 // Mutation: restore per-target arms or omit Backend's cursor-only flip submission.
@@ -858,8 +900,7 @@ fn shared_wake_outstanding_arms_stay_bounded() {
     assert_eq!(max_outstanding, 2);
     assert_eq!(issued - delivered, 0);
     assert!(flip_submitted);
-    assert!(backend.pstate.shared_wake_armed.is_empty());
-    assert!(backend.pstate.armed_vblank_targets.is_empty());
+    assert!(backend.platform.vblank_fallback.kernel_arm_watch.is_empty());
 }
 
 // Mutation: never clear the tagged slot when its sequence event is delivered.
@@ -871,15 +912,27 @@ fn shared_wake_rearms_only_after_its_event() {
     assert!(Backend::arm_present_shared_wake(&mut backend, randr_crtc_id).unwrap());
     assert!(Backend::arm_present_shared_wake(&mut backend, randr_crtc_id).unwrap());
     assert_eq!(source.legacy_vblank_arms().len(), 1);
-    assert!(backend.pstate.shared_wake_armed.contains(&crtc_key));
+    assert!(super::vblank_arm_is_watched(
+        &backend,
+        crtc_key,
+        super::SHARED_WAKE_VBLANK_ARM_SLOT
+    ));
 
     source.fire_legacy_vblank_arms(1_000_000, 6);
     drain_shared_wake_test_events(&mut backend, &mut state);
-    assert!(!backend.pstate.shared_wake_armed.contains(&crtc_key));
+    assert!(!super::vblank_arm_is_watched(
+        &backend,
+        crtc_key,
+        super::SHARED_WAKE_VBLANK_ARM_SLOT
+    ));
 
     assert!(Backend::arm_present_shared_wake(&mut backend, randr_crtc_id).unwrap());
     assert_eq!(source.legacy_vblank_arms().len(), 1);
-    assert!(backend.pstate.shared_wake_armed.contains(&crtc_key));
+    assert!(super::vblank_arm_is_watched(
+        &backend,
+        crtc_key,
+        super::SHARED_WAKE_VBLANK_ARM_SLOT
+    ));
 }
 
 // Mutation: omit the tagged slot clear on DPMS or VT release.
@@ -891,9 +944,9 @@ fn shared_wake_cleared_by_lifecycle_edges() {
 
     let (mut dpms, dpms_crtc, randr_crtc_id, source) = shared_wake_test_backend();
     dpms.platform.for_tests_accept_output_power_commits();
-    dpms.pstate.shared_wake_armed.insert(dpms_crtc);
+    super::seed_vblank_arm_watch(&mut dpms, dpms_crtc, super::SHARED_WAKE_VBLANK_ARM_SLOT);
     Backend::set_dpms_power(&mut dpms, 3).expect("DPMS off");
-    assert!(dpms.pstate.shared_wake_armed.is_empty());
+    assert!(dpms.platform.vblank_fallback.kernel_arm_watch.is_empty());
     // The fd-less fixture has no framebuffer for DPMS-on; restore its active
     // state to exercise the next production arm call after the off edge.
     dpms.kms_outputs_active = true;
@@ -902,11 +955,11 @@ fn shared_wake_cleared_by_lifecycle_edges() {
 
     let mut vt = KmsBackend::for_tests();
     let vt_crtc = output_crtc_key(&vt, 0);
-    vt.pstate.shared_wake_armed.insert(vt_crtc);
+    super::seed_vblank_arm_watch(&mut vt, vt_crtc, super::SHARED_WAKE_VBLANK_ARM_SLOT);
     let mut state = ServerState::new();
     Backend::begin_vt_release(&mut vt);
     Backend::finish_vt_release(&mut vt, &mut state, &InputInventory::new());
-    assert!(vt.pstate.shared_wake_armed.is_empty());
+    assert!(vt.platform.vblank_fallback.kernel_arm_watch.is_empty());
 }
 
 #[test]
@@ -2037,7 +2090,7 @@ fn arm_present_shared_wake_with_arms_only_selected_crtc() {
         "must arm the selected CRTC even when another domain has a larger counter"
     );
     assert!(
-        !b.pstate.shared_wake_armed.contains(&crtc1),
+        !super::vblank_arm_is_watched(&b, crtc1, super::SHARED_WAKE_VBLANK_ARM_SLOT),
         "the unrelated CRTC must not gain an armed entry"
     );
 }

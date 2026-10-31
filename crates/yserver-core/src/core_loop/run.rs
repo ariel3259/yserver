@@ -3308,11 +3308,12 @@ pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dy
             }
         }
         for ((crtc_id, crtc_epoch), future_parked) in by_domain {
-            let result = if backend.present_absolute_vblank_arm_supported(crtc_id) {
-                backend.arm_present_shared_wake(crtc_id)
-            } else {
-                Ok(false)
-            };
+            if !backend.present_absolute_vblank_arm_supported(crtc_id) {
+                // Unsupported clocks keep the due-pass's flip pacing; its
+                // separate idle-display rung handles an actually idle CRTC.
+                continue;
+            }
+            let result = backend.arm_present_shared_wake(crtc_id);
             let covered = match result {
                 Ok(true) => {
                     log::debug!(

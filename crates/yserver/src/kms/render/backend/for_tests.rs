@@ -675,8 +675,6 @@ impl KmsBackend {
                 crate::kms::render::backend::kms::session::DrmVtResumeExecutor,
             ),
             monotonic_clock: Rc::new(std::time::Instant::now),
-            armed_vblank_targets: std::collections::HashMap::new(),
-            shared_wake_armed: std::collections::HashSet::new(),
             crtc_queue_sequence_unsupported_devices: HashSet::new(),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
