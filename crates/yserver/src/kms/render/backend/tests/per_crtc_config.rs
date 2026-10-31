@@ -22,7 +22,7 @@ use crate::{
     platform::drm::Output,
 };
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     io,
     os::fd::{AsFd as _, AsRawFd as _, RawFd},
     rc::Rc,
@@ -504,6 +504,56 @@ fn live_two_heads() -> Option<(RecordingSceneFixture, Rc<PowerLog>, ScanoutRoute
     Some((fixture, log, route))
 }
 
+fn install_fake_clock(backend: &mut KmsBackend) -> Rc<Cell<std::time::Instant>> {
+    let now = Rc::new(Cell::new(std::time::Instant::now()));
+    let clock = Rc::clone(&now);
+    backend.for_tests_set_monotonic_clock(Rc::new(move || clock.get()));
+    now
+}
+
+fn freeze_output_for_test(
+    backend: &mut KmsBackend,
+    output_idx: usize,
+    now: &Cell<std::time::Instant>,
+) -> (
+    crate::kms::render::platform::CrtcKey,
+    u32,
+    Rc<crate::kms::render::platform::flip_events::RecordingPageFlipEventSource>,
+) {
+    use yserver_core::{backend::Backend, server::ServerState};
+
+    let key =
+        crate::kms::render::platform::CrtcKey::for_output(&backend.platform.outputs[output_idx]);
+    let projected = Backend::randr_outputs_and_modes(backend).0;
+    let crtc_id = projected
+        .get(output_idx)
+        .expect("live output has a RandR projection")
+        .crtc_id;
+    let source = backend.platform.devices[0]
+        .test_page_flip_event_source
+        .clone()
+        .expect("recording fixture has a page-flip source");
+    source.set_legacy_vblank(Ok(5));
+    backend
+        .pstate
+        .crtc_queue_sequence_unsupported_devices
+        .insert(key.device_key);
+    backend
+        .platform
+        .vblank_fallback
+        .pipes
+        .insert(key, output_idx as u32);
+    assert!(
+        Backend::arm_present_shared_wake(backend, crtc_id)
+            .expect("arm the selected CRTC's kernel wake")
+    );
+    let armed_at = now.get();
+    now.set(armed_at + KmsBackend::FROZEN_VBLANK_WINDOW);
+    backend.poll_deferred_input(&mut ServerState::new());
+    assert!(backend.platform.vblank_fallback.frozen.contains_key(&key));
+    (key, crtc_id, source)
+}
+
 fn device_fd(fixture: &RecordingSceneFixture) -> RawFd {
     fixture.events.backend.platform.devices[0]
         .device
@@ -848,6 +898,133 @@ fn enabling_an_off_output_modesets_only_its_crtc() {
     flip_for(&next, crtc0);
     flip_for(&next, crtc1);
     retire_all(&mut fixture, &next, 2, None);
+    fixture.adopt_drawables(0x6b00..0x6b03);
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutations: clear the mark on a same-route modeset, or keep the old interval.
+fn same_route_modeset_keeps_the_mark_and_never_rewinds() {
+    let Some((mut fixture, _log, _route)) = live_two_heads() else {
+        println!(
+            "SKIP same_route_modeset_keeps_the_mark_and_never_rewinds: Vulkan fixture unavailable"
+        );
+        return;
+    };
+    let now = install_fake_clock(&mut fixture.events.backend);
+    let (key, crtc_id, _source) = freeze_output_for_test(&mut fixture.events.backend, 1, &now);
+    now.set(now.get() + Duration::from_secs(1));
+    let before = Backend::present_get_ust_msc(&fixture.events.backend, crtc_id);
+
+    let backend = &mut fixture.events.backend;
+    let mut discovered = clone_test_drm_output(&backend.platform.outputs[1].output);
+    let mut timing = advertised(800, 600);
+    timing.vrefresh = 240;
+    timing.clock_khz = 0;
+    timing.htotal = 0;
+    timing.vtotal = 0;
+    discovered.picked = timing.clone();
+    discovered.modes.push(timing);
+    backend.pstate.crtc_config_discovery_override = Some(discovered);
+    let connector_name = connector(backend, 1);
+    let output_id = output_id(backend, &connector_name);
+    assert!(
+        Backend::apply_crtc_config(
+            backend,
+            output_id,
+            &connector_name,
+            Some(ModeSpec {
+                width: 800,
+                height: 600,
+                vrefresh: 240,
+            }),
+            800,
+            0,
+        )
+        .expect("same-route 240 Hz mode change")
+    );
+
+    let frozen = backend.platform.vblank_fallback.frozen[&key];
+    assert_eq!(
+        frozen.anchor_msc, before.0,
+        "modeset anchors at the current MSC"
+    );
+    assert_eq!(
+        frozen.anchor_ust, before.1,
+        "modeset anchors at the current UST"
+    );
+    assert_eq!(frozen.anchor_at, now.get());
+    assert_eq!(frozen.interval, Duration::from_nanos(1_000_000_000 / 240));
+    now.set(now.get() + frozen.interval * 2);
+    assert_eq!(
+        Backend::present_get_ust_msc(backend, crtc_id).0,
+        before.0 + 2,
+        "the re-anchored clock advances at the new mode's rate"
+    );
+    fixture.finish_after_normal_drain();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+// Mutation: retain a frozen mark after disable, preventing the kernel arm on enable.
+fn disable_and_enable_returns_to_the_kernel_clock() {
+    let Some((mut fixture, _log, route)) = live_two_heads() else {
+        println!("SKIP disable_and_enable_returns_to_the_kernel_clock: Vulkan fixture unavailable");
+        return;
+    };
+    let now = install_fake_clock(&mut fixture.events.backend);
+    let (key, crtc_id, source) = freeze_output_for_test(&mut fixture.events.backend, 1, &now);
+    let backend = &mut fixture.events.backend;
+    let output_key = backend.platform.outputs[1].key.clone();
+    let saved = clone_test_drm_output(&backend.platform.outputs[1].output);
+    let connector_name = connector(backend, 1);
+    let output_id = output_id(backend, &connector_name);
+    assert!(
+        Backend::apply_crtc_config(backend, output_id, &connector_name, None, 0, 0,)
+            .expect("disable frozen CRTC")
+    );
+    assert!(!backend.platform.vblank_fallback.frozen.contains_key(&key));
+    assert!(
+        !backend
+            .platform
+            .vblank_fallback
+            .kernel_arm_watch
+            .keys()
+            .any(|(watched, _)| *watched == key)
+    );
+
+    backend.pstate.crtc_config_discovery_override = Some(saved);
+    let pool = recording_scanout_pool(backend, &output_key, route, (800, 600), 0x6b00, 0x5300)
+        .expect("replacement pool for re-enable");
+    backend.pstate.crtc_config_discovery_pool = Some((route, pool));
+    assert!(
+        Backend::apply_crtc_config(backend, output_id, &connector_name, Some(MODE_800), 800, 0,)
+            .expect("re-enable CRTC")
+    );
+    assert!(!backend.platform.vblank_fallback.frozen.contains_key(&key));
+    backend
+        .pstate
+        .crtc_queue_sequence_unsupported_devices
+        .insert(key.device_key);
+    backend.platform.vblank_fallback.pipes.insert(key, 1);
+    source.set_legacy_vblank(Ok(5));
+    assert!(
+        Backend::arm_present_shared_wake(backend, crtc_id)
+            .expect("re-enabled CRTC arms the kernel wake")
+    );
+    assert!(backend.pstate.shared_wake_armed.contains(&key));
+    assert!(
+        backend
+            .platform
+            .vblank_fallback
+            .kernel_arm_watch
+            .contains_key(&(
+                key,
+                crate::kms::render::platform::vblank_fallback::VblankArmSlot::SharedWake,
+            ))
+    );
+    assert!(!backend.platform.vblank_fallback.software.contains_key(&key));
     fixture.adopt_drawables(0x6b00..0x6b03);
     fixture.finish_after_normal_drain();
 }

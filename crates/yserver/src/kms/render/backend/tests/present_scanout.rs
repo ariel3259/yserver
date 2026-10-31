@@ -4076,6 +4076,7 @@ fn scanout_m0_steady_candidate_keeps_one_shape_and_source_record() {
         explicit_sync: false,
         options: 0,
     };
+    b.pstate.scanout_m0.interval_start = std::time::Instant::now();
     b.observe_scanout_m0(candidate);
     b.observe_scanout_m0(PresentScanoutCandidate {
         present_id: 2,

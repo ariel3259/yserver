@@ -228,6 +228,7 @@ The coordinator runs this, with the user's permission and watching, after prefli
 - [ ] **Step 1: NVIDIA, the original failure.** Install the branch binary with `present_pace=debug`. In the session, the i3 config's two `xrandr` lines run at startup. Open Firefox and Alacritty on the two monitors, run `fastfetch`, type, and repeat for 5 minutes. Expected: no `os error 12` in the log, one `vblank counter frozen` line for DP-3, cursor smooth on both monitors, Alacritty responsive.
 - [ ] **Step 2: NVIDIA, a healthy head.** Start without the `xrandr` lines. Expected: no `vblank counter frozen` line, `msc` advancing on both outputs.
 - [ ] **Step 3: NVIDIA, a game or mpv on DP-3 while frozen.** Expected: frame pacing near the mode's rate, no hang.
+- [ ] **Step 3b: NVIDIA client frame rate while frozen.** A native NVIDIA client (`glxgears` or vkcube) and CS2 on the frozen head. Expected: near the mode's rate. XLibre's fake clock gave 1 fps on NVIDIA, so measure instead of assuming.
 - [ ] **Step 4: AMD regression.** `--vrr` on, mpv, and a compositor session. Expected: no `vblank counter frozen`, no `os error 12`, tearing and direct scanout as on master.
 - [ ] **Step 5: Record results** in the PR body. A visual glitch in any step is a finding.
 

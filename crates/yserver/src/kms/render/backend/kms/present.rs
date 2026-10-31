@@ -23,6 +23,8 @@ pub(in crate::kms::render::backend) fn absolute_seq_user_data(crtc_id: u32) -> u
 }
 
 impl KmsBackend {
+    pub(crate) const FROZEN_VBLANK_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+
     fn direct_candidate_authoritative_root(
         &self,
         candidate: PresentScanoutCandidate,
@@ -610,6 +612,7 @@ impl KmsBackend {
         }
         self.pstate.shared_wake_armed.clear();
         self.platform.vblank_fallback.software.clear();
+        self.platform.vblank_fallback.kernel_arm_watch.clear();
     }
 
     /// Drop armed slots (both the relative idle slot and tagged Present
@@ -632,6 +635,10 @@ impl KmsBackend {
         self.pstate
             .shared_wake_armed
             .retain(|key| live.contains(key));
+        self.platform
+            .vblank_fallback
+            .kernel_arm_watch
+            .retain(|(key, _), _| live.contains(key));
     }
 
     /// Side-effect-free `DRM_CRTC_SEQUENCE` event handler.
@@ -672,9 +679,22 @@ impl KmsBackend {
         if tagged {
             if let Some(key) = crtc_key {
                 self.pstate.shared_wake_armed.remove(&key);
+                self.platform.vblank_fallback.kernel_arm_watch.remove(&(
+                    key,
+                    crate::kms::render::platform::vblank_fallback::VblankArmSlot::SharedWake,
+                ));
             }
         } else if let Some(key) = crtc_key {
             self.pstate.armed_vblank_targets.remove(&key);
+            self.platform.vblank_fallback.kernel_arm_watch.remove(&(
+                key,
+                crate::kms::render::platform::vblank_fallback::VblankArmSlot::Idle,
+            ));
+        }
+        if let Some(key) = crtc_key
+            && self.platform.vblank_fallback.frozen.contains_key(&key)
+        {
+            return;
         }
         let Some(handle) = crtc_handle else {
             log::warn!("PRESENT-DBG: CrtcSequence bogus crtc_id={crtc_id_raw} — dropped");
@@ -749,7 +769,13 @@ impl KmsBackend {
             self.clear_all_armed_vblank_targets();
             return Ok(0);
         }
-        if !self.kernel_vblank_arm_available(crtc_key.device_key) {
+        if self.platform.vblank_fallback.frozen.contains_key(&crtc_key) {
+            let now = (self.pstate.monotonic_clock)();
+            return Ok(usize::from(
+                self.platform.arm_software_vblank(crtc_key, now),
+            ));
+        }
+        if !self.kernel_vblank_arm_available(crtc_key) {
             let now = (self.pstate.monotonic_clock)();
             return Ok(usize::from(
                 self.platform.arm_software_vblank(crtc_key, now),
@@ -760,6 +786,13 @@ impl KmsBackend {
         }
         if armer(crtc_key)? {
             self.pstate.armed_vblank_targets.insert(crtc_key, 0);
+            self.platform.vblank_fallback.kernel_arm_watch.insert(
+                (
+                    crtc_key,
+                    crate::kms::render::platform::vblank_fallback::VblankArmSlot::Idle,
+                ),
+                (self.pstate.monotonic_clock)(),
+            );
             Ok(1)
         } else {
             Ok(0)
@@ -785,7 +818,16 @@ impl KmsBackend {
             self.clear_all_armed_vblank_targets();
             return Ok(false);
         }
-        if !self.kernel_vblank_arm_available(crtc_key.device_key) {
+        if self.platform.vblank_fallback.frozen.contains_key(&crtc_key) {
+            let now = (self.pstate.monotonic_clock)();
+            self.platform.arm_software_vblank(crtc_key, now);
+            return Ok(self
+                .platform
+                .vblank_fallback
+                .software
+                .contains_key(&crtc_key));
+        }
+        if !self.kernel_vblank_arm_available(crtc_key) {
             return Ok(false);
         }
         if self.pstate.shared_wake_armed.contains(&crtc_key) {
@@ -793,6 +835,13 @@ impl KmsBackend {
         }
         if armer(crtc_key)? {
             self.pstate.shared_wake_armed.insert(crtc_key);
+            self.platform.vblank_fallback.kernel_arm_watch.insert(
+                (
+                    crtc_key,
+                    crate::kms::render::platform::vblank_fallback::VblankArmSlot::SharedWake,
+                ),
+                (self.pstate.monotonic_clock)(),
+            );
             Ok(true)
         } else {
             Ok(false)
@@ -826,13 +875,14 @@ impl KmsBackend {
     /// CRTC_QUEUE_SEQUENCE, or the legacy WAIT_VBLANK fallback.
     pub(in crate::kms::render::backend) fn kernel_vblank_arm_available(
         &self,
-        device_key: crate::platform::drm::DrmDeviceKey,
+        crtc_key: CrtcKey,
     ) -> bool {
-        !self
-            .pstate
-            .crtc_queue_sequence_unsupported_devices
-            .contains(&device_key)
-            || self.platform.wait_vblank_supported(device_key)
+        self.platform.vblank_fallback.frozen.contains_key(&crtc_key)
+            || !self
+                .pstate
+                .crtc_queue_sequence_unsupported_devices
+                .contains(&crtc_key.device_key)
+            || self.platform.wait_vblank_supported(crtc_key.device_key)
     }
 
     fn kernel_vblank_armer(&self, crtc_key: CrtcKey) -> Option<KernelVblankArmer> {
@@ -872,12 +922,12 @@ impl KmsBackend {
         };
         self.platform
             .note_wait_vblank_error(crtc_key.device_key, &error);
-        !self.kernel_vblank_arm_available(crtc_key.device_key)
+        !self.kernel_vblank_arm_available(crtc_key)
     }
 
-    /// Fire due software vblanks: each advances its CRTC's MSC by one and
-    /// feeds the sequence-event path, unless a flip or another event already
-    /// advanced that MSC since the arm.
+    /// Fire due software vblanks. The ordinary fallback advances one MSC
+    /// through the sequence-event path unless another event already advanced
+    /// it; frozen CRTCs record their elapsed clock sample instead.
     pub(in crate::kms::render::backend) fn service_software_vblanks(&mut self) {
         if self.platform.vblank_fallback.software.is_empty() {
             return;
@@ -891,6 +941,26 @@ impl KmsBackend {
             let Some(output_idx) = self.platform.output_index_for_crtc(crtc_key) else {
                 continue;
             };
+            if self.platform.vblank_fallback.frozen.contains_key(&crtc_key) {
+                let Some((msc, ust)) = self.platform.frozen_clock_now(crtc_key, now) else {
+                    continue;
+                };
+                self.platform.record_vblank_clock(crtc_key, msc, ust);
+                self.platform.record_completion_clock(
+                    crtc_key,
+                    yserver_core::backend::PresentClockSample {
+                        msc,
+                        ust,
+                        source: yserver_core::backend::PresentClockSource::IdleSequence,
+                    },
+                    None,
+                );
+                log::debug!(
+                    target: "present_pace",
+                    "present_clock frozen software vblank output={output_idx} msc={msc}"
+                );
+                continue;
+            }
             if self.platform.present_get_ust_msc(crtc_key).0 != vblank.armed_msc
                 || self.present_flip_in_flight_for_output(output_idx)
             {
@@ -909,6 +979,62 @@ impl KmsBackend {
                 u64::from(u32::from(crtc_key.crtc)),
                 time_ns,
                 msc,
+            );
+        }
+    }
+
+    pub(crate) fn mark_frozen_crtcs(&mut self) {
+        if !self.scanout_allowed() || !self.kms_outputs_active {
+            return;
+        }
+        let now = (self.pstate.monotonic_clock)();
+        let due: HashSet<CrtcKey> = self
+            .platform
+            .vblank_fallback
+            .kernel_arm_watch
+            .iter()
+            .filter_map(|((key, _), armed_at)| {
+                (!self.platform.vblank_fallback.frozen.contains_key(key)
+                    && now.saturating_duration_since(*armed_at) >= Self::FROZEN_VBLANK_WINDOW)
+                    .then_some(*key)
+            })
+            .collect();
+        for crtc_key in due {
+            let Some(device) = self.platform.device_for_key(crtc_key.device_key) else {
+                continue;
+            };
+            match device.page_flip_event_source.events_ready(&device.device) {
+                Ok(true) => continue,
+                Err(error) => {
+                    log::warn!(
+                        "PRESENT-DBG: unable to check queued DRM events before freezing CRTC: {error}"
+                    );
+                    continue;
+                }
+                Ok(false) => {}
+            }
+            let general = self.platform.present_get_ust_msc(crtc_key);
+            let completion = self.platform.present_get_completion_clock(crtc_key);
+            let (anchor_msc, anchor_ust) = if completion.msc > general.0 {
+                (completion.msc, completion.ust)
+            } else {
+                general
+            };
+            let Some(interval) = self.platform.crtc_frame_interval(crtc_key) else {
+                continue;
+            };
+            self.platform.vblank_fallback.frozen.insert(
+                crtc_key,
+                crate::kms::render::platform::vblank_fallback::FrozenClock {
+                    anchor_msc,
+                    anchor_ust,
+                    anchor_at: now,
+                    interval,
+                },
+            );
+            let device = crtc_key.device_key;
+            log::warn!(
+                "kms: CRTC {crtc_key:?} on {device} vblank counter frozen; Present uses a software clock"
             );
         }
     }
@@ -1843,7 +1969,7 @@ impl KmsBackend {
         crtc_id: u32,
     ) -> bool {
         self.present_crtc_key(crtc_id)
-            .is_some_and(|key| self.kernel_vblank_arm_available(key.device_key))
+            .is_some_and(|key| self.kernel_vblank_arm_available(key))
     }
 
     pub(in crate::kms::render::backend) fn backend_present_arm_present_shared_wake(
@@ -1926,7 +2052,9 @@ impl KmsBackend {
         crtc_id: u32,
     ) -> (u64, u64) {
         self.present_crtc_key(crtc_id).map_or((0, 0), |crtc_key| {
-            self.platform.present_get_ust_msc(crtc_key)
+            self.platform
+                .frozen_clock_now(crtc_key, (self.pstate.monotonic_clock)())
+                .unwrap_or_else(|| self.platform.present_get_ust_msc(crtc_key))
         })
     }
 
@@ -1940,7 +2068,17 @@ impl KmsBackend {
                 ust: 0,
                 source: yserver_core::backend::PresentClockSource::PageFlip,
             },
-            |crtc_key| self.platform.present_get_completion_clock(crtc_key),
+            |crtc_key| {
+                let mut sample = self.platform.present_get_completion_clock(crtc_key);
+                if let Some((msc, ust)) = self
+                    .platform
+                    .frozen_clock_now(crtc_key, (self.pstate.monotonic_clock)())
+                {
+                    sample.msc = msc;
+                    sample.ust = ust;
+                }
+                sample
+            },
         )
     }
 
@@ -1952,7 +2090,9 @@ impl KmsBackend {
         let Some(crtc_key) = self.present_crtc_key(crtc_id) else {
             return Ok(0);
         };
-        if !self.present_completion_is_idle_for(crtc_key) {
+        if !self.platform.vblank_fallback.frozen.contains_key(&crtc_key)
+            && !self.present_completion_is_idle_for(crtc_key)
+        {
             return Ok(0);
         }
         self.arm_idle_vblanks_ioctl(crtc_id, target_mscs)

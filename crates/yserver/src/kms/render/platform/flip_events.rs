@@ -142,6 +142,9 @@ pub(crate) trait PageFlipEventSource {
         device: &crate::drm::Device,
     ) -> io::Result<Option<(Vec<KernelPageFlip>, Vec<KernelCrtcSequence>)>>;
 
+    /// Check whether kernel events are readable without consuming them.
+    fn events_ready(&self, device: &crate::drm::Device) -> io::Result<bool>;
+
     /// Legacy `DRM_IOCTL_WAIT_VBLANK` count query for `pipe`.
     fn query_vblank(
         &self,
@@ -253,6 +256,31 @@ impl PageFlipEventSource for DrmPageFlipEventSource {
             return Ok(None);
         }
         self.drain_events(device).map(Some)
+    }
+
+    fn events_ready(&self, device: &crate::drm::Device) -> io::Result<bool> {
+        let mut poll_fd = libc::pollfd {
+            fd: device.as_fd().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `poll_fd` is one initialized record for this zero-time check.
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, 0) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                return Ok(true);
+            }
+            return Err(error);
+        }
+        let error_events = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
+        if poll_fd.revents & error_events != 0 {
+            return Err(io::Error::other(format!(
+                "DRM fd {} reported poll error flags 0x{:x} while checking events",
+                poll_fd.fd, poll_fd.revents
+            )));
+        }
+        Ok(ready > 0 && poll_fd.revents & libc::POLLIN != 0)
     }
 }
 
@@ -463,6 +491,10 @@ impl PageFlipEventSource for RecordingPageFlipEventSource {
             return Ok(None);
         }
         self.drain_events(device).map(Some)
+    }
+
+    fn events_ready(&self, _device: &crate::drm::Device) -> io::Result<bool> {
+        Ok(!self.flips.borrow().is_empty() || !self.sequences.borrow().is_empty())
     }
 
     fn wait_ready(
@@ -752,6 +784,7 @@ impl PlatformBackend {
     pub(crate) fn drain_page_flip_events(
         &mut self,
         drm_fd: RawFd,
+        now: std::time::Instant,
     ) -> io::Result<DrainedPageFlipEvents> {
         let device_index = self.drm_device_index_for_fd(drm_fd).ok_or_else(|| {
             io::Error::new(
@@ -790,7 +823,11 @@ impl PlatformBackend {
             };
             // u32 frame → u64 MSC (kernel wraps at 2^32; monotonic enough
             // for a frame clock within a session). UST in microseconds.
-            let ust = u64::try_from(flip.ust.as_micros()).unwrap_or(u64::MAX);
+            let frozen_sample = self.frozen_clock_now(crtc_key, now);
+            let ust = frozen_sample.map_or_else(
+                || u64::try_from(flip.ust.as_micros()).unwrap_or(u64::MAX),
+                |(_, ust)| ust,
+            );
             // apple_drm (Asahi) reports `frame == 0` on every page-flip
             // completion — the kernel does not maintain a CRTC sequence
             // counter — and rejects `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` with
@@ -800,12 +837,14 @@ impl PlatformBackend {
             // forever). Fall back to a per-output software counter that
             // increments on every flip when the kernel reports 0; on
             // drivers that report a real frame this stays untouched.
-            let legacy_msc = if flip.frame == 0 {
+            let legacy_msc = if frozen_sample.is_none() && flip.frame == 0 {
                 self.query_legacy_vblank_msc(crtc_key, &device, event_source.as_ref())
             } else {
                 None
             };
-            let msc = if let Some(msc) = legacy_msc {
+            let msc = if let Some((msc, _)) = frozen_sample {
+                msc
+            } else if let Some(msc) = legacy_msc {
                 msc
             } else if flip.frame == 0 {
                 let next = self
@@ -840,18 +879,27 @@ impl PlatformBackend {
                 target: "present_pace",
                 "present_clock sample source=pageflip output={output_idx} msc={msc} ust={ust}"
             );
-            let completion_at_monotonic = completion_timestamp_monotonic(
-                flip.ust,
-                flip.event_at_monotonic,
-                flip.event_at_boottime,
-            );
+            let completion_at_monotonic = if frozen_sample.is_some() {
+                flip.event_at_monotonic
+            } else {
+                completion_timestamp_monotonic(
+                    flip.ust,
+                    flip.event_at_monotonic,
+                    flip.event_at_boottime,
+                )
+            };
+            let kernel_ust = if frozen_sample.is_some() {
+                std::time::Duration::from_micros(ust)
+            } else {
+                flip.ust
+            };
             completions.push((
                 output_idx,
                 sample,
                 FlipEventTimestamps {
                     commit_id: (flip.commit_id != 0).then_some(flip.commit_id),
                     received_at_monotonic: flip.event_at_monotonic,
-                    kernel_ust: flip.ust,
+                    kernel_ust,
                     completion_at_monotonic,
                 },
             ));
