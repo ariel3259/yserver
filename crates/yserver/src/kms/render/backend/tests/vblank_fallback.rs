@@ -85,6 +85,7 @@ fn mark_frozen_at_watch_deadline(
 
 #[derive(Clone, Copy)]
 struct CorePresentRequest {
+    client_id: u32,
     serial: u32,
     x_offset: i16,
     target_msc: u64,
@@ -745,35 +746,61 @@ fn run_frozen_core_present_requests(
             event_mask: present::EVENT_MASK_COMPLETE_NOTIFY,
         },
     );
+    let needs_second_client = requests_to_send
+        .iter()
+        .any(|request| request.client_id == 2);
+    assert!(
+        requests_to_send
+            .iter()
+            .all(|request| matches!(request.client_id, 1 | 2)),
+        "core-loop fixture registers clients 1 and 2"
+    );
+    if needs_second_client {
+        state.present_event_selections.insert(
+            0x0200_7efe,
+            PresentEventSelection {
+                owner: ClientId(2),
+                window: WINDOW,
+                event_mask: present::EVENT_MASK_COMPLETE_NOTIFY,
+            },
+        );
+    }
 
     let (transport, mut peer) = Transport::pair().expect("core test client transport");
     peer.set_read_timeout(Some(Duration::from_secs(10)))
         .expect("set test client read timeout");
-    state.clients.insert(
-        1,
-        ClientState {
-            writer: Arc::new(Mutex::new(transport)),
-            is_local: true,
-            fd_passing: true,
-            internal: false,
-            byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
-            last_sequence: Arc::new(AtomicU16::new(0)),
-            resource_id_base: 0,
-            resource_id_mask: u32::MAX,
-            big_requests_enabled: false,
-            event_masks: HashMap::new(),
-            save_set: HashSet::new(),
-            xi2_masks: HashMap::new(),
-            xi1_event_classes: HashSet::new(),
-            xi1_window_event_classes: HashMap::new(),
-            outbound: VecDeque::new(),
-            watching_writable: false,
-            write_failed: false,
-            gone: false,
-            focused_window: yserver_core::resources::ROOT_WINDOW,
-            reader_control: None,
-        },
-    );
+    let make_client_state = |transport| ClientState {
+        writer: Arc::new(Mutex::new(transport)),
+        is_local: true,
+        fd_passing: true,
+        internal: false,
+        byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
+        last_sequence: Arc::new(AtomicU16::new(0)),
+        resource_id_base: 0,
+        resource_id_mask: u32::MAX,
+        big_requests_enabled: false,
+        event_masks: HashMap::new(),
+        save_set: HashSet::new(),
+        xi2_masks: HashMap::new(),
+        xi1_event_classes: HashSet::new(),
+        xi1_window_event_classes: HashMap::new(),
+        outbound: VecDeque::new(),
+        watching_writable: false,
+        write_failed: false,
+        gone: false,
+        focused_window: yserver_core::resources::ROOT_WINDOW,
+        reader_control: None,
+    };
+    state.clients.insert(1, make_client_state(transport));
+    let second_peer = if needs_second_client {
+        let (transport, peer) = Transport::pair().expect("second core test client transport");
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("set second test client read timeout");
+        state.clients.insert(2, make_client_state(transport));
+        Some(peer)
+    } else {
+        None
+    };
     b.for_tests_set_monotonic_clock(Rc::new(Instant::now));
     b.scene.test_set_flip_in_flight(flip_in_flight);
 
@@ -791,6 +818,7 @@ fn run_frozen_core_present_requests(
             }
         }
         let _shutdown_on_drop = ShutdownOnDrop(shutdown);
+        let mut second_peer = second_peer;
         let send_present = |sequence: u16, request: CorePresentRequest| {
             let mut body = vec![0_u8; 68];
             body[0..4].copy_from_slice(&WINDOW.0.to_le_bytes());
@@ -801,11 +829,11 @@ fn run_frozen_core_present_requests(
                 .copy_from_slice(&crtc_ids_for_driver[request.target_output_idx].to_le_bytes());
             body[36..40].copy_from_slice(&request.options.to_le_bytes());
             body[44..52].copy_from_slice(&request.target_msc.to_le_bytes());
-            body[52..56].copy_from_slice(&request.divisor.to_le_bytes());
-            body[56..60].copy_from_slice(&request.remainder.to_le_bytes());
+            body[52..60].copy_from_slice(&u64::from(request.divisor).to_le_bytes());
+            body[60..68].copy_from_slice(&u64::from(request.remainder).to_le_bytes());
             requests
                 .send(Message::Request {
-                    id: ClientId(1),
+                    id: ClientId(request.client_id),
                     sequence: SequenceNumber(sequence),
                     accepted_at: None,
                     header: RequestHeader {
@@ -840,23 +868,16 @@ fn run_frozen_core_present_requests(
                           completions: &mut Vec<(u32, u8, u64, u64)>,
                           barrier_replies: &mut usize,
                           complete_count: usize,
-                          barrier_count: usize| {
+                          barrier_count: usize|
+         -> std::io::Result<()> {
             while completions.len() < complete_count || *barrier_replies < barrier_count {
                 let mut first = [0_u8; 1];
-                peer.read_exact(&mut first).unwrap_or_else(|error| {
-                    panic!(
-                        "read core response while waiting for {complete_count} completions and \
-                         {barrier_count} barriers (got {} completions and {barrier_replies} barriers): \
-                         {error}",
-                        completions.len()
-                    )
-                });
+                peer.read_exact(&mut first)?;
                 match first[0] {
                     35 => {
                         let mut event = [0_u8; 40];
                         event[0] = first[0];
-                        peer.read_exact(&mut event[1..])
-                            .expect("read CompleteNotify");
+                        peer.read_exact(&mut event[1..])?;
                         assert_eq!(
                             u16::from_le_bytes([event[8], event[9]]),
                             u16::from(present::EVENT_COMPLETE_NOTIFY)
@@ -871,22 +892,28 @@ fn run_frozen_core_present_requests(
                     1 => {
                         let mut reply = [0_u8; 32];
                         reply[0] = first[0];
-                        peer.read_exact(&mut reply[1..])
-                            .expect("read barrier reply");
+                        peer.read_exact(&mut reply[1..])?;
                         *barrier_replies += 1;
                     }
-                    response => panic!("unexpected X11 response {response}"),
+                    response => {
+                        return Err(std::io::Error::other(format!(
+                            "unexpected X11 response {response}"
+                        )));
+                    }
                 }
             }
+            Ok(())
         };
         send_barrier(1);
-        read_until(&mut peer, &mut completions, &mut barrier_replies, 0, 1);
+        read_until(&mut peer, &mut completions, &mut barrier_replies, 0, 1)
+            .expect("client 1 reads the initial barrier reply");
         for (offset, request) in requests_for_driver.iter().copied().enumerate() {
             send_present(u16::try_from(offset + 2).unwrap(), request);
         }
         let before_mark_barrier = u16::try_from(request_count + 2).unwrap();
         send_barrier(before_mark_barrier);
-        read_until(&mut peer, &mut completions, &mut barrier_replies, 0, 2);
+        read_until(&mut peer, &mut completions, &mut barrier_replies, 0, 2)
+            .expect("client 1 reads the pre-mark barrier reply");
         let early_completions = completions.clone();
         read_until(
             &mut peer,
@@ -894,8 +921,30 @@ fn run_frozen_core_present_requests(
             &mut barrier_replies,
             request_count,
             2,
-        );
-        (completions, early_completions, Instant::now())
+        )
+        .expect("client 1 receives every requested CompleteNotify");
+        if let Some(second_peer) = second_peer.as_mut() {
+            let mut second_completions = Vec::new();
+            let mut second_barrier_replies = 0;
+            assert!(
+                read_until(
+                    second_peer,
+                    &mut second_completions,
+                    &mut second_barrier_replies,
+                    request_count,
+                    0,
+                )
+                .is_ok(),
+                "client 2 receives CompleteNotify for the shared frozen-CRTC Presents"
+            );
+            assert_eq!(
+                second_completions, completions,
+                "both subscribed clients observe the same frozen-clock completions"
+            );
+            (second_completions, early_completions, Instant::now())
+        } else {
+            (completions, early_completions, Instant::now())
+        }
     });
 
     run_core(
@@ -952,6 +1001,7 @@ fn frozen_crtc_no_events_completes_after_window() {
     );
 
     let requests = [101, 102, 103].map(|serial| CorePresentRequest {
+        client_id: 1,
         serial,
         x_offset: i16::try_from(serial - 101).unwrap(),
         target_msc: 1,
@@ -994,17 +1044,30 @@ fn frozen_crtc_no_events_completes_after_window() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD (lavapipe)"]
-// Mutation: omit divisor/remainder when deriving a frozen CRTC's target MSC.
+// Mutations: misencode the remainder, omit divisor/remainder, or route client 2's completion elsewhere.
 fn divisor_present_completes_on_frozen_crtc() {
-    let requests = [CorePresentRequest {
-        serial: 201,
-        x_offset: 0,
-        target_msc: 0,
-        divisor: 2,
-        remainder: 0,
-        target_output_idx: 1,
-        options: 0,
-    }];
+    let requests = [
+        CorePresentRequest {
+            client_id: 1,
+            serial: 201,
+            x_offset: 0,
+            target_msc: 0,
+            divisor: 8,
+            remainder: 7,
+            target_output_idx: 1,
+            options: 0,
+        },
+        CorePresentRequest {
+            client_id: 2,
+            serial: 202,
+            x_offset: 1,
+            target_msc: 0,
+            divisor: 8,
+            remainder: 7,
+            target_output_idx: 1,
+            options: 0,
+        },
+    ];
     let Some((completions, frozen, _)) = run_frozen_core_present_requests(
         &requests,
         "divisor_present_completes_on_frozen_crtc",
@@ -1013,8 +1076,19 @@ fn divisor_present_completes_on_frozen_crtc() {
     ) else {
         return;
     };
-    assert_eq!(completions[0].0, 201);
-    assert_eq!(completions[0].3, frozen.anchor_msc + 1);
+    assert_eq!(
+        completions
+            .iter()
+            .map(|(serial, _, _, _)| *serial)
+            .collect::<Vec<_>>(),
+        [201, 202],
+        "both independent clients complete on the frozen CRTC"
+    );
+    assert!(
+        completions
+            .iter()
+            .all(|(_, _, _, msc)| *msc >= frozen.anchor_msc + 6)
+    );
 }
 
 #[test]
@@ -1023,6 +1097,7 @@ fn divisor_present_completes_on_frozen_crtc() {
 fn window_moved_off_frozen_crtc_completes_in_order() {
     let requests = [
         CorePresentRequest {
+            client_id: 1,
             serial: 301,
             x_offset: 0,
             target_msc: 3,
@@ -1032,6 +1107,7 @@ fn window_moved_off_frozen_crtc_completes_in_order() {
             options: 0,
         },
         CorePresentRequest {
+            client_id: 1,
             serial: 302,
             x_offset: 1,
             target_msc: 3,
@@ -1041,6 +1117,7 @@ fn window_moved_off_frozen_crtc_completes_in_order() {
             options: 0,
         },
         CorePresentRequest {
+            client_id: 1,
             serial: 303,
             x_offset: 2,
             target_msc: 0,
@@ -1073,6 +1150,7 @@ fn window_moved_off_frozen_crtc_completes_in_order() {
 // Mutations: keep the completion-arm idle gate or suppress frozen clock ticks.
 fn frozen_tick_runs_with_a_flip_in_flight() {
     let requests = [CorePresentRequest {
+        client_id: 1,
         serial: 401,
         x_offset: 0,
         target_msc: 1,

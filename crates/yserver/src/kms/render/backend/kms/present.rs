@@ -769,13 +769,9 @@ impl KmsBackend {
             self.clear_all_armed_vblank_targets();
             return Ok(0);
         }
-        if self.platform.vblank_fallback.frozen.contains_key(&crtc_key) {
-            let now = (self.pstate.monotonic_clock)();
-            return Ok(usize::from(
-                self.platform.arm_software_vblank(crtc_key, now),
-            ));
-        }
-        if !self.kernel_vblank_arm_available(crtc_key) {
+        if self.platform.vblank_fallback.frozen.contains_key(&crtc_key)
+            || !self.kernel_vblank_arm_available(crtc_key)
+        {
             let now = (self.pstate.monotonic_clock)();
             return Ok(usize::from(
                 self.platform.arm_software_vblank(crtc_key, now),

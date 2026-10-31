@@ -126,6 +126,35 @@ fn completion_timestamp_monotonic(
     }
     received_monotonic.checked_sub(age)
 }
+
+/// Zero-time readiness check shared by event draining and the frozen-vblank
+/// detector. `None` means poll was interrupted; callers decide whether that
+/// means "not ready" or "defer the verdict".
+fn poll_events_ready(fd: RawFd, operation: &str) -> io::Result<Option<bool>> {
+    let mut poll_fd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `poll_fd` is one initialized record for this zero-time check.
+    let ready = unsafe { libc::poll(&mut poll_fd, 1, 0) };
+    if ready < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    let error_events = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
+    if poll_fd.revents & error_events != 0 {
+        return Err(io::Error::other(format!(
+            "DRM fd {} reported poll error flags 0x{:x} while {operation}",
+            poll_fd.fd, poll_fd.revents
+        )));
+    }
+    Ok(Some(ready > 0 && poll_fd.revents & libc::POLLIN != 0))
+}
+
 pub(crate) type KernelCrtcSequence = (u64, i64, u64);
 
 pub(crate) trait PageFlipEventSource {
@@ -230,57 +259,14 @@ impl PageFlipEventSource for DrmPageFlipEventSource {
         &self,
         device: &crate::drm::Device,
     ) -> io::Result<Option<(Vec<KernelPageFlip>, Vec<KernelCrtcSequence>)>> {
-        let mut poll_fd = libc::pollfd {
-            fd: device.as_fd().as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: `poll_fd` is one initialized record for the duration of
-        // this zero-time readiness check.
-        let ready = unsafe { libc::poll(&mut poll_fd, 1, 0) };
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                return Ok(None);
-            }
-            return Err(error);
-        }
-        let error_events = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
-        if poll_fd.revents & error_events != 0 {
-            return Err(io::Error::other(format!(
-                "DRM fd {} reported poll error flags 0x{:x} while draining old events",
-                poll_fd.fd, poll_fd.revents
-            )));
-        }
-        if ready == 0 || poll_fd.revents & libc::POLLIN == 0 {
+        if poll_events_ready(device.as_fd().as_raw_fd(), "draining old events")? != Some(true) {
             return Ok(None);
         }
         self.drain_events(device).map(Some)
     }
 
     fn events_ready(&self, device: &crate::drm::Device) -> io::Result<bool> {
-        let mut poll_fd = libc::pollfd {
-            fd: device.as_fd().as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: `poll_fd` is one initialized record for this zero-time check.
-        let ready = unsafe { libc::poll(&mut poll_fd, 1, 0) };
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                return Ok(true);
-            }
-            return Err(error);
-        }
-        let error_events = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
-        if poll_fd.revents & error_events != 0 {
-            return Err(io::Error::other(format!(
-                "DRM fd {} reported poll error flags 0x{:x} while checking events",
-                poll_fd.fd, poll_fd.revents
-            )));
-        }
-        Ok(ready > 0 && poll_fd.revents & libc::POLLIN != 0)
+        Ok(poll_events_ready(device.as_fd().as_raw_fd(), "checking events")?.unwrap_or(true))
     }
 }
 
@@ -888,18 +874,13 @@ impl PlatformBackend {
                     flip.event_at_boottime,
                 )
             };
-            let kernel_ust = if frozen_sample.is_some() {
-                std::time::Duration::from_micros(ust)
-            } else {
-                flip.ust
-            };
             completions.push((
                 output_idx,
                 sample,
                 FlipEventTimestamps {
                     commit_id: (flip.commit_id != 0).then_some(flip.commit_id),
                     received_at_monotonic: flip.event_at_monotonic,
-                    kernel_ust,
+                    kernel_ust: flip.ust,
                     completion_at_monotonic,
                 },
             ));
