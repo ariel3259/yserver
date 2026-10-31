@@ -34,10 +34,11 @@ use yserver_protocol::x11::{self, ClientId};
 
 use crate::{
     core_loop::{
-        auth::{AuthState, AuthTransport, AuthVerdict},
+        auth::{AuthState, AuthVerdict},
         message::{Message, SetupAllocateResponse},
         sender::BoundSender,
     },
+    peer::PeerIdentity,
     resources::{ARGB_VISUAL, GLMARK_VISUAL, ROOT_COLORMAP, ROOT_VISUAL, ROOT_WINDOW},
     transport::Transport,
 };
@@ -151,20 +152,18 @@ fn run_setup(
     stream.set_read_timeout(Some(SETUP_TIMEOUT))?;
     stream.set_write_timeout(Some(SETUP_TIMEOUT))?;
 
+    // The peer's identity, read once from the socket; the client never
+    // gets a say in it.
+    let peer = PeerIdentity::of(&stream);
+
     let setup = x11::read_setup_request(&mut stream)?;
     debug!(
         "client {} setup: byte_order={:?} protocol {}.{}",
         id.0, setup.byte_order, setup.protocol_major, setup.protocol_minor
     );
 
-    // Authorization follows the actual socket, independently of extension
-    // capability metadata: TCP must never take the local-open fallback.
-    let auth_transport = match &stream {
-        Transport::Unix(_) => AuthTransport::Unix,
-        Transport::Tcp(_) => AuthTransport::Tcp,
-        #[cfg(test)]
-        Transport::Capture(_) => panic!("test capture transport cannot perform setup"),
-    };
+    // Authorization follows the socket `peer` was read from, independently
+    // of extension capability metadata: TCP never takes the host list.
     // The generation handed to `check` is THIS thread's producer binding,
     // captured at accept — never the counter's current value. An XDMCP
     // session credential is bound to the generation its `Accept` belonged to,
@@ -175,15 +174,16 @@ fn run_setup(
     // listener.
     if !internal
         && let AuthVerdict::Reject(reason) = auth.check(
-            auth_transport,
+            &peer,
             sender.generation(),
             &setup.auth_protocol_name,
             &setup.auth_protocol_data,
         )
     {
         warn!(
-            "client {} auth rejected ({reason:?}); presented proto {:?}",
+            "client {} auth rejected ({:?}); presented proto {:?}",
             id.0,
+            reason.trim_end(),
             String::from_utf8_lossy(&setup.auth_protocol_name)
         );
         x11::write_setup_failed(&mut stream, setup.byte_order, reason)?;
@@ -277,6 +277,7 @@ fn run_setup(
         is_local,
         fd_passing,
         internal,
+        peer,
         setup_reply,
     })?;
     Ok(())
@@ -294,7 +295,10 @@ fn vendor_release() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{core_loop::sender::channel, xauth::MIT_MAGIC_COOKIE};
+    use crate::{
+        core_loop::{auth::AuthTransport, sender::channel},
+        xauth::MIT_MAGIC_COOKIE,
+    };
     use std::{
         io::{Read, Write},
         os::unix::net::UnixStream,
@@ -433,7 +437,9 @@ mod tests {
         let (poll, sender, rx) = channel().unwrap();
         let _ = poll; // keep the poll alive (waker borrows from registry)
         let registry = make_registry();
-        let (server_side, mut client_side) = UnixStream::pair().unwrap();
+        // Through a listener, so the peer credentials below are the
+        // production ones on every platform.
+        let (server_side, mut client_side) = crate::peer::connected_unix_pair();
         let id = ClientId(7);
 
         spawn(
@@ -498,12 +504,17 @@ mod tests {
                 resource_id_base,
                 resource_id_mask,
                 byte_order,
+                peer,
                 ..
             } => {
                 assert_eq!(got, id);
                 assert_eq!(resource_id_base, 0x0010_0000);
                 assert_eq!(resource_id_mask, 0x000F_FFFF);
                 assert_eq!(byte_order, ClientByteOrder::LittleEndian);
+                assert_eq!(peer.transport, AuthTransport::Unix);
+                // SAFETY: plain getter with no preconditions.
+                let euid = unsafe { libc::geteuid() };
+                assert_eq!(peer.cred.map(|cred| cred.uid), Some(euid));
             }
             other => panic!("expected ClientSetupComplete, got {other:?}"),
         }

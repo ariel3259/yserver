@@ -57,6 +57,7 @@ use super::{
 use crate::{
     backend::{Backend, BackendFdKind, CrtcConfigToken, Dri3ExportToken, HostSocketStatus},
     host_x11::HostEvent,
+    peer::address_is_ours,
     server::{KeyRepeatState, ServerState},
     transport::{Listener, Transport},
 };
@@ -2123,6 +2124,10 @@ fn run_core_with_inventory(
     input_inventory: &mut InputInventory,
 ) -> io::Result<()> {
     let setup_registry = setup_thread::make_registry();
+    state.host_access = super::auth::HostAccessHandle {
+        auth: Arc::clone(&auth),
+        generation: rx.current_generation(),
+    };
     // The generation counter is shared with every `CoreSender`; the
     // receiver is the loop's sole handle to it, and the reset boundary
     // is the only thing that bumps it.
@@ -2521,6 +2526,7 @@ fn run_core_with_inventory(
                                 is_local,
                                 fd_passing,
                                 internal,
+                                peer,
                                 setup_reply,
                             } => {
                                 if let Err(err) = handle_client_setup_complete(
@@ -2534,6 +2540,7 @@ fn run_core_with_inventory(
                                     resource_id_mask,
                                     byte_order,
                                     (is_local, fd_passing, internal),
+                                    peer,
                                     &setup_reply,
                                 ) {
                                     error!("ClientSetupComplete for client {} failed: {err}", id.0);
@@ -4619,6 +4626,7 @@ fn handle_client_setup_complete(
     resource_id_mask: u32,
     byte_order: yserver_protocol::x11::ClientByteOrder,
     (is_local, fd_passing, internal): (bool, bool, bool),
+    peer: crate::peer::PeerIdentity,
     setup_reply: &[u8],
 ) -> io::Result<()> {
     use std::sync::{Arc, Mutex, atomic::AtomicU16};
@@ -4650,6 +4658,7 @@ fn handle_client_setup_complete(
             is_local,
             fd_passing,
             internal,
+            peer,
         },
     );
     setup_registry
@@ -4728,56 +4737,6 @@ fn handle_client_setup_complete(
     // a RETAINED client may arm, so the decision has to sit after
     // XDMCP admission.
     Ok(())
-}
-
-/// Is `peer` one of this machine's own addresses?
-///
-/// Xorg's `xtransLocalClient` (`os/access.c`) treats an AF_UNIX peer as
-/// local, and otherwise compares the peer against `selfhosts` — the
-/// addresses `DefineSelf` collected from the interfaces. So a TCP
-/// connection from the machine's own address is a LOCAL client there, and
-/// keeps the locality-gated extensions.
-///
-/// Queried per accept rather than snapshotted at startup: accepts are
-/// rare, `getifaddrs` is cheap, and a cached set goes stale across a
-/// hotplug or a DHCP renewal. Xorg snapshots and then patches with
-/// `AugmentSelf`; asking each time is simpler and cannot drift.
-///
-/// Not implemented: Xorg additionally treats a client whose command name
-/// is `ssh` as non-local, to catch a forwarded connection. That is a
-/// heuristic on `/proc`, and `ssh -X` reaches us over a UNIX socket
-/// anyway.
-fn address_is_ours(peer: std::net::IpAddr) -> bool {
-    if peer.is_loopback() {
-        return true;
-    }
-    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: `getifaddrs` fills `ifap` with an owned list on success; we
-    // walk it without retaining anything and free it before returning.
-    if unsafe { libc::getifaddrs(&raw mut ifap) } != 0 {
-        return false;
-    }
-    let mut found = false;
-    let mut cur = ifap;
-    while !cur.is_null() {
-        // SAFETY: `cur` is a node of the list `getifaddrs` just built, and
-        // `ifa_addr` is either null or a valid `sockaddr` for its family.
-        let addr = unsafe { (*cur).ifa_addr };
-        if !addr.is_null() && unsafe { (*addr).sa_family } == libc::AF_INET as libc::sa_family_t {
-            let sin = addr.cast::<libc::sockaddr_in>();
-            // SAFETY: family said AF_INET, so the node is a sockaddr_in.
-            let raw = unsafe { (*sin).sin_addr.s_addr };
-            if std::net::IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(raw))) == peer {
-                found = true;
-                break;
-            }
-        }
-        // SAFETY: as above; `ifa_next` is null at the end of the list.
-        cur = unsafe { (*cur).ifa_next };
-    }
-    // SAFETY: `ifap` is exactly what `getifaddrs` returned and is freed once.
-    unsafe { libc::freeifaddrs(ifap) };
-    found
 }
 
 /// Accept at most this many connections per listener and core iteration.

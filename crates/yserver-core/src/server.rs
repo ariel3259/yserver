@@ -1076,6 +1076,9 @@ pub struct ServerState {
     pub server_grab_owner: Option<ClientId>,
     pub id_allocator: IdAllocator,
     pub start_instant: Instant,
+    /// The core's way to the host access list (`xhost`). Survives a reset
+    /// with the new generation, like `start_instant`.
+    pub host_access: crate::core_loop::auth::HostAccessHandle,
     pub randr: RandrState,
     /// RANDR event masks selected via RRSelectInput: (client, window) -> mask.
     pub randr_select_masks: HashMap<(u32, ResourceId), u16>,
@@ -1781,6 +1784,7 @@ impl ServerState {
             server_grab_owner: None,
             id_allocator: IdAllocator::new(),
             start_instant: Instant::now(),
+            host_access: crate::core_loop::auth::HostAccessHandle::default(),
             randr: RandrState::nested(0, width, height),
             randr_select_masks: HashMap::new(),
             randr_primary_output_explicit: false,
@@ -3100,6 +3104,9 @@ pub struct ClientState {
     /// The server's own client (a window shell's clipboard bridge): not
     /// counted as connected for the shell or the last-client reset.
     pub internal: bool,
+    /// Who connected, read from the socket at setup. Immutable for the
+    /// connection's life.
+    pub peer: crate::peer::PeerIdentity,
     pub byte_order: ClientByteOrder,
     pub last_sequence: Arc<AtomicU16>,
     pub resource_id_base: u32,

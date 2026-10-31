@@ -29,8 +29,18 @@ use std::{
     time::SystemTime,
 };
 
-use super::generation::Generation;
-use crate::xauth::{self, MIT_MAGIC_COOKIE};
+use super::{
+    generation::Generation,
+    host_access::{
+        BadValue, FAMILY_INTERNET, FAMILY_INTERNET6, FAMILY_LOCAL_HOST, FAMILY_SERVER_INTERPRETED,
+        HostEntry, HostList, NameResolver, SiEntry, SiType, SystemResolver, check_addr,
+        si_matches_local,
+    },
+};
+use crate::{
+    peer::{PeerCred, PeerIdentity, own_interface_addrs},
+    xauth::{self, MIT_MAGIC_COOKIE},
+};
 
 // Reject reason strings — byte-for-byte X.Org. Note the trailing newline
 // on two of them and its absence on the cookie one.
@@ -66,7 +76,55 @@ pub struct AuthState {
     /// cookies, but never the cookie-less local-open fallback (Xorg
     /// `AccessUsingXdmcp`).
     xdmcp: bool,
+    /// A TCP listener is configured. Without one Xorg's `selfhosts` is
+    /// empty (os/connection.c:287-288), so no list entry stands for this
+    /// host and admits a local client.
+    tcp_listen: bool,
+    /// Our own interface addresses, the interface part of Xorg's
+    /// `selfhosts`. Production: [`own_interface_addrs`], queried per use
+    /// like `address_is_ours`. A seam so tests do not depend on the host's
+    /// interfaces.
+    own_addrs: fn() -> Vec<HostEntry>,
     inner: Mutex<Inner>,
+}
+
+/// The core thread's handle on the process-lifetime [`AuthState`], for
+/// `ChangeHosts`, `ListHosts` and `SetAccessControl`, with the generation the
+/// core is running. Every `AuthState` call from the core passes
+/// `generation`. `run_core` installs the real one; a reset carries `auth`
+/// into the fresh state with the new generation.
+#[derive(Clone)]
+pub struct HostAccessHandle {
+    pub auth: Arc<AuthState>,
+    pub generation: Generation,
+}
+
+impl Default for HostAccessHandle {
+    /// A private `AuthState` with no `-auth` file, for states that never
+    /// run under `run_core` (unit tests, before installation).
+    fn default() -> Self {
+        Self {
+            auth: AuthState::new(None),
+            generation: Generation::default(),
+        }
+    }
+}
+
+impl std::fmt::Debug for HostAccessHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostAccessHandle")
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why a `ChangeHosts` failed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostChangeError {
+    /// `BadAccess`: the write came from an older, quarantined generation.
+    Access,
+    /// `BadValue`, carrying the length or the family as [`BadValue`] says.
+    Value(BadValue),
 }
 
 /// The cookie from one accepted XDMCP offer, bound to the generation that
@@ -83,8 +141,17 @@ struct Inner {
     last_mtime: Option<SystemTime>,
     /// Latches true once ≥1 cookie has loaded (X.Org `loaded`).
     ever_loaded: bool,
-    /// Host-ACL local-access toggle (collapsed to a bool on unix-only).
+    /// Xorg's `LocalHostEnabled`: admits every cookie-less Unix client. Three
+    /// writers, as in Xorg: the auth-file load outcome, `ChangeHosts` of
+    /// `FamilyLocalHost` (`xhost ±local:`), and the reset (`ResetHosts`, via
+    /// [`Inner::enter`]). Only meaningful for `generation`.
     local_open: bool,
+    /// Xorg's `validhosts` and `AccessEnabled`. Reset with `local_open`.
+    hosts: HostList,
+    /// The generation `local_open` and `hosts` belong to. `AuthState`
+    /// outlives a reset, so the reset is applied by the first access from a
+    /// newer generation ([`Inner::enter`]), never by a call at the boundary.
+    generation: Generation,
     /// MIT-MAGIC-COOKIE-1 data blobs. ADDITIVE — never cleared.
     cookies: Vec<Vec<u8>>,
     /// The XDMCP session credential. ONE slot: a new `Accept` replaces it,
@@ -121,6 +188,18 @@ fn should_reload(stat_mtime: Option<SystemTime>, last_mtime: &mut Option<SystemT
     }
 }
 
+/// How an access relates to the generation `Inner` is tagged with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Access {
+    /// The access belongs to the generation the state is tagged with (after
+    /// entering it, if it was newer).
+    Current,
+    /// A producer of an older, quarantined generation. It writes nothing,
+    /// and the local-open fallback does not apply to it; the dispatcher
+    /// discards its completion anyway.
+    Stale,
+}
+
 enum LoadOutcome {
     /// File opened, ≥1 MIT cookie decoded.
     Loaded(Vec<Vec<u8>>),
@@ -135,8 +214,15 @@ impl Inner {
     /// (os/access.c:273-279), so a load may close local access but never open it.
     fn apply_load_outcome(&mut self, outcome: LoadOutcome, xdmcp: bool) {
         match outcome {
-            LoadOutcome::Loaded(mut cookies) => {
-                self.cookies.append(&mut cookies); // additive — os/auth.c never clears
+            LoadOutcome::Loaded(cookies) => {
+                // Additive — os/auth.c never clears. Skip cookies already
+                // held, so the forced reload on every reset does not grow
+                // the list.
+                for cookie in cookies {
+                    if !self.cookies.contains(&cookie) {
+                        self.cookies.push(cookie);
+                    }
+                }
                 self.local_open = false; // DisableLocalAccess
                 self.ever_loaded = true;
             }
@@ -153,6 +239,29 @@ impl Inner {
                 }
             }
         }
+    }
+
+    /// Bring the state into `generation`. The first access from a newer
+    /// generation applies Xorg's reset: `ResetHosts` closes local access
+    /// and empties the enabled host list (os/access.c:956-962), and `ResetAuthorization` forces the next auth load
+    /// (os/auth.c:225-233), whose outcome may open it again. With no auth
+    /// file that load finds zero cookies (`LoadAuthorization` returns 0,
+    /// os/auth.c:117-119), so the reset value is `!xdmcp`. An access from an
+    /// older generation changes nothing.
+    fn enter(&mut self, generation: Generation, file: Option<&Path>, xdmcp: bool) -> Access {
+        if generation < self.generation {
+            return Access::Stale;
+        }
+        if generation > self.generation {
+            self.local_open = false;
+            self.hosts = HostList::default();
+            match file {
+                Some(path) => AuthState::reload_if_needed(self, path, true, xdmcp),
+                None => self.apply_load_outcome(LoadOutcome::OpenedEmpty, xdmcp),
+            }
+            self.generation = generation;
+        }
+        Access::Current
     }
 }
 
@@ -217,7 +326,31 @@ impl Inner {
         AuthVerdict::Reject(REASON_BAD_PROTO)
     }
 
+    /// The cookie verdict, then the parts of Xorg's `InvalidHost`
+    /// (os/access.c:1529-1555) that need no lookup: access control disabled
+    /// (`xhost +`) or local access open. Both only for Unix: the host list
+    /// never admits a TCP client. The selfhost and SI rules run in
+    /// [`AuthState::check`] with the lock released.
     fn verdict(
+        &self,
+        transport: AuthTransport,
+        xdmcp: bool,
+        setup_generation: Generation,
+        name: &[u8],
+        data: &[u8],
+    ) -> AuthVerdict {
+        let verdict = self.cookie_verdict(transport, xdmcp, setup_generation, name, data);
+        if verdict != AuthVerdict::Allow
+            && transport == AuthTransport::Unix
+            && (!self.hosts.access_enabled || self.local_open)
+        {
+            return AuthVerdict::Allow;
+        }
+        verdict
+    }
+
+    /// [`Inner::verdict`] without the local-open fallback.
+    fn cookie_verdict(
         &self,
         transport: AuthTransport,
         xdmcp: bool,
@@ -235,12 +368,10 @@ impl Inner {
         if xdmcp && transport == AuthTransport::Tcp {
             return Self::reject(name);
         }
-        // Cookie match OR local-open admits (mirrors CheckAuthorization +
-        // host-ACL fallthrough, os/connection.c:536-560).
+        // Cookie match; `verdict` adds the local-open fallback (mirrors
+        // CheckAuthorization + host-ACL fallthrough,
+        // os/connection.c:536-560).
         if name == MIT_MAGIC_COOKIE.as_bytes() && self.cookies.iter().any(|c| ct_eq(c, data)) {
-            return AuthVerdict::Allow;
-        }
-        if transport == AuthTransport::Unix && self.local_open {
             return AuthVerdict::Allow;
         }
         Self::reject(name)
@@ -250,26 +381,46 @@ impl Inner {
 impl AuthState {
     /// Build from `LaunchOptions.auth_file`. `None` ⇒ permanently open.
     pub fn new(file: Option<PathBuf>) -> Arc<Self> {
-        Self::new_with_xdmcp(file, false)
+        Self::new_with(file, false, false)
     }
 
     /// Build from `LaunchOptions.auth_file` and whether `LaunchOptions.xdmcp`
     /// is set. See [`AuthState::xdmcp`] for what the flag changes.
     pub fn new_with_xdmcp(file: Option<PathBuf>, xdmcp: bool) -> Arc<Self> {
+        Self::new_with(file, xdmcp, false)
+    }
+
+    /// Build from `LaunchOptions.auth_file`, whether `LaunchOptions.xdmcp`
+    /// is set, and whether a TCP listener is configured
+    /// (`LaunchOptions.tcp_listen`, see [`AuthState::tcp_listen`]).
+    pub fn new_with(file: Option<PathBuf>, xdmcp: bool, tcp_listen: bool) -> Arc<Self> {
+        Arc::new(Self::build(file, xdmcp, tcp_listen, own_interface_addrs))
+    }
+
+    fn build(
+        file: Option<PathBuf>,
+        xdmcp: bool,
+        tcp_listen: bool,
+        own_addrs: fn() -> Vec<HostEntry>,
+    ) -> Self {
         // Start open; the first successful load flips this to false (Xorg ShouldLoadAuth=TRUE → never-loaded+unopenable stays open).
         // XDMCP starts closed and stays closed: AccessUsingXdmcp (os/access.c:387-391).
         let local_open = !xdmcp;
-        Arc::new(Self {
+        Self {
             file,
             xdmcp,
+            tcp_listen,
+            own_addrs,
             inner: Mutex::new(Inner {
                 last_mtime: None,
                 ever_loaded: false,
                 local_open,
+                hosts: HostList::default(),
+                generation: Generation::default(),
                 cookies: Vec::new(),
                 session: None,
             }),
-        })
+        }
     }
 
     /// Install the credential from an accepted XDMCP offer, bound to
@@ -355,28 +506,204 @@ impl AuthState {
     /// bound to at accept (`BoundSender::generation`), never the counter's
     /// current value: reading the counter here would re-admit a client of the
     /// destroyed session the instant a reset installed a new credential.
+    ///
+    /// The cookie decides first; the host list is consulted only when it
+    /// fails (os/connection.c:533-560), so the list only adds admissions.
+    /// It is consulted for Unix peers only, never for TCP.
     pub fn check(
         &self,
-        transport: AuthTransport,
+        peer: &PeerIdentity,
         setup_generation: Generation,
         proto_name: &[u8],
         proto_data: &[u8],
     ) -> AuthVerdict {
-        // Poisoning recovery — same pattern as setup_thread.rs:66.
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        // With no `-auth` file there is nothing to reload; the initial state
-        // (`local_open`, no file cookies) is already what such a server has,
-        // and is never mutated. The session credential still applies.
-        if let Some(path) = self.file.as_deref() {
-            Self::reload_if_needed(&mut inner, path, false, self.xdmcp);
-        }
-        inner.verdict(
-            transport,
-            self.xdmcp,
+        self.check_with(
+            peer,
             setup_generation,
             proto_name,
             proto_data,
+            &SystemResolver,
         )
+    }
+
+    fn check_with(
+        &self,
+        peer: &PeerIdentity,
+        setup_generation: Generation,
+        proto_name: &[u8],
+        proto_data: &[u8],
+        resolver: &dyn NameResolver,
+    ) -> AuthVerdict {
+        let (verdict, hosts) = {
+            // Poisoning recovery — same pattern as setup_thread.rs:66.
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            // A newer generation first gets Xorg's reset state; a stale
+            // producer changes nothing, and neither the local-open fallback
+            // nor the host list applies to it.
+            let access = inner.enter(setup_generation, self.file.as_deref(), self.xdmcp);
+            if access == Access::Stale {
+                return inner.cookie_verdict(
+                    peer.transport,
+                    self.xdmcp,
+                    setup_generation,
+                    proto_name,
+                    proto_data,
+                );
+            }
+            // With no `-auth` file there is nothing to reload: `local_open`
+            // then changes only through `enter` and `FamilyLocalHost`. The
+            // session credential still applies.
+            if let Some(path) = self.file.as_deref() {
+                Self::reload_if_needed(&mut inner, path, false, self.xdmcp);
+            }
+            let verdict = inner.verdict(
+                peer.transport,
+                self.xdmcp,
+                setup_generation,
+                proto_name,
+                proto_data,
+            );
+            if verdict == AuthVerdict::Allow || peer.transport != AuthTransport::Unix {
+                return verdict;
+            }
+            (verdict, inner.hosts.hosts.clone())
+        };
+        // The lock is released: the interface query and the NSS lookups run
+        // on this snapshot of the list.
+        if self.list_admits_unix(&hosts, peer.cred.as_ref(), resolver) {
+            return AuthVerdict::Allow;
+        }
+        verdict
+    }
+
+    /// The rest of `InvalidHost` for a Unix peer (os/access.c:1540-1566):
+    /// one of our `selfhosts` is listed, or an SI entry matches the peer's
+    /// credentials. Non-SI entries never match a Unix peer (`addr` is NULL).
+    fn list_admits_unix(
+        &self,
+        hosts: &[HostEntry],
+        cred: Option<&PeerCred>,
+        resolver: &dyn NameResolver,
+    ) -> bool {
+        if hosts.is_empty() {
+            return false;
+        }
+        let selfhosts = self.selfhosts();
+        hosts.iter().any(|host| selfhosts.contains(host))
+            || hosts
+                .iter()
+                .any(|host| si_matches_local(host, cred, resolver))
+    }
+
+    /// Xorg's `selfhosts`: every interface address plus `{FamilyLocalHost,
+    /// len 0}` (`DefineSelf`, os/access.c:793-818, :874-886), and nothing
+    /// without a TCP listener (os/connection.c:287-288).
+    fn selfhosts(&self) -> Vec<HostEntry> {
+        if !self.tcp_listen {
+            return Vec::new();
+        }
+        let mut selfhosts = (self.own_addrs)();
+        selfhosts.push(HostEntry {
+            family: FAMILY_LOCAL_HOST,
+            addr: Vec::new(),
+        });
+        selfhosts
+    }
+
+    /// `ChangeHosts` after the mode and access checks: Xorg's `AddHost`
+    /// (`insert`) or `RemoveHost` (os/access.c:1313-1446). `FamilyLocalHost`
+    /// takes any length and opens or closes local access, then is stored
+    /// like any entry. Every other family is validated first; deleting an
+    /// absent entry is fine. Names resolve through `resolver` on the calling
+    /// thread, as Xorg does on its only one.
+    pub fn change_hosts(
+        &self,
+        generation: Generation,
+        insert: bool,
+        family: u8,
+        addr: &[u8],
+        resolver: &dyn NameResolver,
+    ) -> Result<(), HostChangeError> {
+        if family != FAMILY_LOCAL_HOST {
+            check_addr(family, addr, resolver).map_err(HostChangeError::Value)?;
+        }
+        let entry = HostEntry {
+            family,
+            addr: addr.to_vec(),
+        };
+        let inert = if insert {
+            self.inert_reason(&entry)
+        } else {
+            None
+        };
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            // Cannot happen for a live client; fails closed.
+            if inner.enter(generation, self.file.as_deref(), self.xdmcp) == Access::Stale {
+                return Err(HostChangeError::Access);
+            }
+            if family == FAMILY_LOCAL_HOST {
+                inner.local_open = insert;
+            }
+            if insert {
+                inner.hosts.insert(entry);
+            } else {
+                inner.hosts.delete(&entry);
+            }
+        }
+        if let Some(reason) = inert {
+            log::warn!("xhost: added a host entry (family {family}) that admits nobody: {reason}");
+        }
+        Ok(())
+    }
+
+    /// Why an inserted entry can never admit anyone here, if it cannot. The
+    /// list never admits TCP, so an address entry only counts as one of our
+    /// own `selfhosts`, and an SI `hostname`/`ipv6` entry only ever matches
+    /// Internet peers (os/access.c:1819-1846, :1970-1994).
+    fn inert_reason(&self, entry: &HostEntry) -> Option<&'static str> {
+        match entry.family {
+            FAMILY_INTERNET | FAMILY_INTERNET6 if !self.tcp_listen => Some(
+                "no TCP listener, so it is not one of our addresses, and the list never \
+                 admits a TCP client",
+            ),
+            FAMILY_INTERNET | FAMILY_INTERNET6 if !(self.own_addrs)().contains(entry) => {
+                Some("not one of our addresses, and the list never admits a TCP client")
+            }
+            FAMILY_SERVER_INTERPRETED => SiEntry::parse(&entry.addr)
+                .filter(|si| matches!(si.kind, SiType::Hostname | SiType::Ipv6))
+                .map(|_| "SI hostname/ipv6 entries only match TCP clients, which the list never admits"),
+            _ => None,
+        }
+    }
+
+    /// `SetAccessControl` after the mode and access checks: Xorg's
+    /// `ChangeAccessControl` (os/access.c:1616-1623). Connected clients are
+    /// not touched.
+    pub fn set_access_enabled(
+        &self,
+        generation: Generation,
+        enabled: bool,
+    ) -> Result<(), HostChangeError> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.enter(generation, self.file.as_deref(), self.xdmcp) == Access::Stale {
+            return Err(HostChangeError::Access);
+        }
+        inner.hosts.access_enabled = enabled;
+        Ok(())
+    }
+
+    /// `ListHosts`' `enabled` flag and entries, newest first. An older
+    /// generation reads the reset state.
+    pub fn list_hosts(&self, generation: Generation) -> (bool, Vec<HostEntry>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        match inner.enter(generation, self.file.as_deref(), self.xdmcp) {
+            Access::Current => (inner.hosts.access_enabled, inner.hosts.hosts.clone()),
+            Access::Stale => {
+                let reset = HostList::default();
+                (reset.access_enabled, reset.hosts)
+            }
+        }
     }
 }
 
@@ -384,6 +711,17 @@ impl AuthState {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    const UNIX: PeerIdentity = PeerIdentity {
+        transport: AuthTransport::Unix,
+        addr: None,
+        cred: None,
+    };
+    const TCP: PeerIdentity = PeerIdentity {
+        transport: AuthTransport::Tcp,
+        addr: None,
+        cred: None,
+    };
 
     fn t(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
@@ -430,6 +768,8 @@ mod tests {
             last_mtime: Some(t(1)),
             ever_loaded: true,
             local_open: false,
+            hosts: HostList::default(),
+            generation: Generation::default(),
             cookies,
             session: None,
         }
@@ -439,6 +779,8 @@ mod tests {
             last_mtime: None,
             ever_loaded: false,
             local_open: true,
+            hosts: HostList::default(),
+            generation: Generation::default(),
             cookies: Vec::new(),
             session: None,
         }
@@ -484,6 +826,8 @@ mod tests {
             last_mtime: None,
             ever_loaded: false,
             local_open: false,
+            hosts: HostList::default(),
+            generation: Generation::default(),
             cookies: Vec::new(),
             session: None,
         };
@@ -596,7 +940,7 @@ mod tests {
 
         assert_eq!(
             auth.check(
-                AuthTransport::Unix,
+                &UNIX,
                 Generation::default(),
                 MIT_MAGIC_COOKIE.as_bytes(),
                 &cookie
@@ -605,7 +949,7 @@ mod tests {
         );
         assert_eq!(
             auth.check(
-                AuthTransport::Unix,
+                &UNIX,
                 Generation::default(),
                 MIT_MAGIC_COOKIE.as_bytes(),
                 &[0u8; 16]
@@ -613,7 +957,7 @@ mod tests {
             AuthVerdict::Reject(REASON_BAD_COOKIE)
         );
         assert_eq!(
-            auth.check(AuthTransport::Unix, Generation::default(), b"", b""),
+            auth.check(&UNIX, Generation::default(), b"", b""),
             AuthVerdict::Reject(REASON_NO_PROTO)
         );
 
@@ -622,7 +966,7 @@ mod tests {
         fs::remove_file(&path).unwrap();
         assert_eq!(
             auth.check(
-                AuthTransport::Unix,
+                &UNIX,
                 Generation::default(),
                 MIT_MAGIC_COOKIE.as_bytes(),
                 &cookie
@@ -631,7 +975,7 @@ mod tests {
         );
         assert_eq!(
             auth.check(
-                AuthTransport::Unix,
+                &UNIX,
                 Generation::default(),
                 MIT_MAGIC_COOKIE.as_bytes(),
                 &[0u8; 16]
@@ -645,11 +989,11 @@ mod tests {
     fn check_no_auth_file_is_open() {
         let auth = AuthState::new(None);
         assert_eq!(
-            auth.check(AuthTransport::Unix, Generation::default(), b"", b""),
+            auth.check(&UNIX, Generation::default(), b"", b""),
             AuthVerdict::Allow
         );
         assert_eq!(
-            auth.check(AuthTransport::Tcp, Generation::default(), b"", b""),
+            auth.check(&TCP, Generation::default(), b"", b""),
             AuthVerdict::Reject(REASON_NO_PROTO),
             "TCP must never inherit Unix local-open access"
         );
@@ -661,11 +1005,11 @@ mod tests {
         fs::write(&path, b"").unwrap();
         let auth = AuthState::new(Some(path.clone()));
         assert_eq!(
-            auth.check(AuthTransport::Unix, Generation::default(), b"", b""),
+            auth.check(&UNIX, Generation::default(), b"", b""),
             AuthVerdict::Allow
         );
         assert_eq!(
-            auth.check(AuthTransport::Tcp, Generation::default(), b"", b""),
+            auth.check(&TCP, Generation::default(), b"", b""),
             AuthVerdict::Reject(REASON_NO_PROTO),
             "an empty -auth file cannot authorize TCP"
         );
@@ -681,12 +1025,12 @@ mod tests {
         let _ = fs::remove_file(&path); // ensure absent
         let auth = AuthState::new(Some(path));
         assert_eq!(
-            auth.check(AuthTransport::Unix, Generation::default(), b"", b""),
+            auth.check(&UNIX, Generation::default(), b"", b""),
             AuthVerdict::Allow
         );
         assert_eq!(
             auth.check(
-                AuthTransport::Tcp,
+                &TCP,
                 Generation::default(),
                 MIT_MAGIC_COOKIE.as_bytes(),
                 &[0u8; 16]
@@ -705,7 +1049,7 @@ mod tests {
 
         assert_eq!(
             auth.check(
-                AuthTransport::Tcp,
+                &TCP,
                 Generation::default(),
                 MIT_MAGIC_COOKIE.as_bytes(),
                 &cookie
@@ -714,7 +1058,7 @@ mod tests {
         );
         assert_eq!(
             auth.check(
-                AuthTransport::Tcp,
+                &TCP,
                 Generation::default(),
                 MIT_MAGIC_COOKIE.as_bytes(),
                 &[0u8; 16]
@@ -734,7 +1078,7 @@ mod tests {
         assert!(auth.require_tcp_auth_at_startup().is_ok());
         assert_eq!(
             auth.check(
-                AuthTransport::Tcp,
+                &TCP,
                 Generation::default(),
                 MIT_MAGIC_COOKIE.as_bytes(),
                 &cookie
@@ -785,11 +1129,11 @@ mod tests {
         // 1. No -auth file at all: Unix open, TCP closed.
         let none = AuthState::new(None);
         assert_eq!(
-            none.check(AuthTransport::Unix, Generation::default(), b"", b""),
+            none.check(&UNIX, Generation::default(), b"", b""),
             AuthVerdict::Allow
         );
         assert_eq!(
-            none.check(AuthTransport::Tcp, Generation::default(), b"", b""),
+            none.check(&TCP, Generation::default(), b"", b""),
             AuthVerdict::Reject(REASON_NO_PROTO)
         );
 
@@ -799,12 +1143,12 @@ mod tests {
         let _ = fs::remove_file(&missing);
         let unreadable = AuthState::new(Some(missing));
         assert_eq!(
-            unreadable.check(AuthTransport::Unix, Generation::default(), b"", b""),
+            unreadable.check(&UNIX, Generation::default(), b"", b""),
             AuthVerdict::Allow
         );
         assert_eq!(
             unreadable.check(
-                AuthTransport::Tcp,
+                &TCP,
                 Generation::default(),
                 MIT_MAGIC_COOKIE.as_bytes(),
                 &[7u8; 16]
@@ -818,7 +1162,7 @@ mod tests {
         let path = temp_path("fence-loaded");
         fs::write(&path, xauth_bytes(b"7", &cookie)).unwrap();
         let loaded = AuthState::new(Some(path.clone()));
-        for transport in [AuthTransport::Unix, AuthTransport::Tcp] {
+        for transport in [&UNIX, &TCP] {
             assert_eq!(
                 loaded.check(
                     transport,
@@ -860,7 +1204,7 @@ mod tests {
         let old_client = sender.bind();
         assert!(auth.install_session_cookie(rx.current_generation(), MIT, &first));
         assert_eq!(
-            auth.check(AuthTransport::Tcp, old_client.generation(), MIT, &first),
+            auth.check(&TCP, old_client.generation(), MIT, &first),
             AuthVerdict::Allow
         );
 
@@ -873,7 +1217,7 @@ mod tests {
         // A client of the new session presenting the PREVIOUS session's
         // cookie is refused.
         assert_eq!(
-            auth.check(AuthTransport::Tcp, new_client.generation(), MIT, &first),
+            auth.check(&TCP, new_client.generation(), MIT, &first),
             AuthVerdict::Reject(REASON_BAD_COOKIE)
         );
 
@@ -884,7 +1228,7 @@ mod tests {
         // `generation::should_dispatch`; all this asserts is which comparison
         // produced the refusal above.)
         assert_eq!(
-            auth.check(AuthTransport::Tcp, old_client.generation(), MIT, &first),
+            auth.check(&TCP, old_client.generation(), MIT, &first),
             AuthVerdict::Allow,
             "the refusal must come from the generation comparison, not from an \
              empty slot — otherwise this test passes for the wrong reason"
@@ -895,20 +1239,20 @@ mod tests {
         let second = [0xC2u8; 16];
         assert!(auth.install_session_cookie(new_generation, MIT, &second));
         assert_eq!(
-            auth.check(AuthTransport::Tcp, new_client.generation(), MIT, &second),
+            auth.check(&TCP, new_client.generation(), MIT, &second),
             AuthVerdict::Allow
         );
         assert_eq!(
-            auth.check(AuthTransport::Tcp, new_client.generation(), MIT, &first),
+            auth.check(&TCP, new_client.generation(), MIT, &first),
             AuthVerdict::Reject(REASON_BAD_COOKIE)
         );
         assert_eq!(
-            auth.check(AuthTransport::Tcp, old_client.generation(), MIT, &first),
+            auth.check(&TCP, old_client.generation(), MIT, &first),
             AuthVerdict::Reject(REASON_BAD_COOKIE),
             "one slot: the previous session's cookie is gone once replaced"
         );
         assert_eq!(
-            auth.check(AuthTransport::Tcp, old_client.generation(), MIT, &second),
+            auth.check(&TCP, old_client.generation(), MIT, &second),
             AuthVerdict::Reject(REASON_BAD_COOKIE),
             "nor may an old client borrow the new session's cookie"
         );
@@ -927,7 +1271,7 @@ mod tests {
 
         assert!(auth.install_session_cookie(generation, MIT, &refused));
         assert_eq!(
-            auth.check(AuthTransport::Tcp, generation, MIT, &refused),
+            auth.check(&TCP, generation, MIT, &refused),
             AuthVerdict::Allow
         );
 
@@ -939,7 +1283,7 @@ mod tests {
         // long.
         auth.clear_session_cookie();
         assert_eq!(
-            auth.check(AuthTransport::Tcp, generation, MIT, &refused),
+            auth.check(&TCP, generation, MIT, &refused),
             AuthVerdict::Reject(REASON_BAD_COOKIE),
             "the refused offer's cookie must stop authorizing immediately, not \
              merely once a replacement arrives"
@@ -948,11 +1292,11 @@ mod tests {
         // The replacement offer, in the same generation.
         assert!(auth.install_session_cookie(generation, MIT, &accepted));
         assert_eq!(
-            auth.check(AuthTransport::Tcp, generation, MIT, &accepted),
+            auth.check(&TCP, generation, MIT, &accepted),
             AuthVerdict::Allow
         );
         assert_eq!(
-            auth.check(AuthTransport::Tcp, generation, MIT, &refused),
+            auth.check(&TCP, generation, MIT, &refused),
             AuthVerdict::Reject(REASON_BAD_COOKIE)
         );
     }
@@ -965,21 +1309,21 @@ mod tests {
         let generation = Generation::default();
 
         assert_eq!(
-            auth.check(AuthTransport::Tcp, generation, MIT, &[0x11u8; 16]),
+            auth.check(&TCP, generation, MIT, &[0x11u8; 16]),
             AuthVerdict::Reject(REASON_BAD_COOKIE)
         );
         assert_eq!(
-            auth.check(AuthTransport::Tcp, generation, b"", b""),
+            auth.check(&TCP, generation, b"", b""),
             AuthVerdict::Reject(REASON_NO_PROTO)
         );
         assert_eq!(
-            auth.check(AuthTransport::Tcp, generation, MIT, b""),
+            auth.check(&TCP, generation, MIT, b""),
             AuthVerdict::Reject(REASON_BAD_COOKIE),
             "an empty presentation must not match an empty slot"
         );
         // Nor a cookie-less Unix client: XDMCP never opens local access.
         assert_eq!(
-            auth.check(AuthTransport::Unix, generation, b"", b""),
+            auth.check(&UNIX, generation, b"", b""),
             AuthVerdict::Reject(REASON_NO_PROTO)
         );
     }
@@ -1019,11 +1363,11 @@ mod tests {
         let auth = AuthState::new_with_xdmcp(None, true);
         let generation = Generation::default();
         assert_eq!(
-            auth.check(AuthTransport::Unix, generation, b"", b""),
+            auth.check(&UNIX, generation, b"", b""),
             AuthVerdict::Reject(REASON_NO_PROTO)
         );
         assert_eq!(
-            auth.check(AuthTransport::Unix, generation, MIT, &[0u8; 16]),
+            auth.check(&UNIX, generation, MIT, &[0u8; 16]),
             AuthVerdict::Reject(REASON_BAD_COOKIE)
         );
     }
@@ -1035,7 +1379,7 @@ mod tests {
         let generation = Generation::default();
         let auth = AuthState::new_with_xdmcp(Some(path.clone()), true);
         assert_eq!(
-            auth.check(AuthTransport::Unix, generation, b"", b""),
+            auth.check(&UNIX, generation, b"", b""),
             AuthVerdict::Reject(REASON_NO_PROTO),
             "empty file at startup"
         );
@@ -1043,7 +1387,7 @@ mod tests {
         // A later reload of the still-empty file.
         touch_later(&path);
         assert_eq!(
-            auth.check(AuthTransport::Unix, generation, b"", b""),
+            auth.check(&UNIX, generation, b"", b""),
             AuthVerdict::Reject(REASON_NO_PROTO),
             "reload of the still-empty file"
         );
@@ -1054,18 +1398,18 @@ mod tests {
         fs::write(&path, xauth_bytes(b"7", &cookie)).unwrap();
         touch_later(&path);
         assert_eq!(
-            auth.check(AuthTransport::Unix, generation, MIT, &cookie),
+            auth.check(&UNIX, generation, MIT, &cookie),
             AuthVerdict::Allow
         );
         fs::write(&path, b"").unwrap();
         touch_later(&path);
         assert_eq!(
-            auth.check(AuthTransport::Unix, generation, b"", b""),
+            auth.check(&UNIX, generation, b"", b""),
             AuthVerdict::Reject(REASON_NO_PROTO),
             "emptied after a load"
         );
         assert_eq!(
-            auth.check(AuthTransport::Unix, generation, MIT, &cookie),
+            auth.check(&UNIX, generation, MIT, &cookie),
             AuthVerdict::Allow
         );
         let _ = fs::remove_file(path);
@@ -1081,7 +1425,7 @@ mod tests {
         fs::create_dir(&dir).unwrap();
         let auth = AuthState::new_with_xdmcp(Some(dir.clone()), true);
         assert_eq!(
-            auth.check(AuthTransport::Unix, generation, b"", b""),
+            auth.check(&UNIX, generation, b"", b""),
             AuthVerdict::Reject(REASON_NO_PROTO)
         );
         let _ = fs::remove_dir(dir);
@@ -1091,7 +1435,7 @@ mod tests {
         let _ = fs::remove_file(&missing);
         let auth = AuthState::new_with_xdmcp(Some(missing), true);
         assert_eq!(
-            auth.check(AuthTransport::Unix, generation, b"", b""),
+            auth.check(&UNIX, generation, b"", b""),
             AuthVerdict::Reject(REASON_NO_PROTO)
         );
     }
@@ -1103,11 +1447,11 @@ mod tests {
         let session = [0x4Du8; 16];
         assert!(auth.install_session_cookie(generation, MIT, &session));
         assert_eq!(
-            auth.check(AuthTransport::Unix, generation, MIT, &session),
+            auth.check(&UNIX, generation, MIT, &session),
             AuthVerdict::Allow
         );
         assert_eq!(
-            auth.check(AuthTransport::Unix, generation, b"", b""),
+            auth.check(&UNIX, generation, b"", b""),
             AuthVerdict::Reject(REASON_NO_PROTO)
         );
     }
@@ -1121,12 +1465,12 @@ mod tests {
 
         let auth = AuthState::new_with_xdmcp(Some(path.clone()), true);
         assert_eq!(
-            auth.check(AuthTransport::Unix, generation, MIT, &file_cookie),
+            auth.check(&UNIX, generation, MIT, &file_cookie),
             AuthVerdict::Allow,
             "Unix clients are unaffected by XDMCP mode"
         );
         assert_eq!(
-            auth.check(AuthTransport::Tcp, generation, MIT, &file_cookie),
+            auth.check(&TCP, generation, MIT, &file_cookie),
             AuthVerdict::Reject(REASON_BAD_COOKIE),
             "a cookie in a local file must not authorize a client into an \
              XDMCP session it has nothing to do with"
@@ -1136,11 +1480,11 @@ mod tests {
         let session_cookie = [0x6Bu8; 16];
         assert!(auth.install_session_cookie(generation, MIT, &session_cookie));
         assert_eq!(
-            auth.check(AuthTransport::Tcp, generation, MIT, &session_cookie),
+            auth.check(&TCP, generation, MIT, &session_cookie),
             AuthVerdict::Allow
         );
         assert_eq!(
-            auth.check(AuthTransport::Tcp, generation, MIT, &file_cookie),
+            auth.check(&TCP, generation, MIT, &file_cookie),
             AuthVerdict::Reject(REASON_BAD_COOKIE),
             "installing a session cookie does not un-shadow the file ones"
         );
@@ -1149,7 +1493,7 @@ mod tests {
         // file or the cookie.
         let plain = AuthState::new(Some(path.clone()));
         assert_eq!(
-            plain.check(AuthTransport::Tcp, generation, MIT, &file_cookie),
+            plain.check(&TCP, generation, MIT, &file_cookie),
             AuthVerdict::Allow
         );
 
@@ -1166,19 +1510,14 @@ mod tests {
         // admit precisely this client — an open display dressed as an
         // authenticated one.
         assert_eq!(
-            auth.check(AuthTransport::Tcp, generation, MIT, b""),
+            auth.check(&TCP, generation, MIT, b""),
             AuthVerdict::Reject(REASON_BAD_COOKIE)
         );
 
         // An authorization name this layer cannot check is refused too.
         assert!(!auth.install_session_cookie(generation, b"XDM-AUTHORIZATION-1", &[1u8; 8]));
         assert_eq!(
-            auth.check(
-                AuthTransport::Tcp,
-                generation,
-                b"XDM-AUTHORIZATION-1",
-                &[1u8; 8]
-            ),
+            auth.check(&TCP, generation, b"XDM-AUTHORIZATION-1", &[1u8; 8]),
             AuthVerdict::Reject(REASON_BAD_PROTO)
         );
 
@@ -1188,7 +1527,7 @@ mod tests {
         assert!(auth.install_session_cookie(generation, MIT, &good));
         assert!(!auth.install_session_cookie(generation, MIT, b""));
         assert_eq!(
-            auth.check(AuthTransport::Tcp, generation, MIT, &good),
+            auth.check(&TCP, generation, MIT, &good),
             AuthVerdict::Reject(REASON_BAD_COOKIE)
         );
     }
@@ -1208,5 +1547,643 @@ mod tests {
                 .require_tcp_auth_at_startup()
                 .is_err()
         );
+    }
+
+    // ---- the reset: generation-tagged `local_open` ----
+
+    use crate::core_loop::generation::GenerationCounter;
+
+    /// Stand-in for `xhost ±local:` until `ChangeHosts` exists.
+    fn set_local_open(auth: &AuthState, open: bool) {
+        auth.inner.lock().unwrap().local_open = open;
+    }
+
+    fn cookieless_unix(auth: &AuthState, generation: Generation) -> AuthVerdict {
+        auth.check(&UNIX, generation, b"", b"")
+    }
+
+    /// Rewrite `path` without moving its mtime, so only a forced load can
+    /// see the new contents.
+    fn rewrite_keeping_mtime(path: &Path, bytes: &[u8]) {
+        let mtime = fs::metadata(path).unwrap().modified().unwrap();
+        fs::write(path, bytes).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_reset_without_auth_file_reopens_local_access() {
+        let counter = GenerationCounter::new();
+        let auth = AuthState::new(None);
+        let g0 = counter.current();
+        set_local_open(&auth, false);
+        assert_eq!(
+            cookieless_unix(&auth, g0),
+            AuthVerdict::Reject(REASON_NO_PROTO)
+        );
+        // ResetHosts closes it, and the forced load of no file reopens it.
+        assert_eq!(cookieless_unix(&auth, counter.bump()), AuthVerdict::Allow);
+    }
+
+    #[test]
+    fn a_reset_under_xdmcp_closes_local_access() {
+        let counter = GenerationCounter::new();
+        let auth = AuthState::new_with_xdmcp(None, true);
+        let g0 = counter.current();
+        set_local_open(&auth, true);
+        assert_eq!(cookieless_unix(&auth, g0), AuthVerdict::Allow);
+        assert_eq!(
+            cookieless_unix(&auth, counter.bump()),
+            AuthVerdict::Reject(REASON_NO_PROTO)
+        );
+    }
+
+    #[test]
+    fn a_reset_forces_the_auth_reload_even_with_an_unchanged_mtime() {
+        let counter = GenerationCounter::new();
+        let path = temp_path("reset-forced-reload");
+        let (first, second) = ([0x31u8; 16], [0x32u8; 16]);
+        fs::write(&path, xauth_bytes(b"0", &first)).unwrap();
+        let auth = AuthState::new(Some(path.clone()));
+        let g0 = counter.current();
+        assert_eq!(auth.check(&UNIX, g0, MIT, &first), AuthVerdict::Allow);
+        rewrite_keeping_mtime(&path, &xauth_bytes(b"0", &second));
+        assert_eq!(
+            auth.check(&UNIX, g0, MIT, &second),
+            AuthVerdict::Reject(REASON_BAD_COOKIE),
+            "same mtime: no lazy reload within G0"
+        );
+
+        // An open local access from G0 (`xhost +local:`) does not survive.
+        set_local_open(&auth, true);
+        let g1 = counter.bump();
+        assert_eq!(
+            auth.check(&UNIX, g1, MIT, &second),
+            AuthVerdict::Allow,
+            "the reset forced the reload"
+        );
+        assert_eq!(
+            cookieless_unix(&auth, g1),
+            AuthVerdict::Reject(REASON_NO_PROTO),
+            "a loaded cookie leaves local access closed"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_reset_with_an_emptied_auth_file_opens_local_access() {
+        let counter = GenerationCounter::new();
+        let path = temp_path("reset-emptied");
+        fs::write(&path, xauth_bytes(b"0", &[0x33u8; 16])).unwrap();
+        let auth = AuthState::new(Some(path.clone()));
+        let g0 = counter.current();
+        assert_eq!(
+            cookieless_unix(&auth, g0),
+            AuthVerdict::Reject(REASON_NO_PROTO)
+        );
+        rewrite_keeping_mtime(&path, b"");
+        assert_eq!(
+            cookieless_unix(&auth, g0),
+            AuthVerdict::Reject(REASON_NO_PROTO)
+        );
+        assert_eq!(cookieless_unix(&auth, counter.bump()), AuthVerdict::Allow);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_reset_with_a_deleted_auth_file_keeps_the_reset_value() {
+        // `loaded` stays TRUE and `loadauth == -1` changes nothing, so the
+        // value is ResetHosts' closed one.
+        let counter = GenerationCounter::new();
+        let path = temp_path("reset-deleted");
+        fs::write(&path, xauth_bytes(b"0", &[0x34u8; 16])).unwrap();
+        let auth = AuthState::new(Some(path.clone()));
+        let g0 = counter.current();
+        assert_eq!(
+            cookieless_unix(&auth, g0),
+            AuthVerdict::Reject(REASON_NO_PROTO)
+        );
+        set_local_open(&auth, true);
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            cookieless_unix(&auth, counter.bump()),
+            AuthVerdict::Reject(REASON_NO_PROTO)
+        );
+    }
+
+    #[test]
+    fn an_older_generation_writes_nothing_and_gets_no_local_fallback() {
+        let counter = GenerationCounter::new();
+        let auth = AuthState::new(None);
+        let g1 = counter.bump();
+        let g2 = counter.bump();
+        assert_eq!(cookieless_unix(&auth, g1), AuthVerdict::Allow);
+        assert_eq!(cookieless_unix(&auth, g2), AuthVerdict::Allow);
+        assert_eq!(
+            cookieless_unix(&auth, g1),
+            AuthVerdict::Reject(REASON_NO_PROTO)
+        );
+        let inner = auth.inner.lock().unwrap();
+        assert_eq!(inner.generation, g2);
+        assert!(inner.local_open);
+    }
+
+    #[test]
+    fn reset_reloads_do_not_duplicate_cookies() {
+        let counter = GenerationCounter::new();
+        let path = temp_path("reset-dedup");
+        let cookie = [0x35u8; 16];
+        fs::write(&path, xauth_bytes(b"0", &cookie)).unwrap();
+        let auth = AuthState::new(Some(path.clone()));
+        let mut generation = counter.current();
+        for _ in 0..4 {
+            assert_eq!(
+                auth.check(&UNIX, generation, MIT, &cookie),
+                AuthVerdict::Allow
+            );
+            generation = counter.bump();
+        }
+        assert_eq!(auth.inner.lock().unwrap().cookies.len(), 1);
+        let _ = fs::remove_file(path);
+    }
+
+    // ---- the host list: admission through `InvalidHost` ----
+
+    use crate::core_loop::host_access::{FAMILY_DECNET, HostEntry};
+    use std::{
+        ffi::CStr,
+        net::{IpAddr, Ipv4Addr, Ipv6Addr},
+        sync::mpsc,
+        time::Duration as StdDuration,
+    };
+
+    const BOB: PeerCred = PeerCred {
+        uid: 1000,
+        gid: 100,
+        pid: None,
+    };
+    const HOST_COOKIE: [u8; 16] = [0x51; 16];
+    const WRONG_COOKIE: [u8; 16] = [0x52; 16];
+
+    /// `bob` is uid 1000, group `staff` gid 100; nothing else resolves.
+    struct Names;
+
+    impl NameResolver for Names {
+        fn uid(&self, name: &CStr) -> Option<u32> {
+            (name.to_bytes() == b"bob").then_some(1000)
+        }
+        fn gid(&self, name: &CStr) -> Option<u32> {
+            (name.to_bytes() == b"staff").then_some(100)
+        }
+    }
+
+    fn unix_peer(cred: Option<PeerCred>) -> PeerIdentity {
+        PeerIdentity {
+            transport: AuthTransport::Unix,
+            addr: None,
+            cred,
+        }
+    }
+
+    fn tcp_peer() -> PeerIdentity {
+        PeerIdentity {
+            transport: AuthTransport::Tcp,
+            addr: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            cred: None,
+        }
+    }
+
+    fn v6_own() -> [u8; 16] {
+        Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets()
+    }
+
+    fn fake_own_addrs() -> Vec<HostEntry> {
+        vec![
+            HostEntry {
+                family: FAMILY_INTERNET,
+                addr: vec![127, 0, 0, 1],
+            },
+            HostEntry {
+                family: FAMILY_INTERNET6,
+                addr: v6_own().to_vec(),
+            },
+        ]
+    }
+
+    fn si(kind: &str, value: &str) -> Vec<u8> {
+        let mut addr = kind.as_bytes().to_vec();
+        addr.push(0);
+        addr.extend_from_slice(value.as_bytes());
+        addr
+    }
+
+    /// `-auth` with one cookie, already loaded, so `local_open` is false.
+    fn enforcing_state(tag: &str, tcp_listen: bool) -> (AuthState, PathBuf) {
+        let path = temp_path(tag);
+        fs::write(&path, xauth_bytes(b"0", &HOST_COOKIE)).unwrap();
+        let auth = AuthState::build(Some(path.clone()), false, tcp_listen, fake_own_addrs);
+        assert_eq!(
+            auth.check_with(
+                &unix_peer(Some(BOB)),
+                Generation::default(),
+                MIT,
+                &HOST_COOKIE,
+                &Names
+            ),
+            AuthVerdict::Allow
+        );
+        assert!(!auth.inner.lock().unwrap().local_open);
+        (auth, path)
+    }
+
+    fn add(auth: &AuthState, family: u8, addr: &[u8]) {
+        auth.change_hosts(Generation::default(), true, family, addr, &Names)
+            .unwrap();
+    }
+
+    fn cookieless(auth: &AuthState, peer: &PeerIdentity) -> AuthVerdict {
+        auth.check_with(peer, Generation::default(), b"", b"", &Names)
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Source {
+        AccessDisabled,
+        LocalOpen,
+        LocalUserId(&'static str),
+        LocalUserName(&'static str),
+        LocalGroupId(&'static str),
+        LocalGroupName(&'static str),
+        SelfLocalHost,
+    }
+
+    fn apply(auth: &AuthState, source: Source) {
+        match source {
+            Source::AccessDisabled => auth
+                .set_access_enabled(Generation::default(), false)
+                .unwrap(),
+            Source::LocalOpen => set_local_open(auth, true),
+            Source::LocalUserId(v) | Source::LocalUserName(v) => {
+                add(auth, FAMILY_SERVER_INTERPRETED, &si("localuser", v));
+            }
+            Source::LocalGroupId(v) | Source::LocalGroupName(v) => {
+                add(auth, FAMILY_SERVER_INTERPRETED, &si("localgroup", v));
+            }
+            Source::SelfLocalHost => {
+                add(auth, FAMILY_LOCAL_HOST, &[]);
+                set_local_open(auth, false);
+            }
+        }
+    }
+
+    const ADMITTING: [Source; 7] = [
+        Source::AccessDisabled,
+        Source::LocalOpen,
+        Source::LocalUserId("#1000"),
+        Source::LocalUserName("bob"),
+        Source::LocalGroupId("#100"),
+        Source::LocalGroupName("staff"),
+        Source::SelfLocalHost,
+    ];
+
+    #[test]
+    fn each_host_source_alone_admits_a_cookieless_unix_peer() {
+        for (n, source) in ADMITTING.into_iter().enumerate() {
+            let (auth, path) = enforcing_state(&format!("h-admit-{n}"), true);
+            let bob = unix_peer(Some(BOB));
+            assert_eq!(
+                cookieless(&auth, &bob),
+                AuthVerdict::Reject(REASON_NO_PROTO),
+                "{source:?}: refused before"
+            );
+            apply(&auth, source);
+            assert_eq!(cookieless(&auth, &bob), AuthVerdict::Allow, "{source:?}");
+            assert_eq!(
+                auth.check_with(&bob, Generation::default(), MIT, &WRONG_COOKIE, &Names),
+                AuthVerdict::Allow,
+                "{source:?}: a wrong cookie falls through to the list too"
+            );
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn non_matching_host_entries_refuse() {
+        let cases: [(Source, Option<PeerCred>); 5] = [
+            (Source::LocalUserId("#1001"), Some(BOB)),
+            (Source::LocalGroupId("#101"), Some(BOB)),
+            // A supplementary group of the peer: credentials carry the
+            // primary gid only, as on Xorg's SO_PEERCRED/getpeereid paths.
+            (Source::LocalGroupId("#27"), Some(BOB)),
+            (Source::LocalUserId("#1000"), None),
+            (Source::LocalGroupId("#100"), None),
+        ];
+        for (n, (source, cred)) in cases.into_iter().enumerate() {
+            let (auth, path) = enforcing_state(&format!("h-refuse-{n}"), true);
+            apply(&auth, source);
+            assert_eq!(
+                cookieless(&auth, &unix_peer(cred)),
+                AuthVerdict::Reject(REASON_NO_PROTO),
+                "{source:?} against {cred:?}"
+            );
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn no_host_source_admits_tcp() {
+        for (n, source) in ADMITTING.into_iter().enumerate() {
+            let (auth, path) = enforcing_state(&format!("h-tcp-{n}"), true);
+            apply(&auth, source);
+            assert_eq!(
+                auth.check_with(
+                    &tcp_peer(),
+                    Generation::default(),
+                    MIT,
+                    &WRONG_COOKIE,
+                    &Names
+                ),
+                AuthVerdict::Reject(REASON_BAD_COOKIE),
+                "{source:?}"
+            );
+            assert_eq!(
+                auth.check_with(&tcp_peer(), Generation::default(), b"", b"", &Names),
+                AuthVerdict::Reject(REASON_NO_PROTO),
+                "{source:?}"
+            );
+            assert_eq!(
+                auth.check_with(
+                    &tcp_peer(),
+                    Generation::default(),
+                    MIT,
+                    &HOST_COOKIE,
+                    &Names
+                ),
+                AuthVerdict::Allow,
+                "{source:?}: the file cookie still admits TCP"
+            );
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn xdmcp_tcp_needs_the_session_credential_whatever_the_list_says() {
+        let auth = AuthState::build(None, true, true, fake_own_addrs);
+        let generation = Generation::default();
+        let session = [0x53u8; 16];
+        assert!(auth.install_session_cookie(generation, MIT, &session));
+        auth.set_access_enabled(generation, false).unwrap();
+        add(&auth, FAMILY_LOCAL_HOST, &[]);
+        assert_eq!(
+            auth.check_with(&tcp_peer(), generation, MIT, &session, &Names),
+            AuthVerdict::Allow
+        );
+        assert_eq!(
+            auth.check_with(&tcp_peer(), generation, MIT, &WRONG_COOKIE, &Names),
+            AuthVerdict::Reject(REASON_BAD_COOKIE)
+        );
+    }
+
+    #[test]
+    fn a_valid_cookie_admits_with_an_enabled_empty_list() {
+        let (auth, path) = enforcing_state("h-cookie", false);
+        assert_eq!(auth.list_hosts(Generation::default()), (true, Vec::new()));
+        assert_eq!(
+            auth.check_with(
+                &unix_peer(None),
+                Generation::default(),
+                MIT,
+                &HOST_COOKIE,
+                &Names
+            ),
+            AuthVerdict::Allow
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    /// `+local:` and then a cookie reload: `DisableLocalHost` closes local
+    /// access, the entry stays listed (os/access.c:300-311, :1322-1325).
+    fn local_host_then_reload(auth: &AuthState, path: &Path, addr: &[u8]) {
+        add(auth, FAMILY_LOCAL_HOST, addr);
+        assert!(auth.inner.lock().unwrap().local_open);
+        fs::write(path, xauth_bytes(b"0", &[0x54u8; 16])).unwrap();
+        touch_later(path);
+        // Any connection triggers the lazy reload.
+        assert_eq!(
+            auth.check_with(
+                &unix_peer(None),
+                Generation::default(),
+                MIT,
+                &HOST_COOKIE,
+                &Names
+            ),
+            AuthVerdict::Allow
+        );
+        assert!(!auth.inner.lock().unwrap().local_open);
+    }
+
+    #[test]
+    fn a_cookie_reload_closes_local_host_but_keeps_the_entry() {
+        let (auth, path) = enforcing_state("h-local-reload", false);
+        local_host_then_reload(&auth, &path, &[]);
+        assert_eq!(
+            auth.list_hosts(Generation::default()),
+            (
+                true,
+                vec![HostEntry {
+                    family: FAMILY_LOCAL_HOST,
+                    addr: Vec::new(),
+                }]
+            )
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_listed_selfhost_admits_unix_only_with_a_tcp_listener() {
+        for tcp_listen in [true, false] {
+            let expected = if tcp_listen {
+                AuthVerdict::Allow
+            } else {
+                AuthVerdict::Reject(REASON_NO_PROTO)
+            };
+            let (auth, path) = enforcing_state(&format!("h-self-local-{tcp_listen}"), tcp_listen);
+            local_host_then_reload(&auth, &path, &[]);
+            assert_eq!(
+                cookieless(&auth, &unix_peer(None)),
+                expected,
+                "{{252, []}}, tcp_listen {tcp_listen}"
+            );
+            let _ = fs::remove_file(path);
+
+            let (auth, path) = enforcing_state(&format!("h-self-v4-{tcp_listen}"), tcp_listen);
+            add(&auth, FAMILY_INTERNET, &[127, 0, 0, 1]);
+            assert_eq!(
+                cookieless(&auth, &unix_peer(None)),
+                expected,
+                "127.0.0.1, tcp_listen {tcp_listen}"
+            );
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn a_nonzero_length_local_host_entry_is_not_a_selfhost() {
+        let (auth, path) = enforcing_state("h-self-local-len", true);
+        local_host_then_reload(&auth, &path, &[1]);
+        assert_eq!(
+            cookieless(&auth, &unix_peer(None)),
+            AuthVerdict::Reject(REASON_NO_PROTO)
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn ipv6_selfhosts_come_from_the_own_address_list() {
+        let other = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2).octets();
+        for tcp_listen in [true, false] {
+            let (auth, path) = enforcing_state(&format!("h-self-v6-{tcp_listen}"), tcp_listen);
+            add(&auth, FAMILY_INTERNET6, &other);
+            assert_eq!(
+                cookieless(&auth, &unix_peer(None)),
+                AuthVerdict::Reject(REASON_NO_PROTO),
+                "2001:db8::2 is not ours"
+            );
+            add(&auth, FAMILY_INTERNET6, &v6_own());
+            let expected = if tcp_listen {
+                AuthVerdict::Allow
+            } else {
+                AuthVerdict::Reject(REASON_NO_PROTO)
+            };
+            assert_eq!(
+                cookieless(&auth, &unix_peer(None)),
+                expected,
+                "2001:db8::1, tcp_listen {tcp_listen}"
+            );
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn the_host_list_does_not_survive_a_reset() {
+        let counter = GenerationCounter::new();
+        let (auth, path) = enforcing_state("h-reset", false);
+        let g0 = counter.current();
+        add(&auth, FAMILY_SERVER_INTERPRETED, &si("localuser", "#1000"));
+        auth.set_access_enabled(g0, false).unwrap();
+        let bob = unix_peer(Some(BOB));
+        assert_eq!(cookieless(&auth, &bob), AuthVerdict::Allow);
+        let g1 = counter.bump();
+        assert_eq!(
+            auth.check_with(&bob, g1, b"", b"", &Names),
+            AuthVerdict::Reject(REASON_NO_PROTO)
+        );
+        assert_eq!(auth.list_hosts(g1), (true, Vec::new()));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_stale_generation_cannot_write_the_list() {
+        let counter = GenerationCounter::new();
+        let auth = AuthState::new(None);
+        let g0 = counter.current();
+        let g1 = counter.bump();
+        assert_eq!(auth.list_hosts(g1), (true, Vec::new()));
+        assert_eq!(
+            auth.change_hosts(g0, true, FAMILY_LOCAL_HOST, &[], &Names),
+            Err(HostChangeError::Access)
+        );
+        assert_eq!(
+            auth.set_access_enabled(g0, false),
+            Err(HostChangeError::Access)
+        );
+        assert_eq!(auth.list_hosts(g1), (true, Vec::new()));
+    }
+
+    #[test]
+    fn change_hosts_validates_before_storing() {
+        let auth = AuthState::new(None);
+        let g = Generation::default();
+        assert_eq!(
+            auth.change_hosts(g, true, FAMILY_DECNET, &[1, 2], &Names),
+            Err(HostChangeError::Value(BadValue::Length))
+        );
+        assert_eq!(
+            auth.change_hosts(g, true, 7, &[], &Names),
+            Err(HostChangeError::Value(BadValue::Family))
+        );
+        assert_eq!(
+            auth.change_hosts(
+                g,
+                true,
+                FAMILY_SERVER_INTERPRETED,
+                &si("localuser", "nobody_here"),
+                &Names
+            ),
+            Err(HostChangeError::Value(BadValue::Length))
+        );
+        assert_eq!(auth.list_hosts(g), (true, Vec::new()));
+    }
+
+    /// Blocks inside `uid` until released, after announcing it got there.
+    struct BlockingNames {
+        entered: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl NameResolver for BlockingNames {
+        fn uid(&self, name: &CStr) -> Option<u32> {
+            self.entered.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+            Names.uid(name)
+        }
+        fn gid(&self, name: &CStr) -> Option<u32> {
+            Names.gid(name)
+        }
+    }
+
+    #[test]
+    fn name_lookups_at_check_run_with_the_lock_released() {
+        let (auth, path) = enforcing_state("h-unlocked", false);
+        let auth = Arc::new(auth);
+        add(&auth, FAMILY_SERVER_INTERPRETED, &si("localuser", "bob"));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let checker = {
+            let auth = Arc::clone(&auth);
+            std::thread::spawn(move || {
+                let resolver = BlockingNames {
+                    entered: entered_tx,
+                    release: Mutex::new(release_rx),
+                };
+                auth.check_with(
+                    &unix_peer(Some(BOB)),
+                    Generation::default(),
+                    b"",
+                    b"",
+                    &resolver,
+                )
+            })
+        };
+        entered_rx
+            .recv_timeout(StdDuration::from_secs(10))
+            .expect("check reached the resolver");
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer = {
+            let auth = Arc::clone(&auth);
+            std::thread::spawn(move || {
+                add(&auth, FAMILY_SERVER_INTERPRETED, &si("localuser", "#1"));
+                done_tx.send(()).unwrap();
+            })
+        };
+        let completed = done_rx.recv_timeout(StdDuration::from_secs(10)).is_ok();
+        release_tx.send(()).unwrap();
+        assert!(completed, "change_hosts blocked behind a check in NSS");
+        writer.join().unwrap();
+        assert_eq!(checker.join().unwrap(), AuthVerdict::Allow);
+        let _ = fs::remove_file(path);
     }
 }
