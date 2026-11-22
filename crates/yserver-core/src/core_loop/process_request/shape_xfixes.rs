@@ -407,9 +407,8 @@ fn handle_shape_request_ops(
                 // Xorg miSetShape re-evaluates the pointer before ShapeNotify
                 // goes out (`mi/miwindow.c:680`); so do the other SHAPE ops.
                 backend.windows_restructured(state);
-                if changed {
-                    emit_shape_notify(state, window, req.dest_kind);
-                }
+                let _ = changed; // SPIKE: Xorg RegionOperate always sends ShapeNotify (Xext/shape.c:592)
+                emit_shape_notify(state, window, req.dest_kind);
             }
         }
         x11shape::MASK => {
@@ -490,9 +489,8 @@ fn handle_shape_request_ops(
                 let changed = shape_combine(state, window, req.dest_kind, source, req.op);
                 mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
                 backend.windows_restructured(state);
-                if changed {
-                    emit_shape_notify(state, window, req.dest_kind);
-                }
+                let _ = changed; // SPIKE
+                emit_shape_notify(state, window, req.dest_kind);
             }
         }
         x11shape::COMBINE => {
@@ -530,9 +528,8 @@ fn handle_shape_request_ops(
                 let changed = shape_combine(state, dest, req.dest_kind, source, req.op);
                 mirror_shape_to_host_state(state, backend, origin, dest, req.dest_kind);
                 backend.windows_restructured(state);
-                if changed {
-                    emit_shape_notify(state, dest, req.dest_kind);
-                }
+                let _ = changed; // SPIKE
+                emit_shape_notify(state, dest, req.dest_kind);
             }
         }
         x11shape::OFFSET => {
