@@ -878,12 +878,12 @@ impl<P: Platform> XBackend<P> {
                         height: u32::from(height),
                     },
                 };
+                // SPIKE: clip like the solid path — own and ancestors'
+                // bounding shapes plus higher siblings.
                 let surviving: Vec<ash::vk::Rect2D> = if self.windows.contains_key(&host_xid) {
-                    let occ = self.copy_area_shared_backing_occluders(host_xid, &dst_target);
-                    if occ.is_empty() {
-                        vec![clear_rect]
-                    } else {
-                        compute_copy_area_dst_rects(clear_rect, &occ)
+                    match self.shared_backing_draw_clip(host_xid, &dst_target) {
+                        Some(keep) => intersect_rect_with_clip(clear_rect, &keep),
+                        None => vec![clear_rect],
                     }
                 } else {
                     vec![clear_rect]

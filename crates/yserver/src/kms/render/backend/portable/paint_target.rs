@@ -975,20 +975,40 @@ impl<P: Platform> XBackend<P> {
                             return None;
                         }
                         let sibling_target = self.resolve_paint_target(*sibling_host_xid)?;
-                        (sibling_target.backing_id() == dst_target.backing_id()).then_some((
-                            sibling_geom.stack_rank,
-                            ash::vk::Rect2D {
-                                offset: ash::vk::Offset2D {
-                                    x: sibling_target.offset().0 - dst_target.offset().0,
-                                    y: sibling_target.offset().1 - dst_target.offset().1,
-                                },
-                                extent: ash::vk::Extent2D {
-                                    width: u32::from(sibling_geom.width),
-                                    height: u32::from(sibling_geom.height),
-                                },
+                        if sibling_target.backing_id() != dst_target.backing_id() {
+                            return None;
+                        }
+                        let (sx, sy) = (
+                            sibling_target.offset().0 - dst_target.offset().0,
+                            sibling_target.offset().1 - dst_target.offset().1,
+                        );
+                        let rect = ash::vk::Rect2D {
+                            offset: ash::vk::Offset2D { x: sx, y: sy },
+                            extent: ash::vk::Extent2D {
+                                width: u32::from(sibling_geom.width),
+                                height: u32::from(sibling_geom.height),
                             },
-                        ))
-                    }),
+                        };
+                        // SPIKE: a shaped sibling occludes only its shape.
+                        let rects = match self.bounding_shape_local(*sibling_host_xid) {
+                            Some(shape) => {
+                                let shape: Vec<ash::vk::Rect2D> = shape
+                                    .into_iter()
+                                    .map(|r| ash::vk::Rect2D {
+                                        offset: ash::vk::Offset2D {
+                                            x: r.offset.x + sx,
+                                            y: r.offset.y + sy,
+                                        },
+                                        extent: r.extent,
+                                    })
+                                    .collect();
+                                intersect_rect_with_clip(rect, &shape)
+                            }
+                            None => vec![rect],
+                        };
+                        Some(rects.into_iter().map(move |r| (sibling_geom.stack_rank, r)))
+                    })
+                    .flatten(),
             );
             let Some(parent_xid) = branch_geom.parent else {
                 break;
